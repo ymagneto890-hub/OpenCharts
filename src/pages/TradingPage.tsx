@@ -127,6 +127,79 @@ export function resolveMainChartCandles(params: {
   return getReplaySliceForTimeframe(selectedSymbol, timeframe, replaySimTimeSec);
 }
 
+export interface PrepareTradeHistoryReplayParams {
+  symbolName: string;
+  trade: ClosedPosition;
+  entryTimeSec: number;
+  anchorAtRegularOpen: boolean;
+  startReplay: (
+    symbol: string,
+    timeframe: string,
+    timeSec: number,
+    opts?: { temporary?: boolean; trade?: ClosedPosition },
+  ) => { ok: true } | { ok: false; error: string };
+  setDataWarning: (warning: string | null) => void;
+  ensureData?: typeof ensureReplayHistoricalDataLoaded;
+}
+
+/**
+ * Prepares authentic historical data (4h + 1m intraday VWAP + EMA warmup + targetDate
+ * validation) before launching Replay from Trade History (`handleReplayFromHistory`).
+ */
+export async function prepareAndStartTradeHistoryReplay(
+  params: PrepareTradeHistoryReplayParams,
+): Promise<{ ok: boolean; error?: string; warnings: string[] }> {
+  const {
+    symbolName,
+    trade,
+    entryTimeSec,
+    anchorAtRegularOpen,
+    startReplay,
+    setDataWarning,
+    ensureData = ensureReplayHistoricalDataLoaded,
+  } = params;
+
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const entryDate = new Date(entryTimeSec * 1000);
+  const targetDate = `${entryDate.getFullYear()}-${pad(entryDate.getMonth() + 1)}-${pad(entryDate.getDate())}`;
+
+  const loadRes = await ensureData({
+    symbol: symbolName,
+    primaryTimeframe: "4h",
+    additionalTimeframes: [],
+    targetDate,
+    targetTimeSec: entryTimeSec,
+    anchorAtRegularOpen,
+  });
+
+  if (!loadRes.ok) {
+    return {
+      ok: false,
+      error:
+        loadRes.error ??
+        `No existen datos históricos reales suficientes para ${symbolName} (4h) en ${targetDate}.`,
+      warnings: loadRes.warnings,
+    };
+  }
+
+  const startRes = startReplay(symbolName, "4h", entryTimeSec, {
+    temporary: true,
+    trade,
+  });
+  if (!startRes.ok) {
+    return {
+      ok: false,
+      error: startRes.error,
+      warnings: loadRes.warnings,
+    };
+  }
+
+  if (loadRes.warnings.length > 0) {
+    setDataWarning(loadRes.warnings[0]!);
+  }
+  return { ok: true, warnings: loadRes.warnings };
+}
+
 type ConfirmOrderState = {
   symbol: string;
   side: "BUY" | "SELL";
@@ -1270,21 +1343,34 @@ export function TradingPage() {
   const handleReplayFromHistory = useCallback(
     (trade: ClosedPosition, entryTimeSec: number) => {
       const symbolName = trade.symbolName;
-      const res = replay.start(symbolName, "4h", entryTimeSec, { temporary: true, trade });
-      if (res.ok) {
-        if (symbolName !== selectedSymbol) {
-          setSelectedSymbol(symbolName);
+      const launch = async () => {
+        const res = await prepareAndStartTradeHistoryReplay({
+          symbolName,
+          trade,
+          entryTimeSec,
+          anchorAtRegularOpen: !getChartPreferencesFromStorage().showExtendedHours,
+          startReplay: (sym, tf, tSec, opts) => replay.start(sym, tf, tSec, opts),
+          setDataWarning: (warning) => replay.setDataWarning(warning),
+        });
+        if (res.ok) {
+          if (symbolName !== selectedSymbol) {
+            setSelectedSymbol(symbolName);
+          }
+          setTimeframe("4h");
+          localStorage.setItem(`tf_${symbolName}`, "4h");
+          const entryDate = new Date(entryTimeSec * 1000);
+          toast.success(
+            "Replay Temporal (4H)",
+            `Posicionado en la entrada del trade (${entryDate.toLocaleDateString("es-ES")} ${entryDate.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}). Niveles de Entrada, SL y TP visibles en el gráfico.`,
+          );
+          if (res.warnings.length > 0) {
+            toast.warning("Replay Temporal (4H)", res.warnings[0]!);
+          }
+        } else {
+          toast.warning("Replay Temporal (4H)", res.error ?? "No se pudo iniciar el Replay histórico.");
         }
-        setTimeframe("4h");
-        localStorage.setItem(`tf_${symbolName}`, "4h");
-        const entryDate = new Date(entryTimeSec * 1000);
-        toast.success(
-          "Replay Temporal (4H)",
-          `Posicionado en la entrada del trade (${entryDate.toLocaleDateString("es-ES")} ${entryDate.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}). Niveles de Entrada, SL y TP visibles en el gráfico.`,
-        );
-      } else {
-        toast.warning("Replay", res.error);
-      }
+      };
+      void launch();
     },
     [replay, selectedSymbol, setSelectedSymbol],
   );

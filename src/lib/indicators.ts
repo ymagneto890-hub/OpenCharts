@@ -1701,6 +1701,7 @@ export function isValidVwapSeedForDay(
   day: number,
   firstDayBarSec: number,
   source: VwapPriceSource,
+  sessionAnchorSec?: number,
 ): priorSeed is VwapSessionSeed {
   if (!priorSeed) return false;
   if (priorSeed.anchorBucket !== day) return false;
@@ -1710,6 +1711,13 @@ export function isValidVwapSeedForDay(
   if (priorSeed.source && priorSeed.source !== source) return false;
   if (priorSeed.coveredUntilSec !== undefined) {
     if (!Number.isFinite(priorSeed.coveredUntilSec) || priorSeed.coveredUntilSec > firstDayBarSec) {
+      return false;
+    }
+    if (
+      typeof sessionAnchorSec === "number" &&
+      Number.isFinite(sessionAnchorSec) &&
+      priorSeed.coveredUntilSec < sessionAnchorSec
+    ) {
       return false;
     }
   }
@@ -1723,10 +1731,17 @@ function resolveDayCoverageStartSec(
   rawCoverageStartSec: number | undefined,
   sessionTimeZone: VwapSessionTimeZone,
   coverageByDay: VwapBandsOptions["sessionCoverageByDay"],
+  anchorAtRegularOpen = false,
 ): number {
   const explicitDayCov = lookupDayCoverage(coverageByDay, day);
   if (explicitDayCov && Number.isFinite(explicitDayCov.startSec)) {
     return Math.min(explicitDayCov.startSec, firstEligibleDayBarSec);
+  }
+  // When anchored strictly to NY Regular Trading Hours (09:30–16:00 ET), pre-market bars
+  // (e.g., 04:00 ET in `sameDayRawEarliestSec` or `rawCoverageStartSec`) MUST NEVER prove
+  // that RTH opening minutes (09:30..firstEligibleDayBarSec) are covered.
+  if (anchorAtRegularOpen) {
+    return firstEligibleDayBarSec;
   }
   let startSec = firstEligibleDayBarSec;
   if (typeof sameDayRawEarliestSec === "number" && Number.isFinite(sameDayRawEarliestSec)) {
@@ -1829,10 +1844,17 @@ export function assessVwapSessionCoverage(
       options.rawCoverageStartSec,
       sessionTimeZone,
       options.sessionCoverageByDay,
+      anchorAtRegularOpen,
     );
     const seeded =
       firstDayInSeries &&
-      isValidVwapSeedForDay(options.priorSessionSeed, day, earliestDayBarSec, source);
+      isValidVwapSeedForDay(
+        options.priorSessionSeed,
+        day,
+        earliestDayBarSec,
+        source,
+        sessionAnchorSec,
+      );
     days[day] = {
       isComplete: seeded || dayCovStart <= sessionAnchorSec,
       sessionAnchorSec,
@@ -1921,8 +1943,13 @@ export function vwapBands(
       bucket = getVwapAnchorBucket(c.time, anchor, sessionTimeZone);
     }
     if (anchor !== "none" && bucket !== lastBucket) {
+      const anchorSecForBucket =
+        anchor === "session"
+          ? getSessionAnchorStartSec(c.time, sessionTimeZone, anchorAtRegularOpen)
+          : undefined;
       const hasMatchingSeed =
-        lastBucket === null && isValidVwapSeedForDay(priorSeed, bucket, c.time, source);
+        lastBucket === null &&
+        isValidVwapSeedForDay(priorSeed, bucket, c.time, source, anchorSecForBucket);
       if (hasMatchingSeed) {
         cumVol = priorSeed!.cumVol;
         mean = priorSeed!.mean;
@@ -1933,7 +1960,7 @@ export function vwapBands(
         mean = 0;
         sumSqWeightedDiff = 0;
         if (enforceCompleteSession) {
-          const anchorSec = getSessionAnchorStartSec(
+          const anchorSec = anchorSecForBucket ?? getSessionAnchorStartSec(
             c.time,
             sessionTimeZone,
             anchorAtRegularOpen,
@@ -1945,6 +1972,7 @@ export function vwapBands(
             options.rawCoverageStartSec,
             sessionTimeZone,
             options.sessionCoverageByDay,
+            anchorAtRegularOpen,
           );
           bucketIncomplete = dayCovStart > anchorSec;
         } else {
@@ -2089,6 +2117,10 @@ export function computeFineGrainedSessionVwap(
   for (const c of normalizedFine) {
     const day = getVwapAnchorBucket(c.time, "session", sessionTz);
     if (!sameDayFineRawEarliest.has(day)) sameDayFineRawEarliest.set(day, c.time);
+    if (anchorAtRegularOpen) {
+      const ny = getNySessionMinutes(c.time);
+      if (ny.minutes < 570 || ny.minutes >= 960) continue;
+    }
     const list = fineCandlesByDay.get(day);
     if (list) list.push(c);
     else fineCandlesByDay.set(day, [c]);
@@ -2104,6 +2136,8 @@ export function computeFineGrainedSessionVwap(
     if (prev === undefined || t < prev) earliestFineByDay.set(day, t);
   }
 
+  const expected1mSlots = Math.max(1, Math.round(targetTfSec / 60));
+  const targetDivisibleBy60 = targetTfSec % 60 === 0;
   const coveredDays = new Set<number>();
   for (const [day, targetStart] of earliestTargetByDay.entries()) {
     const fineStart = earliestFineByDay.get(day);
@@ -2116,6 +2150,7 @@ export function computeFineGrainedSessionVwap(
       options.fineRawCoverageStartSec,
       sessionTz,
       options.sessionCoverageByDay,
+      anchorAtRegularOpen,
     );
     const coversTargetStart =
       fineStart <= targetStart ||
@@ -2133,26 +2168,84 @@ export function computeFineGrainedSessionVwap(
         day,
         fineStart,
         source,
+        anchorSec,
       );
       if (!seeded && sameDayCovStart > anchorSec) continue;
     }
 
-    // Verify internal alignment on `day`: every higher-TF candle with real volume must have at least one 1m bar inside [T.time, T.time + targetTfSec)
+    // Verify full 1m interval coverage on `day`: having a single 1m bar inside a 5m/15m/1h
+    // bucket (e.g. only 09:34 inside 09:30..09:35) is NOT sufficient unless:
+    //  1) all expected 60s-aligned 1m slots exist in `[tBar.time, tBar.time + targetTfSec)`, OR
+    //  2) the present 1m bars reconcile 100% of `tBar`'s volume and OHLC extremes (proving
+    //     absent minutes genuinely had zero trades), OR
+    //  3) `tBar` is the trailing in-progress bar on `day` and 1m bars cover `[tBar.time, lastFine]`
+    //     contiguously from `tBar.time` with no internal gaps.
     const dayTargetBars = targetByDay.get(day) ?? [];
     const dayFineBars = fineCandlesByDay.get(day) ?? [];
     let fi = 0;
     let hasMissingFineBucket = false;
-    for (const tBar of dayTargetBars) {
+    for (let ti = 0; ti < dayTargetBars.length; ti++) {
+      const tBar = dayTargetBars[ti]!;
       if (!(tBar.volume != null && tBar.volume > 0)) continue;
       const bStart = tBar.time;
       const bEnd = tBar.time + targetTfSec;
       while (fi < dayFineBars.length && dayFineBars[fi]!.time < bStart) {
         fi++;
       }
-      if (fi >= dayFineBars.length || dayFineBars[fi]!.time >= bEnd) {
+      const bucketFineStartIdx = fi;
+      const alignedSlots = new Set<number>();
+      let sumFineVol = 0;
+      let fineHigh = -Infinity;
+      let fineLow = Infinity;
+      let lastFineInBucket: CandleData | null = null;
+      while (fi < dayFineBars.length && dayFineBars[fi]!.time < bEnd) {
+        const fb = dayFineBars[fi]!;
+        if ((fb.time - bStart) % 60 === 0) {
+          alignedSlots.add(fb.time);
+        }
+        sumFineVol += fb.volume != null && Number.isFinite(fb.volume) && fb.volume >= 0 ? fb.volume : 0;
+        const fHigh = Math.max(fb.high, fb.open, fb.close);
+        const fLow = Math.min(fb.low, fb.open, fb.close);
+        if (fHigh > fineHigh) fineHigh = fHigh;
+        if (fLow < fineLow) fineLow = fLow;
+        lastFineInBucket = fb;
+        fi++;
+      }
+      if (!lastFineInBucket) {
         hasMissingFineBucket = true;
         break;
       }
+
+      const firstFineInBucket = dayFineBars[bucketFineStartIdx]!;
+      const hasAllExpectedSlots = targetDivisibleBy60 && alignedSlots.size === expected1mSlots;
+      if (hasAllExpectedSlots) continue;
+
+      // Proof 2: exact volume + OHLC reconciliation proves absent minutes had 0 trades
+      const volTol = Math.max(1e-6, tBar.volume * 1e-6);
+      const volMatches = Math.abs(sumFineVol - tBar.volume) <= volTol;
+      const priceTol = Math.max(1e-5, Math.abs(tBar.close) * 1e-6);
+      const tHigh = Math.max(tBar.high, tBar.open, tBar.close);
+      const tLow = Math.min(tBar.low, tBar.open, tBar.close);
+      const ohlcMatches =
+        Math.abs(firstFineInBucket.open - tBar.open) <= priceTol &&
+        Math.abs(lastFineInBucket.close - tBar.close) <= priceTol &&
+        Math.abs(fineHigh - tHigh) <= priceTol &&
+        Math.abs(fineLow - tLow) <= priceTol;
+      if (volMatches && ohlcMatches) continue;
+
+      // Proof 3: trailing in-progress Replay / live bar covered contiguously from `bStart`
+      const isTrailingBarOnDay = ti === dayTargetBars.length - 1 && fi >= dayFineBars.length;
+      if (
+        isTrailingBarOnDay &&
+        firstFineInBucket.time === bStart &&
+        (lastFineInBucket.time - bStart) % 60 === 0
+      ) {
+        const elapsedSlots = Math.round((lastFineInBucket.time - bStart) / 60) + 1;
+        if (alignedSlots.size === elapsedSlots) continue;
+      }
+
+      hasMissingFineBucket = true;
+      break;
     }
     if (hasMissingFineBucket) continue;
 

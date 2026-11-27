@@ -731,7 +731,175 @@ function findBarIndexAtOrBefore(bars: ReadonlyArray<Candle>, timeSec: number): n
   return ans;
 }
 
-function seriesCoversTargetTime(
+const NY_CLOCK_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  weekday: "short",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+const WEEKDAY_MAP: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+function getNyClockParts(epochSec: number): {
+  year: number;
+  month: number;
+  day: number;
+  dayKey: number;
+  weekday: number;
+  minutes: number;
+} {
+  let year = 1970;
+  let month = 1;
+  let day = 1;
+  let weekday = 4;
+  let hour = 0;
+  let minute = 0;
+  for (const p of NY_CLOCK_FMT.formatToParts(new Date(epochSec * 1000))) {
+    if (p.type === "year") year = Number(p.value);
+    else if (p.type === "month") month = Number(p.value);
+    else if (p.type === "day") day = Number(p.value);
+    else if (p.type === "weekday") weekday = WEEKDAY_MAP[p.value] ?? 1;
+    else if (p.type === "hour") hour = Number(p.value) % 24;
+    else if (p.type === "minute") minute = Number(p.value);
+  }
+  return {
+    year,
+    month,
+    day,
+    dayKey: year * 10000 + month * 100 + day,
+    weekday,
+    minutes: hour * 60 + minute,
+  };
+}
+
+function nthWeekdayOfMonth(year: number, month: number, weekday: number, nth: number): number {
+  const firstDow = new Date(Date.UTC(year, month - 1, 1)).getUTCDay();
+  const offset = (weekday - firstDow + 7) % 7;
+  return 1 + offset + (nth - 1) * 7;
+}
+
+function lastWeekdayOfMonth(year: number, month: number, weekday: number): number {
+  const lastDate = new Date(Date.UTC(year, month, 0));
+  const lastDay = lastDate.getUTCDate();
+  const lastDow = lastDate.getUTCDay();
+  const back = (lastDow - weekday + 7) % 7;
+  return lastDay - back;
+}
+
+function easterSundayMonthDay(year: number): { month: number; day: number } {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return { month, day };
+}
+
+function matchesObservedFixedHoliday(
+  year: number,
+  month: number,
+  day: number,
+  holMonth: number,
+  holDay: number,
+): boolean {
+  const dow = new Date(Date.UTC(year, holMonth - 1, holDay)).getUTCDay();
+  if (dow === 6) {
+    // Saturday observed on Friday
+    const obs = new Date(Date.UTC(year, holMonth - 1, holDay - 1));
+    return obs.getUTCFullYear() === year && obs.getUTCMonth() + 1 === month && obs.getUTCDate() === day;
+  }
+  if (dow === 0) {
+    // Sunday observed on Monday
+    const obs = new Date(Date.UTC(year, holMonth - 1, holDay + 1));
+    return obs.getUTCFullYear() === year && obs.getUTCMonth() + 1 === month && obs.getUTCDate() === day;
+  }
+  return month === holMonth && day === holDay;
+}
+
+export function isUsEquityMarketHoliday(year: number, month: number, day: number): boolean {
+  // New Year's Day (including Dec 31 observed when Jan 1 next year falls on Saturday)
+  if (matchesObservedFixedHoliday(year, month, day, 1, 1)) return true;
+  if (month === 12 && day === 31 && new Date(Date.UTC(year + 1, 0, 1)).getUTCDay() === 6) return true;
+  // Martin Luther King Jr. Day (3rd Monday of Jan)
+  if (month === 1 && day === nthWeekdayOfMonth(year, 1, 1, 3)) return true;
+  // Washington's Birthday / Presidents' Day (3rd Monday of Feb)
+  if (month === 2 && day === nthWeekdayOfMonth(year, 2, 1, 3)) return true;
+  // Good Friday (Easter Sunday minus 2 days)
+  const easter = easterSundayMonthDay(year);
+  const gf = new Date(Date.UTC(year, easter.month - 1, easter.day - 2));
+  if (gf.getUTCFullYear() === year && gf.getUTCMonth() + 1 === month && gf.getUTCDate() === day) return true;
+  // Memorial Day (last Monday of May)
+  if (month === 5 && day === lastWeekdayOfMonth(year, 5, 1)) return true;
+  // Juneteenth (since 2022)
+  if (year >= 2022 && matchesObservedFixedHoliday(year, month, day, 6, 19)) return true;
+  // Independence Day
+  if (matchesObservedFixedHoliday(year, month, day, 7, 4)) return true;
+  // Labor Day (1st Monday of Sep)
+  if (month === 9 && day === nthWeekdayOfMonth(year, 9, 1, 1)) return true;
+  // Thanksgiving Day (4th Thursday of Nov)
+  if (month === 11 && day === nthWeekdayOfMonth(year, 11, 4, 4)) return true;
+  // Christmas Day
+  if (matchesObservedFixedHoliday(year, month, day, 12, 25)) return true;
+  return false;
+}
+
+function isUsEquityEarlyCloseDay(year: number, month: number, day: number, weekday: number): boolean {
+  // Day after Thanksgiving (Friday)
+  if (month === 11 && weekday === 5 && day === nthWeekdayOfMonth(year, 11, 4, 4) + 1) return true;
+  // Christmas Eve (weekday)
+  if (month === 12 && day === 24 && weekday >= 1 && weekday <= 5) return true;
+  // July 3 (weekday)
+  if (month === 7 && day === 3 && weekday >= 1 && weekday <= 5) return true;
+  return false;
+}
+
+function isNyTradingDay(year: number, month: number, day: number, weekday: number): boolean {
+  return weekday >= 1 && weekday <= 5 && !isUsEquityMarketHoliday(year, month, day);
+}
+
+function hasSkippedNyTradingDayBetween(
+  startYear: number,
+  startMonth: number,
+  startDay: number,
+  endYear: number,
+  endMonth: number,
+  endDay: number,
+): boolean {
+  const cur = new Date(Date.UTC(startYear, startMonth - 1, startDay + 1));
+  const endMs = Date.UTC(endYear, endMonth - 1, endDay);
+  while (cur.getTime() < endMs) {
+    const y = cur.getUTCFullYear();
+    const m = cur.getUTCMonth() + 1;
+    const d = cur.getUTCDate();
+    const dow = cur.getUTCDay();
+    if (isNyTradingDay(y, m, d, dow)) return true;
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return false;
+}
+
+export function doesSeriesCoverTargetTime(
   bars: ReadonlyArray<Candle>,
   tfSec: number,
   targetTimeSec: number,
@@ -752,13 +920,86 @@ function seriesCoversTargetTime(
   if (targetTimeSec - nearestBefore.time > maxAllowedGapSec) return false;
 
   const lastBar = bars[bars.length - 1]!;
-  if (lastBar.time + tfSec >= targetTimeSec) return true;
-  // Allow post-close / quiet end-of-day timestamps on the SAME NY/UTC trading day,
-  // but never allow an old historical series to masquerade as a future date's data.
-  if (isStock && tfSec < 86_400) {
-    return getNyTradingDayKey(targetTimeSec) <= getNyTradingDayKey(lastBar.time);
+  if (lastBar.time + tfSec >= targetTimeSec) {
+    // Reject large internal missing-data holes during open Regular Trading Hours on the same day
+    if (isStock && tfSec < 86_400 && nearestBefore.time + tfSec < targetTimeSec) {
+      const prevEndNy = getNyClockParts(nearestBefore.time + tfSec);
+      const tgtNy = getNyClockParts(targetTimeSec);
+      if (
+        prevEndNy.dayKey === tgtNy.dayKey &&
+        isNyTradingDay(tgtNy.year, tgtNy.month, tgtNy.day, tgtNy.weekday) &&
+        prevEndNy.minutes >= 570 &&
+        prevEndNy.minutes < 960 &&
+        tgtNy.minutes >= 570 &&
+        tgtNy.minutes < 960 &&
+        targetTimeSec - (nearestBefore.time + tfSec) > Math.max(tfSec * 4, 1_800)
+      ) {
+        return false;
+      }
+    }
+    return true;
   }
-  return targetTimeSec - (lastBar.time + tfSec) <= Math.max(tfSec * 4, 64_800);
+
+  // `targetTimeSec` is strictly AFTER `lastBar.time + tfSec`:
+  // Never accept an incomplete intraday stock series (e.g. ending at 10:00 ET) for a later
+  // open-session timestamp (e.g. 15:00 ET) merely because both fall on the same NY day.
+  if (isStock && tfSec < 86_400) {
+    const lastEndSec = lastBar.time + tfSec;
+    const lastEndNy = getNyClockParts(lastEndSec);
+    const tgtNy = getNyClockParts(targetTimeSec);
+    const closeThresholdMin = isUsEquityEarlyCloseDay(
+      lastEndNy.year,
+      lastEndNy.month,
+      lastEndNy.day,
+      lastEndNy.weekday,
+    )
+      ? 775 // 12:55 ET on official 13:00 ET early-close sessions
+      : 955; // 15:55 ET on regular 16:00 ET sessions
+    const reachedSessionClose = lastEndNy.minutes >= closeThresholdMin;
+
+    if (tgtNy.dayKey === lastEndNy.dayKey) {
+      if (!isNyTradingDay(tgtNy.year, tgtNy.month, tgtNy.day, tgtNy.weekday)) {
+        return true;
+      }
+      if (tgtNy.minutes < closeThresholdMin + 5) {
+        // Still inside active pre-market or regular hours: never fabricate future coverage past `lastBar.time + tfSec`
+        return false;
+      }
+      // Post-close evening (e.g. 16:30 ET / 20:30 ET / 23:59 ET): valid ONLY if the series reached market close
+      return reachedSessionClose;
+    }
+
+    if (tgtNy.dayKey > lastEndNy.dayKey) {
+      const targetIsClosedTime =
+        !isNyTradingDay(tgtNy.year, tgtNy.month, tgtNy.day, tgtNy.weekday) ||
+        tgtNy.minutes < 240; // Overnight 00:00–03:59 ET before pre-market opens
+      if (!targetIsClosedTime) return false;
+      if (!reachedSessionClose) return false;
+      return !hasSkippedNyTradingDayBetween(
+        lastEndNy.year,
+        lastEndNy.month,
+        lastEndNy.day,
+        tgtNy.year,
+        tgtNy.month,
+        tgtNy.day,
+      );
+    }
+    return false;
+  }
+
+  if (isStock && tfSec >= 86_400) {
+    return targetTimeSec - (lastBar.time + tfSec) <= Math.max(tfSec * 2, 4 * 86_400);
+  }
+  return targetTimeSec - (lastBar.time + tfSec) <= Math.max(tfSec, 300);
+}
+
+function seriesCoversTargetTime(
+  bars: ReadonlyArray<Candle>,
+  tfSec: number,
+  targetTimeSec: number,
+  isStock: boolean,
+): boolean {
+  return doesSeriesCoverTargetTime(bars, tfSec, targetTimeSec, isStock);
 }
 
 function getDirectAuthenticCandidates(symbol: string, timeframe: string): Candle[][] {
@@ -868,12 +1109,67 @@ export function getReplaySeriesWithProvenance(
           sourceStepSec: finerSec,
           requireCompleteBuckets: true,
         });
+        let aggregatedCandles = res.candles;
+
+        // Allow reconstructing ONLY the active trailing in-progress bucket at `targetTimeSec`
+        // strictly from contiguous real finer bars in `[targetBucket, revealedEndSec)` (no gaps, no future bars).
+        // Interior incomplete buckets with missing sub-candles remain strictly excluded.
+        const targetBucket = getBucketStartSec(Math.floor(targetTimeSec), tfSec);
+        const alreadyHasTargetBucket =
+          aggregatedCandles.length > 0 &&
+          aggregatedCandles[aggregatedCandles.length - 1]!.time >= targetBucket;
         if (
-          res.candles.length > 0 &&
-          seriesCoversTargetTime(res.candles, tfSec, targetTimeSec, isStock)
+          !alreadyHasTargetBucket &&
+          targetBucket <= targetTimeSec &&
+          targetTimeSec < targetBucket + tfSec
+        ) {
+          const revealedEndSec = Math.floor(targetTimeSec / finerSec) * finerSec + finerSec;
+          const expectedPartialSlots = Math.round((revealedEndSec - targetBucket) / finerSec);
+          const partialFiner: Candle[] = [];
+          const seenSlots = new Set<number>();
+          let hasMisalignedInPartial = false;
+          for (const fb of finerBars) {
+            const ft = Math.floor(fb.time);
+            if (ft < targetBucket) continue;
+            if (ft >= revealedEndSec) break;
+            if ((ft - targetBucket) % finerSec !== 0) {
+              hasMisalignedInPartial = true;
+              break;
+            }
+            if (!seenSlots.has(ft)) {
+              seenSlots.add(ft);
+              partialFiner.push(fb);
+            }
+          }
+          if (
+            !hasMisalignedInPartial &&
+            expectedPartialSlots > 0 &&
+            seenSlots.size === expectedPartialSlots &&
+            partialFiner.length === expectedPartialSlots
+          ) {
+            const open = partialFiner[0]!.open;
+            const close = partialFiner[partialFiner.length - 1]!.close;
+            let high = Math.max(open, close);
+            let low = Math.min(open, close);
+            let volume = 0;
+            for (const pb of partialFiner) {
+              if (pb.high > high) high = pb.high;
+              if (pb.low < low) low = pb.low;
+              volume += pb.volume;
+            }
+            aggregatedCandles = [
+              ...aggregatedCandles,
+              { time: targetBucket, open, high, low, close, volume },
+            ];
+          }
+        }
+
+        if (
+          aggregatedCandles.length > 0 &&
+          seriesCoversTargetTime(aggregatedCandles, tfSec, targetTimeSec, isStock)
         ) {
           return {
-            candles: res.candles,
+            candles: aggregatedCandles,
             origin: "aggregated",
             sourceTimeframe: finerTf,
           };
@@ -1040,7 +1336,7 @@ export function validateSubIntervalCoverage(
       Math.abs(subHigh - candle.high) <= priceTol &&
       Math.abs(subLow - candle.low) <= priceTol;
 
-    if (volMatches && ohlcMatches && (surroundsWindow || lastSubTime + subSec >= candle.time + tfSec || lastSubTime >= candle.time)) {
+    if (volMatches && ohlcMatches && lastSubTime + subSec >= rangeEnd) {
       return true;
     }
     return false;
@@ -1212,9 +1508,11 @@ export function computeCausalReplayVwapSeed(
       ? getNyTradingDayKey(visibleStartSec)
       : Math.floor(visibleStartSec / 86400);
 
-  // Per-day independent check: never rely on a prior day's bars to assume today's session started at `anchorStartSec`.
+  // Per-day independent check: never rely on a prior day's bars (or pre-market bars when
+  // anchored to 09:30 ET RTH) to assume today's session started at `anchorStartSec`.
   let earliestSameDayBarSec = Infinity;
   for (const b of bars1m) {
+    if (anchorAtRegularOpen && b.time < anchorStartSec) continue;
     const bBucket =
       sessionTz === "america-new-york"
         ? getNyTradingDayKey(b.time)

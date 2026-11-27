@@ -2084,14 +2084,14 @@ export function ChartPanel({
     if (raw1m.length === 0) {
       return { candles: null, rawCoverageStartSec: undefined };
     }
-    const rawCoverageStartSec = raw1m[0]!.time;
     if (isStockSymbol && !chartPrefs.showExtendedHours && !hasExtendedFilterFallback) {
+      const rth1m = filterExtendedHoursCandles(raw1m, false, stockMetaForVwap, demoSymForVwap?.exchange);
       return {
-        candles: filterExtendedHoursCandles(raw1m, false, stockMetaForVwap, demoSymForVwap?.exchange),
-        rawCoverageStartSec,
+        candles: rth1m,
+        rawCoverageStartSec: rth1m.length > 0 ? rth1m[0]!.time : undefined,
       };
     }
-    return { candles: raw1m, rawCoverageStartSec };
+    return { candles: raw1m, rawCoverageStartSec: raw1m[0]!.time };
   }, [
     timeframe,
     selectedSymbol,
@@ -2105,7 +2105,13 @@ export function ChartPanel({
     liveIndicatorData,
   ]);
   const fine1mVwapCandles = fine1mVwapBundle.candles;
-  const chartRawCoverageStartSec = candles.length > 0 ? candles[0]!.time : undefined;
+  const chartRawCoverageStartSec = anchorVwapAtRegularOpen
+    ? liveIndicatorData.length > 0 && typeof liveIndicatorData[0]!.time === "number"
+      ? liveIndicatorData[0]!.time
+      : undefined
+    : candles.length > 0
+      ? candles[0]!.time
+      : undefined;
 
   useIndicators(
     chartRef,

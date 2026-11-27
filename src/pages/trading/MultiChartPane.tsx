@@ -1203,14 +1203,14 @@ export function MultiChartPane({
     if (raw1m.length === 0) {
       return { candles: null, rawCoverageStartSec: undefined };
     }
-    const rawCoverageStartSec = raw1m[0]!.time;
     if (sessionCtx.isStock && !chartPrefs.showExtendedHours && !hasExtendedFilterFallback) {
+      const rth1m = filterExtendedHoursCandles(raw1m, false, sessionCtx.meta, sessionCtx.exchange);
       return {
-        candles: filterExtendedHoursCandles(raw1m, false, sessionCtx.meta, sessionCtx.exchange),
-        rawCoverageStartSec,
+        candles: rth1m,
+        rawCoverageStartSec: rth1m.length > 0 ? rth1m[0]!.time : undefined,
       };
     }
-    return { candles: raw1m, rawCoverageStartSec };
+    return { candles: raw1m, rawCoverageStartSec: raw1m[0]!.time };
   }, [
     paneTf,
     paneSymbol,
@@ -1222,7 +1222,13 @@ export function MultiChartPane({
     liveDisplayCandles,
   ]);
   const paneFine1mVwapCandles = paneFine1mVwapBundle.candles;
-  const paneRawCoverageStartSec = candles.length > 0 ? candles[0]!.time : undefined;
+  const paneRawCoverageStartSec = paneAnchorAtRegularOpen
+    ? liveDisplayCandles.length > 0
+      ? liveDisplayCandles[0]!.time
+      : undefined
+    : candles.length > 0
+      ? candles[0]!.time
+      : undefined;
 
   // Overlay indicators (EMA, VWAP + bands, SMA, BOLL, VPVR, SMC) reused in-place without 5s flicker and updated on live ticks
   useEffect(() => {

@@ -155,11 +155,12 @@ export interface AggregatedCandleIntegrityResult {
   completeBucketTimes: number[];
   duplicateInputCount: number;
   outOfOrderInputCount: number;
+  misalignedInputCount: number;
 }
 
 /**
  * Deterministically aggregates finer OHLCV bars while tracking duplicates, out-of-order inputs,
- * and incomplete target buckets (e.g., intermediate missing sub-candles).
+ * misaligned timestamps, and incomplete target buckets (e.g., intermediate missing sub-candles).
  */
 export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
   bars: ReadonlyArray<T>,
@@ -173,6 +174,7 @@ export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
       completeBucketTimes: [],
       duplicateInputCount: 0,
       outOfOrderInputCount: 0,
+      misalignedInputCount: 0,
     };
   }
   const stepSec =
@@ -180,8 +182,17 @@ export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
       ? Math.max(1, Math.floor(targetTfOrSec))
       : parseTimeframeSeconds(targetTfOrSec);
 
+  const sourceSec = options?.sourceStepSec;
+  const checkCompleteness =
+    typeof sourceSec === "number" &&
+    Number.isFinite(sourceSec) &&
+    sourceSec > 0 &&
+    stepSec > sourceSec &&
+    stepSec % sourceSec === 0;
+
   let duplicateInputCount = 0;
   let outOfOrderInputCount = 0;
+  let misalignedInputCount = 0;
   let prevRawTime = -Infinity;
   const dedupedByTime = new Map<number, T>();
   for (const bar of bars) {
@@ -205,7 +216,8 @@ export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
 
   const sorted = Array.from(dedupedByTime.values()).sort((a, b) => a.time - b.time);
   const buckets = new Map<number, OhlcvBar>();
-  const bucketSlotCount = new Map<number, number>();
+  const bucketAlignedSlots = new Map<number, Set<number>>();
+  const bucketHasMisaligned = new Set<number>();
 
   for (const bar of sorted) {
     const barTime = Math.floor(bar.time);
@@ -223,24 +235,29 @@ export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
         close: bar.close,
         volume: barVol,
       });
-      bucketSlotCount.set(bTime, 1);
     } else {
       existing.high = Math.max(existing.high, barHigh);
       existing.low = Math.min(existing.low, barLow);
       existing.close = bar.close;
       existing.volume += barVol;
-      bucketSlotCount.set(bTime, (bucketSlotCount.get(bTime) ?? 0) + 1);
+    }
+
+    if (checkCompleteness) {
+      if ((barTime - bTime) % sourceSec! === 0) {
+        let slots = bucketAlignedSlots.get(bTime);
+        if (!slots) {
+          slots = new Set<number>();
+          bucketAlignedSlots.set(bTime, slots);
+        }
+        slots.add(barTime);
+      } else {
+        misalignedInputCount += 1;
+        bucketHasMisaligned.add(bTime);
+      }
     }
   }
 
   const allSorted = Array.from(buckets.values()).sort((a, b) => a.time - b.time);
-  const sourceSec = options?.sourceStepSec;
-  const checkCompleteness =
-    typeof sourceSec === "number" &&
-    Number.isFinite(sourceSec) &&
-    sourceSec > 0 &&
-    stepSec > sourceSec &&
-    stepSec % sourceSec === 0;
 
   if (!checkCompleteness) {
     return {
@@ -249,6 +266,7 @@ export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
       completeBucketTimes: allSorted.map((c) => c.time),
       duplicateInputCount,
       outOfOrderInputCount,
+      misalignedInputCount: 0,
     };
   }
 
@@ -261,14 +279,25 @@ export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
   const covEnd = options?.verifiedCoverageEndSec;
 
   for (const candle of allSorted) {
-    const count = bucketSlotCount.get(candle.time) ?? 0;
+    const hasMisaligned = bucketHasMisaligned.has(candle.time);
+    const alignedSlots = bucketAlignedSlots.get(candle.time);
+    let allSlotsExact = !hasMisaligned && alignedSlots !== undefined && alignedSlots.size === expectedSlots;
+    if (allSlotsExact && alignedSlots) {
+      for (let k = 0; k < expectedSlots; k++) {
+        if (!alignedSlots.has(candle.time + k * sourceSec!)) {
+          allSlotsExact = false;
+          break;
+        }
+      }
+    }
     const hasVerifiedSparseCov =
+      !hasMisaligned &&
       allowSparse &&
       typeof covStart === "number" &&
       typeof covEnd === "number" &&
       covStart <= candle.time &&
       covEnd >= candle.time + stepSec;
-    if (count >= expectedSlots || hasVerifiedSparseCov) {
+    if (allSlotsExact || hasVerifiedSparseCov) {
       completeBucketTimes.push(candle.time);
       completeSet.add(candle.time);
     } else {
@@ -284,6 +313,7 @@ export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
     completeBucketTimes,
     duplicateInputCount,
     outOfOrderInputCount,
+    misalignedInputCount,
   };
 }
 

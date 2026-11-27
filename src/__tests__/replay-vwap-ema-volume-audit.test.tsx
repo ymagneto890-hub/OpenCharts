@@ -21,7 +21,10 @@ import {
   aggregateCandlesWithIntegrity,
   computeRequiredWarmupBars,
 } from "../lib/timeframes.ts";
-import { resolveMainChartCandles } from "../pages/TradingPage.tsx";
+import {
+  prepareAndStartTradeHistoryReplay,
+  resolveMainChartCandles,
+} from "../pages/TradingPage.tsx";
 import { MultiChartPane } from "../pages/trading/MultiChartPane.tsx";
 import { ReplayHUD } from "../pages/trading/ReplayHUD.tsx";
 import { calculateReplayVolumeMa, calculateVolumeMa } from "../pages/trading/utils.ts";
@@ -34,6 +37,7 @@ import {
   buildPartialCandleOrNullUpTo,
   buildPartialCandleRange,
   computeCausalReplayVwapSeed,
+  doesSeriesCoverTargetTime,
   ensureReplayHistoricalDataLoaded,
   fetchHistoryAsync,
   getCandleSeriesOrigin,
@@ -41,6 +45,7 @@ import {
   getReplayHistory,
   getReplaySeriesWithProvenance,
   invalidateStockSeries,
+  isUsEquityMarketHoliday,
   resolvePartialCandleWindow,
   setRealStockSeries,
   validateSubIntervalCoverage,
@@ -1675,5 +1680,554 @@ describe("Auditoría Exhaustiva de Replay, VWAP, EMA, Volumen e IBKR (Escenarios
 
     useReplayStore.getState().stop();
     invalidateStockSeries("WARMUPCHK");
+  });
+
+  it("N. VWAP cobertura real de 1m: RTH con pre-market 04:00 ET jamás oculta falta de 09:30..09:34, vela 5m con solo 09:34 o hueco interno se rechaza, minuto sin volumen reconciliado se acepta", () => {
+    registerDynamicSymbol({
+      name: "VWAPRTH",
+      displayName: "VWAP RTH Coverage Corp",
+      category: "STOCKS",
+      initialPrice: 40.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    // 2026-11-24 EST (UTC-5): 04:00 ET = 09:00 UTC, 09:30 ET = 14:30 UTC
+    const t0400 = Math.floor(Date.UTC(2026, 10, 24, 9, 0, 0) / 1000);
+    const t0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000);
+    const t0935 = t0930 + 300;
+    const t0940 = t0930 + 600;
+
+    // 1. Pre-market 04:00..09:29 ET exists, 09:30..09:34 ET is MISSING, RTH resumes at 09:35..09:59 ET
+    const preMarket1m: Candle[] = Array.from({ length: 10 }, (_, i) => ({
+      time: t0400 + i * 60,
+      open: 39.5,
+      high: 39.8,
+      low: 39.3,
+      close: 39.6,
+      volume: 1_200,
+    }));
+    const rthFrom0935_1m: Candle[] = Array.from({ length: 25 }, (_, i) => ({
+      time: t0935 + i * 60,
+      open: 40 + i * 0.05,
+      high: 40.2 + i * 0.05,
+      low: 39.9 + i * 0.05,
+      close: 40.1 + i * 0.05,
+      volume: 5_000 + i * 100,
+    }));
+    const rawWithPreMarketButMissingRthOpen = [...preMarket1m, ...rthFrom0935_1m];
+    const bars5mFrom0935 = aggregateCandles(rthFrom0935_1m, 300) as Candle[];
+
+    // assessVwapSessionCoverage + vwapBands + computeFineGrainedSessionVwap MUST mark RTH INCOMPLETE
+    // even when `rawCoverageStartSec` / `fineRawCoverageStartSec` is 04:00 ET!
+    const rthCov = assessVwapSessionCoverage(rawWithPreMarketButMissingRthOpen, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      rawCoverageStartSec: t0400,
+    });
+    expect(rthCov.isComplete).toBe(false);
+
+    const rthDirect = vwapBands(rawWithPreMarketButMissingRthOpen, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+      rawCoverageStartSec: t0400,
+    });
+    expect(rthDirect.vwap).toEqual([]);
+
+    const rthFine = computeFineGrainedSessionVwap(
+      bars5mFrom0935,
+      rawWithPreMarketButMissingRthOpen,
+      300,
+      {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+        requireCompleteSession: true,
+        fineRawCoverageStartSec: t0400,
+      },
+    );
+    expect(rthFine.vwap).toEqual([]);
+
+    // computeCausalReplayVwapSeed must ALSO reject seeding RTH when 09:30..09:34 is missing despite 04:00 pre-market!
+    setRealStockSeries("VWAPRTH", "1m", rawWithPreMarketButMissingRthOpen);
+    const invalidRthSeed = computeCausalReplayVwapSeed("VWAPRTH", t0940, t0940 + 600, {
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      source: "hlc3",
+    });
+    expect(invalidRthSeed).toBeNull();
+
+    // 2. Full 5m bar [09:30..09:35) with total volume 50,000, but 1m ONLY has 09:34 (volume 10,000) -> MUST be rejected!
+    const full30m1m: Candle[] = Array.from({ length: 30 }, (_, i) => ({
+      time: t0930 + i * 60,
+      open: 41 + i * 0.04,
+      high: 41.25 + i * 0.04,
+      low: 40.85 + i * 0.04,
+      close: 41.1 + i * 0.04,
+      volume: 10_000,
+    }));
+    const full5m = aggregateCandles(full30m1m, 300) as Candle[];
+
+    const only0934InFirst5m = full30m1m.filter((b) => b.time >= t0930 + 240);
+    const resOnly0934 = computeFineGrainedSessionVwap(full5m, only0934InFirst5m, 300, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: false,
+      requireCompleteSession: false,
+    });
+    expect(resOnly0934.vwap).toEqual([]);
+
+    // 3. Internal 1m hole: missing 09:37 inside [09:35..09:40) (volume sum 40,000 != 50,000) -> MUST be rejected!
+    const missing0937 = full30m1m.filter((b) => b.time !== t0935 + 120);
+    const resMissing0937 = computeFineGrainedSessionVwap(full5m, missing0937, 300, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+    });
+    expect(resMissing0937.vwap).toEqual([]);
+
+    // 4. Genuine zero-trade minute omitted by provider: 09:37 had 0 trades (parent 5m volume === sum of the 4 active 1m bars & OHLC matches!)
+    const sparseZeroTrade1m = full30m1m.filter((b) => b.time !== t0935 + 120);
+    const sparseParent5m = aggregateCandles(sparseZeroTrade1m, 300) as Candle[];
+    const resSparseValid = computeFineGrainedSessionVwap(sparseParent5m, sparseZeroTrade1m, 300, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+    });
+    const ref1mVwap = vwapBands(sparseZeroTrade1m, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+    });
+    expect(resSparseValid.vwap).toHaveLength(sparseParent5m.length);
+    expect(resSparseValid.vwap.at(-1)!.value).toBeCloseTo(ref1mVwap.vwap.at(-1)!.value, 10);
+
+    // 5. Multi-session independent coverage: Day 1 complete, Day 2 missing 09:37 (hole), Day 3 complete
+    const day2_0930 = Math.floor(Date.UTC(2026, 10, 25, 14, 30, 0) / 1000);
+    const day3_0930 = Math.floor(Date.UTC(2026, 10, 27, 14, 30, 0) / 1000);
+    const day2Full1m: Candle[] = full30m1m.map((b, i) => ({
+      ...b,
+      time: day2_0930 + i * 60,
+      open: b.open + 2,
+      high: b.high + 2,
+      low: b.low + 2,
+      close: b.close + 2,
+    }));
+    const day3Full1m: Candle[] = full30m1m.map((b, i) => ({
+      ...b,
+      time: day3_0930 + i * 60,
+      open: b.open + 4,
+      high: b.high + 4,
+      low: b.low + 4,
+      close: b.close + 4,
+    }));
+    const threeDay5m = [
+      ...full5m,
+      ...(aggregateCandles(day2Full1m, 300) as Candle[]),
+      ...(aggregateCandles(day3Full1m, 300) as Candle[]),
+    ];
+    const threeDay1mWithDay2Hole = [
+      ...full30m1m,
+      ...day2Full1m.filter((b) => b.time !== day2_0930 + 7 * 60),
+      ...day3Full1m,
+    ];
+    const threeDayVwap = computeFineGrainedSessionVwap(
+      threeDay5m,
+      threeDay1mWithDay2Hole,
+      300,
+      {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+        requireCompleteSession: true,
+      },
+    );
+    const daysOut = new Set(threeDayVwap.vwap.map((p) => getNyTradingDayKey(p.time)));
+    expect(daysOut.has(20261124)).toBe(true);
+    expect(daysOut.has(20261125)).toBe(false); // Day 2 omitted cleanly due to internal 1m hole!
+    expect(daysOut.has(20261127)).toBe(true);
+
+    // 6. Seed whose `coveredUntilSec` ended during pre-market (< 09:30 ET) must be rejected for RTH!
+    const preMarketEndSeed = {
+      anchorBucket: 20261124,
+      cumVol: 100_000,
+      mean: 39.6,
+      sumSqWeightedDiff: 50,
+      coveredUntilSec: t0930 - 60,
+      source: "hlc3" as VwapPriceSource,
+    };
+    expect(
+      isVwapSessionCoverageComplete(rthFrom0935_1m, {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+        priorSessionSeed: preMarketEndSeed,
+      }),
+    ).toBe(false);
+
+    invalidateStockSeries("VWAPRTH");
+  });
+
+  it("O. Cobertura temporal real (doesSeriesCoverTargetTime): rechaza series incompletas del mismo día (10:00 vs 15:00 ET) y huecos RTH, acepta cierre, fin de semana y festivo NYSE", () => {
+    // 2026-11-25 (Wednesday before Thanksgiving) EST (UTC-5): 09:30 ET = 14:30 UTC
+    const wed0930 = Math.floor(Date.UTC(2026, 10, 25, 14, 30, 0) / 1000);
+    // Series ending at 10:00 ET (6 bars of 5m: 09:30..09:55, lastBar.end = 10:00 ET)
+    const wedUntil1000: Candle[] = Array.from({ length: 6 }, (_, i) => ({
+      time: wed0930 + i * 300,
+      open: 50,
+      high: 50.5,
+      low: 49.8,
+      close: 50.2,
+      volume: 10_000,
+    }));
+
+    const wed1500 = Math.floor(Date.UTC(2026, 10, 25, 20, 0, 0) / 1000); // 15:00 ET
+    const wed1630 = Math.floor(Date.UTC(2026, 10, 25, 21, 30, 0) / 1000); // 16:30 ET
+    const wed2030 = Math.floor(Date.UTC(2026, 10, 26, 1, 30, 0) / 1000); // 20:30 ET (same NY day)
+
+    // Series ending at 10:00 ET MUST return FALSE for 15:00 ET and 16:30 ET!
+    expect(doesSeriesCoverTargetTime(wedUntil1000, 300, wed1500, true)).toBe(false);
+    expect(doesSeriesCoverTargetTime(wedUntil1000, 300, wed1630, true)).toBe(false);
+
+    // Full RTH session 09:30..16:00 ET (78 bars of 5m)
+    const wedFullRth: Candle[] = Array.from({ length: 78 }, (_, i) => ({
+      time: wed0930 + i * 300,
+      open: 50,
+      high: 50.5,
+      low: 49.8,
+      close: 50.2,
+      volume: 10_000,
+    }));
+    expect(doesSeriesCoverTargetTime(wedFullRth, 300, wed1500, true)).toBe(true);
+    expect(doesSeriesCoverTargetTime(wedFullRth, 300, wed1630, true)).toBe(true);
+    expect(doesSeriesCoverTargetTime(wedFullRth, 300, wed2030, true)).toBe(true);
+
+    // Thanksgiving Thursday 2026-11-26 is an official US equity holiday!
+    expect(isUsEquityMarketHoliday(2026, 11, 26)).toBe(true);
+    const thanksgiving1400 = Math.floor(Date.UTC(2026, 10, 26, 19, 0, 0) / 1000); // Thu 14:00 ET
+    expect(doesSeriesCoverTargetTime(wedFullRth, 300, thanksgiving1400, true)).toBe(true);
+    expect(doesSeriesCoverTargetTime(wedUntil1000, 300, thanksgiving1400, true)).toBe(false);
+
+    // Next normal trading day open (Friday 2026-11-27 10:00 ET) must be FALSE when only Wednesday is loaded
+    const fri1000 = Math.floor(Date.UTC(2026, 10, 27, 15, 0, 0) / 1000);
+    expect(doesSeriesCoverTargetTime(wedFullRth, 300, fri1000, true)).toBe(false);
+
+    // Weekend: Friday 2026-11-20 full RTH close (16:00 ET) covers Saturday, Sunday, and Monday 02:00 ET overnight
+    const friNov20_0930 = Math.floor(Date.UTC(2026, 10, 20, 14, 30, 0) / 1000);
+    const friFullRth: Candle[] = Array.from({ length: 78 }, (_, i) => ({
+      time: friNov20_0930 + i * 300,
+      open: 50,
+      high: 50.5,
+      low: 49.8,
+      close: 50.2,
+      volume: 10_000,
+    }));
+    const sat1200 = Math.floor(Date.UTC(2026, 10, 21, 17, 0, 0) / 1000);
+    const sun1800 = Math.floor(Date.UTC(2026, 10, 22, 23, 0, 0) / 1000);
+    const mon0200 = Math.floor(Date.UTC(2026, 10, 23, 7, 0, 0) / 1000);
+    const mon1000 = Math.floor(Date.UTC(2026, 10, 23, 15, 0, 0) / 1000);
+    expect(doesSeriesCoverTargetTime(friFullRth, 300, sat1200, true)).toBe(true);
+    expect(doesSeriesCoverTargetTime(friFullRth, 300, sun1800, true)).toBe(true);
+    expect(doesSeriesCoverTargetTime(friFullRth, 300, mon0200, true)).toBe(true);
+    expect(doesSeriesCoverTargetTime(friFullRth, 300, mon1000, true)).toBe(false);
+
+    // Internal open-RTH hole: bars exist for 09:30..10:00 and 13:00..16:00, missing 10:00..13:00 -> target 11:30 ET is FALSE!
+    const wedWithRthHole = [
+      ...wedFullRth.slice(0, 6), // 09:30..10:00
+      ...wedFullRth.slice(42), // 13:00..16:00
+    ];
+    const wed1130 = Math.floor(Date.UTC(2026, 10, 25, 16, 30, 0) / 1000);
+    expect(doesSeriesCoverTargetTime(wedWithRthHole, 300, wed1130, true)).toBe(false);
+  });
+
+  it("P. Velas parciales agregadas, todas las transiciones de temporalidad (1m/5m/15m/1h/4h) y preparación de Replay desde historial de trades", async () => {
+    registerDynamicSymbol({
+      name: "AGGPART",
+      displayName: "Aggregated Partial Corp",
+      category: "STOCKS",
+      initialPrice: 25.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    // 1. ONLY 1m loaded up to 10:06 ET (09:30..10:06 = 37 bars; NO 5m series and NO 10:07..10:09!)
+    // Also remove 09:42 to confirm an INTERIOR hole in 09:40..09:45 is STILL excluded!
+    const t0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000);
+    const bars1mUpTo1006: Candle[] = Array.from({ length: 37 }, (_, i) => ({
+      time: t0930 + i * 60,
+      open: 25 + i * 0.1,
+      high: 25.25 + i * 0.1,
+      low: 24.9 + i * 0.1,
+      close: Number((25.08 + i * 0.1).toFixed(4)),
+      volume: 1_000 + i * 25,
+    })).filter((b) => b.time !== t0930 + 12 * 60); // drop 09:42 (interior hole in 09:40..09:45)
+
+    setRealStockSeries("AGGPART", "1m", bars1mUpTo1006);
+
+    const simAt1007 = t0930 + 37 * 60; // 10:07 ET
+    const resolved5m = getReplaySeriesWithProvenance("AGGPART", "5m", simAt1007 - 1);
+    expect(resolved5m.origin).toBe("aggregated");
+    expect(resolved5m.sourceTimeframe).toBe("1m");
+    // Interior hole bucket 09:40 MUST remain excluded!
+    expect(resolved5m.candles.some((c) => c.time === t0930 + 10 * 60)).toBe(false);
+    // Trailing in-progress partial bucket 10:05..10:07 MUST be present with exact 2m OHLCV!
+    const bar1005 = bars1mUpTo1006.find((b) => b.time === t0930 + 35 * 60)!;
+    const bar1006 = bars1mUpTo1006.find((b) => b.time === t0930 + 36 * 60)!;
+    const lastAgg5m = resolved5m.candles.at(-1)!;
+    expect(lastAgg5m.time).toBe(t0930 + 35 * 60);
+    expect(lastAgg5m.open).toBe(bar1005.open);
+    expect(lastAgg5m.close).toBe(bar1006.close);
+    expect(lastAgg5m.high).toBe(Math.max(bar1005.high, bar1006.high));
+    expect(lastAgg5m.low).toBe(Math.min(bar1005.low, bar1006.low));
+    expect(lastAgg5m.volume).toBe(bar1005.volume + bar1006.volume);
+
+    // Start Replay on 1m at 10:05, step to 10:06 (simTimeSec = 10:07), switch to 5m -> shows exact partial 10:05..10:07!
+    expect(useReplayStore.getState().start("AGGPART", "1m", bar1005.time).ok).toBe(true);
+    useReplayStore.getState().step();
+    expect(useReplayStore.getState().simTimeSec).toBe(simAt1007);
+    expect(useReplayStore.getState().changeTimeframe("5m")).toBe(true);
+    expect(useReplayStore.getState().simTimeSec).toBe(simAt1007);
+    expect(useReplayStore.getState().visible!.at(-1)!.volume).toBe(bar1005.volume + bar1006.volume);
+
+    // Calling step() on 5m when 10:07..10:09 does not exist MUST stop cleanly with dataWarning (no fabricated bars!)
+    useReplayStore.getState().step();
+    expect(useReplayStore.getState().simTimeSec).toBe(simAt1007);
+    expect(useReplayStore.getState().dataWarning).toBeTruthy();
+
+    useReplayStore.getState().stop();
+    invalidateStockSeries("AGGPART");
+
+    // 2. Full matrix of timeframe transitions: 1m->5m, 1m->15m, 5m->15m, 5m->1h, 15m->1h, 15m->4h, 1h->4h + stepBack()
+    registerDynamicSymbol({
+      name: "TFMATRIX",
+      displayName: "TF Matrix Corp",
+      category: "STOCKS",
+      initialPrice: 60.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    // 8 hours of contiguous 1m bars starting 08:00 UTC (2 full 4h buckets: 08:00..12:00 and 12:00..16:00)
+    const t0800Utc = Math.floor(Date.UTC(2026, 10, 24, 8, 0, 0) / 1000);
+    const full480_1m: Candle[] = Array.from({ length: 480 }, (_, i) => ({
+      time: t0800Utc + i * 60,
+      open: 60 + i * 0.02,
+      high: 60.15 + i * 0.02,
+      low: 59.9 + i * 0.02,
+      close: Number((60.05 + i * 0.02).toFixed(4)),
+      volume: 500 + (i % 17) * 10,
+    }));
+    const full5m = aggregateCandles(full480_1m, 300) as Candle[];
+    const full15m = aggregateCandles(full480_1m, 900) as Candle[];
+    const full1h = aggregateCandles(full480_1m, 3600) as Candle[];
+    const full4h = aggregateCandles(full480_1m, 14_400) as Candle[];
+    setRealStockSeries("TFMATRIX", "1m", full480_1m);
+    setRealStockSeries("TFMATRIX", "5m", full5m);
+    setRealStockSeries("TFMATRIX", "15m", full15m);
+    setRealStockSeries("TFMATRIX", "1h", full1h);
+    setRealStockSeries("TFMATRIX", "4h", full4h);
+
+    // Position at 13:15 UTC (1h15m into 12:00..16:00 4h bar)
+    const t1315Utc = t0800Utc + 315 * 60;
+    const t1300Utc = t0800Utc + 300 * 60;
+    const transitions: Array<[string, string, number]> = [
+      ["1m", "5m", t1315Utc - 60], // sim = 13:15
+      ["1m", "15m", t1315Utc - 60],
+      ["5m", "15m", t1315Utc - 300],
+      ["5m", "1h", t1315Utc - 300],
+      ["15m", "1h", t1300Utc], // sim = 13:15
+      ["15m", "4h", t1300Utc], // sim = 13:15
+      ["1h", "4h", t1300Utc], // sim = 14:00 (2h into 12:00..16:00)
+    ];
+
+    for (const [fromTf, toTf, startBarSec] of transitions) {
+      expect(useReplayStore.getState().start("TFMATRIX", fromTf, startBarSec).ok).toBe(true);
+      const exactSim = useReplayStore.getState().simTimeSec;
+      const expectedClose = full480_1m.find((b) => b.time === exactSim - 60)!.close;
+      expect(useReplayStore.getState().changeTimeframe(toTf)).toBe(true);
+      expect(useReplayStore.getState().simTimeSec).toBe(exactSim);
+      expect(useReplayStore.getState().visible!.at(-1)!.close).toBe(expectedClose);
+      // Verify stepBack moves cleanly to an earlier timestamp without mutating future bars
+      useReplayStore.getState().stepBack();
+      expect(useReplayStore.getState().simTimeSec).toBeLessThan(exactSim);
+    }
+    useReplayStore.getState().stop();
+
+    // 3. prepareAndStartTradeHistoryReplay calls ensureReplayHistoricalDataLoaded (4h + 1m + targetDate) before starting
+    const mockTrade = {
+      id: "tr-hist-1",
+      symbolId: "TFMATRIX",
+      symbolName: "TFMATRIX",
+      side: "BUY" as const,
+      quantity: 10,
+      entryPrice: 65,
+      exitPrice: 68,
+      realizedPnl: 30,
+      commission: 0,
+      swap: 0,
+      openedAt: new Date(t0800Utc * 1000).toISOString(),
+      closedAt: new Date((t0800Utc + 14_400) * 1000).toISOString(),
+    };
+    const ensureSpy = vi.fn(async () => ({
+      ok: true,
+      loadedTimeframes: ["4h", "1m"],
+      warnings: ["VWAP incompleto en sesión inicial"],
+    }));
+    const startSpy = vi.fn(() => ({ ok: true as const }));
+    const warningSpy = vi.fn();
+
+    const histOk = await prepareAndStartTradeHistoryReplay({
+      symbolName: "TFMATRIX",
+      trade: mockTrade,
+      entryTimeSec: t0800Utc,
+      anchorAtRegularOpen: true,
+      startReplay: startSpy,
+      setDataWarning: warningSpy,
+      ensureData: ensureSpy,
+    });
+    expect(histOk.ok).toBe(true);
+    expect(ensureSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        symbol: "TFMATRIX",
+        primaryTimeframe: "4h",
+        targetTimeSec: t0800Utc,
+        anchorAtRegularOpen: true,
+      }),
+    );
+    expect(startSpy).toHaveBeenCalledWith("TFMATRIX", "4h", t0800Utc, {
+      temporary: true,
+      trade: mockTrade,
+    });
+    expect(warningSpy).toHaveBeenCalledWith("VWAP incompleto en sesión inicial");
+
+    // When historical data preparation fails, Replay must NOT start on stale data!
+    startSpy.mockClear();
+    const histFail = await prepareAndStartTradeHistoryReplay({
+      symbolName: "TFMATRIX",
+      trade: mockTrade,
+      entryTimeSec: t0800Utc,
+      anchorAtRegularOpen: true,
+      startReplay: startSpy,
+      setDataWarning: warningSpy,
+      ensureData: async () => ({
+        ok: false,
+        loadedTimeframes: [],
+        warnings: [],
+        error: "Sin datos históricos reales para 2026-11-24",
+      }),
+    });
+    expect(histFail.ok).toBe(false);
+    expect(startSpy).not.toHaveBeenCalled();
+
+    invalidateStockSeries("TFMATRIX");
+  });
+
+  it("Q. Integridad de agregación (timestamps desalineados) y consistencia de Volumen / Volume MA20 en step, stepBack y múltiples gráficos", () => {
+    const t0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000);
+
+    // 1. Misaligned timestamps inside [09:30, 09:35): 5 bars at 09:30:00, :10, :20, :30, :40 -> NOT 5 aligned 1m bars!
+    const misalignedBars: Candle[] = [0, 10, 20, 30, 40].map((offsetSec, i) => ({
+      time: t0930 + offsetSec,
+      open: 10 + i * 0.1,
+      high: 10.2 + i * 0.1,
+      low: 9.9 + i * 0.1,
+      close: 10.1 + i * 0.1,
+      volume: 1_000,
+    }));
+    const validSecondBucket: Candle[] = Array.from({ length: 5 }, (_, i) => ({
+      time: t0930 + 300 + i * 60,
+      open: 11 + i * 0.1,
+      high: 11.2 + i * 0.1,
+      low: 10.9 + i * 0.1,
+      close: 11.1 + i * 0.1,
+      volume: 2_000,
+    }));
+
+    const misRes = aggregateCandlesWithIntegrity([...misalignedBars, ...validSecondBucket], 300, {
+      sourceStepSec: 60,
+      requireCompleteBuckets: true,
+    });
+    expect(misRes.misalignedInputCount).toBe(4);
+    expect(misRes.incompleteBucketTimes).toEqual([t0930]);
+    expect(misRes.completeBucketTimes).toEqual([t0930 + 300]);
+    expect(misRes.candles).toHaveLength(1);
+    expect(misRes.candles[0]!.time).toBe(t0930 + 300);
+    expect(misRes.candles[0]!.volume).toBe(10_000);
+
+    // 2. Volume MA20 consistency across step(), stepBack(), and synced 1m / 5m / 15m charts
+    registerDynamicSymbol({
+      name: "VOLMA20",
+      displayName: "Volume MA20 Corp",
+      category: "STOCKS",
+      initialPrice: 30.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    // 360 1m bars = 72 5m bars = 24 15m bars (ensures >= 20 closed bars on 1m, 5m AND 15m for Volume MA20)
+    const bars1m: Candle[] = Array.from({ length: 360 }, (_, i) => ({
+      time: t0930 + i * 60,
+      open: 30,
+      high: 30.2,
+      low: 29.8,
+      close: 30.1,
+      volume: 1_000 + (i + 1) * 100,
+    }));
+    const bars5m = aggregateCandles(bars1m, 300) as Candle[];
+    const bars15m = aggregateCandles(bars1m, 900) as Candle[];
+    setRealStockSeries("VOLMA20", "1m", bars1m);
+    setRealStockSeries("VOLMA20", "5m", bars5m);
+    setRealStockSeries("VOLMA20", "15m", bars15m);
+
+    const toVolHist = (list: ReadonlyArray<Candle>) =>
+      list.map((c) => ({ time: c.time as Time, value: c.volume }));
+
+    // Start at bar index 314 (14:44 ET, sim = 14:45 ET -> 315 closed 1m, 63 closed 5m, 21 closed 15m)
+    expect(useReplayStore.getState().start("VOLMA20", "1m", bars1m[314]!.time).ok).toBe(true);
+    const simBefore = useReplayStore.getState().simTimeSec;
+    const visBefore = useReplayStore.getState().visible!;
+    const maBefore = calculateReplayVolumeMa(toVolHist(visBefore), 60, simBefore, 20);
+    expect(maBefore.length).toBeGreaterThan(0);
+
+    // Step forward -> MA20 incorporates bar 315; stepBack -> MA20 returns bit-for-bit to maBefore!
+    useReplayStore.getState().step();
+    const simAfter = useReplayStore.getState().simTimeSec;
+    const visAfter = useReplayStore.getState().visible!;
+    const maAfter = calculateReplayVolumeMa(toVolHist(visAfter), 60, simAfter, 20);
+    expect(maAfter.at(-1)!.value).toBeGreaterThan(maBefore.at(-1)!.value);
+
+    useReplayStore.getState().stepBack();
+    const visRewound = useReplayStore.getState().visible!;
+    const maRewound = calculateReplayVolumeMa(
+      toVolHist(visRewound),
+      60,
+      useReplayStore.getState().simTimeSec,
+      20,
+    );
+    expect(maRewound).toEqual(maBefore);
+
+    // Multi-chart Volume MA20 at simAfter (14:46 ET = 1 minute into 14:45..14:50 5m and 14:45..15:00 15m):
+    // In-progress partial bar is strictly excluded from MA20 average while closed bars are included!
+    const slice5m = getReplaySliceForTimeframe("VOLMA20", "5m", simAfter);
+    const slice15m = getReplaySliceForTimeframe("VOLMA20", "15m", simAfter);
+    const ma5m = calculateReplayVolumeMa(toVolHist(slice5m), 300, simAfter, 20);
+    const ma15m = calculateReplayVolumeMa(toVolHist(slice15m), 900, simAfter, 20);
+    expect(ma5m.at(-1)!.time).toBe(slice5m.at(-2)!.time);
+    expect(ma15m.at(-1)!.time).toBe(slice15m.at(-2)!.time);
+    // Exact independent mean check on the last 20 closed 5m bars
+    const expectedMa5m =
+      slice5m
+        .slice(-21, -1)
+        .reduce((acc, b) => acc + b.volume, 0) / 20;
+    expect(ma5m.at(-1)!.value).toBeCloseTo(expectedMa5m, 2);
+
+    useReplayStore.getState().stop();
+    invalidateStockSeries("VOLMA20");
   });
 });
