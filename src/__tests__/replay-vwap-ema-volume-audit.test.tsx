@@ -12,6 +12,7 @@ import {
   computeReplayEmaWithWarmup,
   ema,
   getNyTradingDayKey,
+  isValidVwapSeedForDay,
   isVwapSessionCoverageComplete,
   type VwapPriceSource,
   vwapBands,
@@ -20,6 +21,7 @@ import {
   aggregateCandles,
   aggregateCandlesWithIntegrity,
   computeRequiredWarmupBars,
+  isSubIntervalOhlcvCoherent,
 } from "../lib/timeframes.ts";
 import {
   prepareAndStartTradeHistoryReplay,
@@ -34,6 +36,7 @@ import {
 } from "../server/ibkrEngine.ts";
 import {
   applyIbkrBar1s,
+  assessSeriesOpenSessionContinuity,
   buildPartialCandleOrNullUpTo,
   buildPartialCandleRange,
   computeCausalReplayVwapSeed,
@@ -2229,5 +2232,512 @@ describe("Auditoría Exhaustiva de Replay, VWAP, EMA, Volumen e IBKR (Escenarios
 
     useReplayStore.getState().stop();
     invalidateStockSeries("VOLMA20");
+  });
+
+  it("R. VWAP en 1 minuto: detecta huecos internos de 1m, duplicados y timestamps desalineados; acepta cobertura completa, sparse certificado y anclajes week/month/year", () => {
+    const t0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000); // 2026-11-24 09:30 EST
+
+    // Complete 10-minute 1m session (09:30..09:39)
+    const complete1m: Candle[] = Array.from({ length: 10 }, (_, i) => ({
+      time: t0930 + i * 60,
+      open: 100 + i * 0.2,
+      high: 100.4 + i * 0.2,
+      low: 99.8 + i * 0.2,
+      close: 100.1 + i * 0.2,
+      volume: 5_000 + i * 100,
+    }));
+
+    // 1. Complete 1m coverage -> valid VWAP
+    const completeCov = assessVwapSessionCoverage(complete1m, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      expectedBarStepSec: 60,
+      validateInternalGaps: true,
+    });
+    expect(completeCov.isComplete).toBe(true);
+    expect(completeCov.hasInternalGaps).toBe(false);
+    expect(completeCov.hasDuplicateTimestamps).toBe(false);
+    expect(completeCov.hasMisalignedTimestamps).toBe(false);
+
+    const completeVwap = computeFineGrainedSessionVwap(complete1m, null, 60, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+    });
+    expect(completeVwap.vwap).toHaveLength(10);
+
+    // 2. Single 1-minute internal gap (missing 09:33: 09:30, 09:31, 09:32, [gap], 09:34..)
+    const gap1m = complete1m.filter((b) => b.time !== t0930 + 3 * 60);
+    const gapCov = assessVwapSessionCoverage(gap1m, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      expectedBarStepSec: 60,
+      validateInternalGaps: true,
+    });
+    expect(gapCov.isComplete).toBe(false);
+    expect(gapCov.hasInternalGaps).toBe(true);
+
+    const gapVwap = computeFineGrainedSessionVwap(gap1m, null, 60, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+    });
+    expect(gapVwap.vwap).toEqual([]);
+
+    // 3. Provider-certified sparse zero-trade minute (`allowSparseZeroTradeGaps: true`) -> accepted!
+    const sparseVwap = computeFineGrainedSessionVwap(gap1m, null, 60, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+      sessionCoverageByDay: {
+        20261124: {
+          startSec: t0930,
+          endSec: t0930 + 10 * 60,
+          allowSparseZeroTradeGaps: true,
+        },
+      },
+    });
+    expect(sparseVwap.vwap).toHaveLength(9);
+
+    // 4. Duplicate timestamps on 1m (duplicate 09:31) -> rejected!
+    const dup1m: Candle[] = [...complete1m.slice(0, 2), { ...complete1m[1]! }, ...complete1m.slice(2)];
+    const dupCov = assessVwapSessionCoverage(dup1m, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      expectedBarStepSec: 60,
+      validateInternalGaps: true,
+    });
+    expect(dupCov.isComplete).toBe(false);
+    expect(dupCov.hasDuplicateTimestamps).toBe(true);
+    expect(
+      computeFineGrainedSessionVwap(dup1m, null, 60, {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+        requireCompleteSession: true,
+      }).vwap,
+    ).toEqual([]);
+
+    // 5. Misaligned timestamp on 1m (09:31:15 instead of 09:31:00) -> rejected!
+    const misaligned1m: Candle[] = complete1m.map((b, i) =>
+      i === 1 ? { ...b, time: b.time + 15 } : b,
+    );
+    const misCov = assessVwapSessionCoverage(misaligned1m, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      expectedBarStepSec: 60,
+      validateInternalGaps: true,
+    });
+    expect(misCov.isComplete).toBe(false);
+    expect(misCov.hasMisalignedTimestamps).toBe(true);
+    expect(
+      computeFineGrainedSessionVwap(misaligned1m, null, 60, {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+        requireCompleteSession: true,
+      }).vwap,
+    ).toEqual([]);
+
+    // 6. Incomplete start (starts at 09:35 without seed) -> rejected; multi-day validates each day independently
+    const day2_0930 = Math.floor(Date.UTC(2026, 10, 25, 14, 30, 0) / 1000);
+    const day2Gap1m: Candle[] = complete1m
+      .map((b, i) => ({ ...b, time: day2_0930 + i * 60 }))
+      .filter((b) => b.time !== day2_0930 + 4 * 60);
+    const multiDay1mVwap = computeFineGrainedSessionVwap(
+      [...complete1m, ...day2Gap1m],
+      null,
+      60,
+      {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+        requireCompleteSession: true,
+      },
+    );
+    const daysPresent = new Set(multiDay1mVwap.vwap.map((p) => getNyTradingDayKey(p.time)));
+    expect(daysPresent.has(20261124)).toBe(true);
+    expect(daysPresent.has(20261125)).toBe(false);
+
+    // 7. Weekly, monthly, yearly anchors remain intact
+    for (const anchor of ["week", "month", "year"] as const) {
+      const res = computeFineGrainedSessionVwap(complete1m, null, 60, { anchor });
+      expect(res.vwap).toHaveLength(complete1m.length);
+    }
+  });
+
+  it("S. Semilla histórica del VWAP: valida cobertura completa, rechaza huecos internos, otra sesión, otro símbolo, información futura y volumen inválido", () => {
+    registerDynamicSymbol({
+      name: "SEEDCHK",
+      displayName: "Seed Check Corp",
+      category: "STOCKS",
+      initialPrice: 80.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    const t0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000);
+    const t0940 = t0930 + 10 * 60;
+    const t0950 = t0930 + 20 * 60;
+
+    const full20m1m: Candle[] = Array.from({ length: 20 }, (_, i) => ({
+      time: t0930 + i * 60,
+      open: 80 + i * 0.15,
+      high: 80.3 + i * 0.15,
+      low: 79.85 + i * 0.15,
+      close: 80.1 + i * 0.15,
+      volume: 3_000 + i * 200,
+    }));
+    setRealStockSeries("SEEDCHK", "1m", full20m1m);
+
+    // 1. Seed with full continuous coverage [09:30, 09:40) -> valid and matches full continuous VWAP bit-for-bit!
+    const validSeed = computeCausalReplayVwapSeed("SEEDCHK", t0940, t0950, {
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      source: "hlc3",
+    });
+    expect(validSeed).not.toBeNull();
+    expect(validSeed!.symbol).toBe("SEEDCHK");
+    expect(validSeed!.sessionMode).toBe("regular");
+    expect(validSeed!.sessionAnchorSec).toBe(t0930);
+    expect(validSeed!.coverageComplete).toBe(true);
+    expect(validSeed!.coveredUntilSec).toBe(t0940);
+
+    const visibleFrom0940 = full20m1m.slice(10);
+    const seededVwap = vwapBands(visibleFrom0940, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+      priorSessionSeed: validSeed,
+      symbol: "SEEDCHK",
+      simTimeSec: t0950,
+    });
+    const fullRefVwap = vwapBands(full20m1m, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      requireCompleteSession: true,
+    });
+    expect(seededVwap.vwap).toHaveLength(10);
+    expect(seededVwap.vwap.at(-1)!.value).toBeCloseTo(fullRefVwap.vwap.at(-1)!.value, 10);
+
+    // 2. Seed with internal 1m gap (missing 09:33 inside [09:30, 09:40)) -> REJECTED (null)!
+    const gapped1m = full20m1m.filter((b) => b.time !== t0930 + 3 * 60);
+    setRealStockSeries("SEEDCHK", "1m", gapped1m);
+    const gappedSeed = computeCausalReplayVwapSeed("SEEDCHK", t0940, t0950, {
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      source: "hlc3",
+    });
+    expect(gappedSeed).toBeNull();
+
+    // 3. Seed from another session (extended vs regular, or wrong day bucket) -> REJECTED!
+    expect(
+      isValidVwapSeedForDay(
+        { ...validSeed!, sessionMode: "extended" },
+        20261124,
+        t0940,
+        "hlc3",
+        t0930,
+        { symbol: "SEEDCHK", anchorAtRegularOpen: true, simTimeSec: t0950 },
+      ),
+    ).toBe(false);
+    expect(
+      isValidVwapSeedForDay(
+        { ...validSeed!, anchorBucket: 20261123 },
+        20261124,
+        t0940,
+        "hlc3",
+        t0930,
+        { symbol: "SEEDCHK", anchorAtRegularOpen: true, simTimeSec: t0950 },
+      ),
+    ).toBe(false);
+
+    // 4. Seed from another symbol -> REJECTED (both by validator and vwapBands -> [])!
+    const wrongSymSeed = { ...validSeed!, symbol: "OTHERSYM" };
+    expect(
+      isValidVwapSeedForDay(wrongSymSeed, 20261124, t0940, "hlc3", t0930, {
+        symbol: "SEEDCHK",
+        anchorAtRegularOpen: true,
+        simTimeSec: t0950,
+      }),
+    ).toBe(false);
+    expect(
+      vwapBands(visibleFrom0940, {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+        requireCompleteSession: true,
+        priorSessionSeed: wrongSymSeed,
+        symbol: "SEEDCHK",
+        simTimeSec: t0950,
+      }).vwap,
+    ).toEqual([]);
+
+    // 5. Seed containing future information (`coveredUntilSec > firstDayBarSec` or `> simTimeSec`) -> REJECTED!
+    expect(
+      isValidVwapSeedForDay(
+        { ...validSeed!, coveredUntilSec: t0940 + 60 },
+        20261124,
+        t0940,
+        "hlc3",
+        t0930,
+        { symbol: "SEEDCHK", anchorAtRegularOpen: true, simTimeSec: t0950 },
+      ),
+    ).toBe(false);
+    expect(
+      isValidVwapSeedForDay(
+        { ...validSeed!, coveredUntilSec: t0940 },
+        20261124,
+        t0940,
+        "hlc3",
+        t0930,
+        { symbol: "SEEDCHK", anchorAtRegularOpen: true, simTimeSec: t0940 - 60 },
+      ),
+    ).toBe(false);
+
+    // 6. Seed with invalid volume (0, negative, NaN) or `coverageComplete: false` -> REJECTED!
+    expect(
+      isValidVwapSeedForDay({ ...validSeed!, cumVol: 0 }, 20261124, t0940, "hlc3", t0930),
+    ).toBe(false);
+    expect(
+      isValidVwapSeedForDay({ ...validSeed!, cumVol: Number.NaN }, 20261124, t0940, "hlc3", t0930),
+    ).toBe(false);
+    expect(
+      isValidVwapSeedForDay(
+        { ...validSeed!, coverageComplete: false },
+        20261124,
+        t0940,
+        "hlc3",
+        t0930,
+      ),
+    ).toBe(false);
+
+    invalidateStockSeries("SEEDCHK");
+  });
+
+  it("T. Detección de huecos pequeños en sesión abierta vs cierres normales, anticipados, fines de semana y festivos", async () => {
+    registerDynamicSymbol({
+      name: "GAPSMALL",
+      displayName: "Small Gap Corp",
+      category: "STOCKS",
+      initialPrice: 50.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    // 2026-11-24 regular Tuesday (09:30..16:00 ET)
+    const tue0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000);
+    const full1mTue: Candle[] = Array.from({ length: 60 }, (_, i) => ({
+      time: tue0930 + i * 60,
+      open: 50,
+      high: 50.3,
+      low: 49.8,
+      close: 50.1,
+      volume: 2_000,
+    }));
+
+    // 1. Small 1-minute gap during open RTH (missing 09:40 -> gap of 60s, far below old 30m threshold!)
+    const tueWith1mGap = full1mTue.filter((b) => b.time !== tue0930 + 10 * 60);
+    // Target right inside the 1-minute gap (09:40:30) -> FALSE!
+    expect(doesSeriesCoverTargetTime(tueWith1mGap, 60, tue0930 + 10 * 60 + 30, true)).toBe(false);
+    // Target after the 1-minute gap (10:15) with `validateSessionContinuity: true` -> FALSE!
+    expect(
+      doesSeriesCoverTargetTime(tueWith1mGap, 60, tue0930 + 45 * 60, true, {
+        validateSessionContinuity: true,
+      }),
+    ).toBe(false);
+    const contReport = assessSeriesOpenSessionContinuity(
+      tueWith1mGap,
+      60,
+      tue0930 + 45 * 60,
+      true,
+    );
+    expect(contReport.isContinuous).toBe(false);
+    expect(contReport.gaps).toHaveLength(1);
+    expect(contReport.gaps[0]!.missingBars).toBe(1);
+
+    // Provider-certified sparse zero-trade metadata allows the 1-minute gap cleanly
+    expect(
+      doesSeriesCoverTargetTime(tueWith1mGap, 60, tue0930 + 10 * 60 + 30, true, {
+        allowSparseZeroTradeGaps: true,
+      }),
+    ).toBe(true);
+
+    // 2. Large gap during open RTH (missing 09:40..10:10) -> FALSE!
+    const tueWithLargeGap = full1mTue.filter(
+      (b) => b.time < tue0930 + 10 * 60 || b.time >= tue0930 + 40 * 60,
+    );
+    expect(doesSeriesCoverTargetTime(tueWithLargeGap, 60, tue0930 + 25 * 60, true)).toBe(false);
+
+    // 3. ensureReplayHistoricalDataLoaded BLOCKS starting Replay when primary series has a small open-session gap!
+    setRealStockSeries("GAPSMALL", "1m", tueWith1mGap);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ symbol: "GAPSMALL", candles: tueWith1mGap }), { status: 200 }),
+      ),
+    );
+    const loadGapped = await ensureReplayHistoricalDataLoaded({
+      symbol: "GAPSMALL",
+      primaryTimeframe: "1m",
+      targetDate: "2026-11-24",
+      targetTimeSec: tue0930 + 45 * 60,
+      anchorAtRegularOpen: true,
+    });
+    expect(loadGapped.ok).toBe(false);
+    expect(loadGapped.error).toContain("hueco");
+
+    // 4. Official Early-Close Day: Friday 2026-11-27 (day after Thanksgiving, closes at 13:00 ET)
+    const blackFri0930 = Math.floor(Date.UTC(2026, 10, 27, 14, 30, 0) / 1000);
+    const blackFriFullEarlyClose: Candle[] = Array.from({ length: 42 }, (_, i) => ({
+      // 42 * 5m = 210m = 3h30m -> 09:30..13:00 ET
+      time: blackFri0930 + i * 300,
+      open: 51,
+      high: 51.4,
+      low: 50.8,
+      close: 51.2,
+      volume: 8_000,
+    }));
+    const blackFri1400 = Math.floor(Date.UTC(2026, 10, 27, 19, 0, 0) / 1000); // 14:00 ET (after 13:00 early close)
+    const satNov28_1200 = Math.floor(Date.UTC(2026, 10, 28, 17, 0, 0) / 1000); // Saturday
+    expect(doesSeriesCoverTargetTime(blackFriFullEarlyClose, 300, blackFri1400, true)).toBe(true);
+    expect(doesSeriesCoverTargetTime(blackFriFullEarlyClose, 300, satNov28_1200, true)).toBe(true);
+
+    // Incomplete early-close day ending at 10:00 ET MUST be rejected for 12:00 ET and 14:00 ET!
+    const blackFriUntil1000 = blackFriFullEarlyClose.slice(0, 6);
+    const blackFri1200 = Math.floor(Date.UTC(2026, 10, 27, 17, 0, 0) / 1000);
+    expect(doesSeriesCoverTargetTime(blackFriUntil1000, 300, blackFri1200, true)).toBe(false);
+    expect(doesSeriesCoverTargetTime(blackFriUntil1000, 300, blackFri1400, true)).toBe(false);
+
+    invalidateStockSeries("GAPSMALL");
+  });
+
+  it("U. Velas parciales con volumen cero: coherencia OHLCV estricta, rechazo de contradicciones, sin duplicación de volumen y sin sesgo futuro", () => {
+    registerDynamicSymbol({
+      name: "ZEROVOL",
+      displayName: "Zero Vol Integrity Corp",
+      category: "STOCKS",
+      initialPrice: 15.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    const t0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000);
+    const t0935 = t0930 + 300;
+    const t0932 = t0930 + 120;
+
+    // 1. Zero-volume parent 5m candle with COMPATIBLE zero-volume 1m sub-candles -> ACCEPTED!
+    const zeroParent: Candle = {
+      time: t0930,
+      open: 15.0,
+      high: 15.0,
+      low: 15.0,
+      close: 15.0,
+      volume: 0,
+    };
+    const compatibleZero1m: Candle[] = Array.from({ length: 6 }, (_, i) => ({
+      time: t0930 + i * 60,
+      open: 15.0,
+      high: 15.0,
+      low: 15.0,
+      close: 15.0,
+      volume: 0,
+    }));
+    expect(
+      isSubIntervalOhlcvCoherent(zeroParent, compatibleZero1m.slice(0, 5), compatibleZero1m.slice(0, 2)),
+    ).toBe(true);
+    expect(validateSubIntervalCoverage(compatibleZero1m, 60, zeroParent, 300, t0930, t0932)).toBe(
+      true,
+    );
+
+    setRealStockSeries("ZEROVOL", "1m", compatibleZero1m);
+    const partialZeroOk = buildPartialCandleOrNullUpTo("ZEROVOL", zeroParent, "5m", t0932);
+    expect(partialZeroOk).not.toBeNull();
+    expect(partialZeroOk!.volume).toBe(0);
+    expect(partialZeroOk!.close).toBe(15.0);
+
+    // 2. Zero-volume parent 5m candle with CONTRADICTORY sub-candles (sub-volume > 0) -> REJECTED!
+    const contradictoryVol1m: Candle[] = compatibleZero1m.map((b, i) =>
+      i === 1 ? { ...b, volume: 250 } : b,
+    );
+    expect(
+      isSubIntervalOhlcvCoherent(
+        zeroParent,
+        contradictoryVol1m.slice(0, 5),
+        contradictoryVol1m.slice(0, 2),
+      ),
+    ).toBe(false);
+    expect(validateSubIntervalCoverage(contradictoryVol1m, 60, zeroParent, 300, t0930, t0932)).toBe(
+      false,
+    );
+    setRealStockSeries("ZEROVOL", "1m", contradictoryVol1m);
+    expect(buildPartialCandleOrNullUpTo("ZEROVOL", zeroParent, "5m", t0932)).toBeNull();
+
+    // 3. Zero-volume parent 5m candle with CONTRADICTORY prices (sub high 16.5 > parent high 15.0) -> REJECTED!
+    const contradictoryPrice1m: Candle[] = compatibleZero1m.map((b, i) =>
+      i === 1 ? { ...b, high: 16.5, close: 16.2 } : b,
+    );
+    expect(
+      validateSubIntervalCoverage(contradictoryPrice1m, 60, zeroParent, 300, t0930, t0932),
+    ).toBe(false);
+    setRealStockSeries("ZEROVOL", "1m", contradictoryPrice1m);
+    expect(buildPartialCandleOrNullUpTo("ZEROVOL", zeroParent, "5m", t0932)).toBeNull();
+
+    // 4. Positive-volume parent 5m candle: coherent sub-bars accepted without future look-ahead;
+    //    sub-bars exceeding parent volume rejected; duplicated timestamps never double-counted!
+    const coherentPos1m: Candle[] = [
+      { time: t0930, open: 15.0, high: 15.2, low: 14.9, close: 15.1, volume: 1_000 },
+      { time: t0930 + 60, open: 15.1, high: 15.3, low: 15.0, close: 15.25, volume: 1_500 },
+      { time: t0930 + 120, open: 15.25, high: 15.4, low: 15.2, close: 15.35, volume: 1_200 },
+      { time: t0930 + 180, open: 15.35, high: 15.5, low: 15.3, close: 15.4, volume: 1_300 },
+      // Future spike at 09:34 (must NEVER appear in [09:30, 09:32) partial candle!)
+      { time: t0930 + 240, open: 15.4, high: 22.0, low: 12.0, close: 21.0, volume: 5_000 },
+      { time: t0935, open: 21.0, high: 21.2, low: 20.8, close: 21.1, volume: 1_000 },
+    ];
+    const posParent5m: Candle = {
+      time: t0930,
+      open: 15.0,
+      high: 22.0,
+      low: 12.0,
+      close: 21.0,
+      volume: 10_000,
+    };
+
+    // Duplicate 09:30 + 60 bar inside input -> deduplicated, volume MUST NOT be double-counted!
+    const dupInput1m: Candle[] = [coherentPos1m[0]!, coherentPos1m[1]!, { ...coherentPos1m[1]! }, ...coherentPos1m.slice(2)];
+    const aggDup = aggregateCandlesWithIntegrity(dupInput1m.slice(0, 6), 300, {
+      sourceStepSec: 60,
+      requireCompleteBuckets: true,
+    });
+    expect(aggDup.duplicateInputCount).toBe(1);
+    expect(aggDup.candles).toHaveLength(1);
+    expect(aggDup.candles[0]!.volume).toBe(10_000); // NOT 11_500!
+
+    setRealStockSeries("ZEROVOL", "1m", dupInput1m);
+    const partialPos = buildPartialCandleOrNullUpTo("ZEROVOL", posParent5m, "5m", t0932);
+    expect(partialPos).not.toBeNull();
+    expect(partialPos!.open).toBe(15.0);
+    expect(partialPos!.high).toBe(15.3); // Future 09:34 high ($22.0) excluded!
+    expect(partialPos!.low).toBe(14.9); // Future 09:34 low ($12.0) excluded!
+    expect(partialPos!.close).toBe(15.25);
+    expect(partialPos!.volume).toBe(2_500); // 1,000 + 1,500 without double counting!
+
+    // Contradictory parent claiming only 2,000 volume when sub-bars sum to 10,000 -> REJECTED!
+    const underReportedParent: Candle = { ...posParent5m, volume: 2_000 };
+    expect(
+      validateSubIntervalCoverage(coherentPos1m, 60, underReportedParent, 300, t0930, t0932),
+    ).toBe(false);
+    expect(buildPartialCandleOrNullUpTo("ZEROVOL", underReportedParent, "5m", t0932)).toBeNull();
+
+    invalidateStockSeries("ZEROVOL");
   });
 });

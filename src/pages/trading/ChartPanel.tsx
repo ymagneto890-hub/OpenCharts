@@ -2134,6 +2134,8 @@ export function ChartPanel({
     fine1mVwapBundle.rawCoverageStartSec,
     isUsStockForVwap,
     isReplaying,
+    selectedSymbol,
+    replaySimTimeSec,
   );
 
   // ── Real-time live stream (IBKR for stocks, Crypto SSE for crypto/perps; persists across TF switches) ──

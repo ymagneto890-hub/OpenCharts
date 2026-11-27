@@ -1405,11 +1405,21 @@ export interface VwapSessionSeed {
   coveredUntilSec?: number;
   /** Price source used to build the seed; must match `VwapBandsOptions.source` when specified. */
   source?: VwapPriceSource;
+  /** Instrument symbol (normalized uppercase) that generated this seed. */
+  symbol?: string;
+  /** Session mode (`"regular"` for 09:30 ET RTH, `"extended"` for 04:00 ET / UTC). */
+  sessionMode?: "regular" | "extended";
+  /** Session anchor start timestamp (seconds) from which this seed accumulated bars. */
+  sessionAnchorSec?: number;
+  /** Explicitly false when seed coverage is incomplete or has unjustified gaps. */
+  coverageComplete?: boolean;
 }
 
 export interface VwapDayCoverageWindow {
   startSec: number;
   endSec?: number;
+  /** When true, provider metadata certifies that absent 1m bars inside `[startSec, endSec]` genuinely had zero trades. */
+  allowSparseZeroTradeGaps?: boolean;
 }
 
 export interface VwapBandsOptions {
@@ -1437,6 +1447,14 @@ export interface VwapBandsOptions {
    * `priorSessionSeed` supplies the missing pre-window volume for that specific session day.
    */
   requireCompleteSession?: boolean;
+  /** Expected bar interval in seconds (e.g. `60` for 1-minute candles) used to validate internal session continuity. */
+  expectedBarStepSec?: number;
+  /** When true (default for 1m session VWAP), rejects sessions with internal 1m gaps, duplicate timestamps, or misaligned timestamps unless provider metadata certifies sparse zero-trade periods. */
+  validateInternalGaps?: boolean;
+  /** Expected instrument symbol used to cross-check `priorSessionSeed.symbol`. */
+  symbol?: string;
+  /** Replay simulation cutoff (exclusive seconds) used to reject seeds containing future information. */
+  simTimeSec?: number;
 }
 
 export interface VwapDayCoverageStatus {
@@ -1445,6 +1463,9 @@ export interface VwapDayCoverageStatus {
   earliestBarSec: number;
   coverageStartSec: number;
   seeded: boolean;
+  hasInternalGaps?: boolean;
+  hasDuplicateTimestamps?: boolean;
+  hasMisalignedTimestamps?: boolean;
 }
 
 export interface VwapSessionCoverageAssessment {
@@ -1454,6 +1475,9 @@ export interface VwapSessionCoverageAssessment {
   earliestBarSec: number | null;
   coverageStartSec: number | null;
   seeded: boolean;
+  hasInternalGaps?: boolean;
+  hasDuplicateTimestamps?: boolean;
+  hasMisalignedTimestamps?: boolean;
   days?: Record<number, VwapDayCoverageStatus>;
 }
 
@@ -1696,19 +1720,46 @@ function lookupDayCoverage(
   return record[day] ?? null;
 }
 
+export interface VwapSeedValidationContext {
+  symbol?: string;
+  anchorAtRegularOpen?: boolean;
+  simTimeSec?: number;
+}
+
 export function isValidVwapSeedForDay(
   priorSeed: VwapSessionSeed | null | undefined,
   day: number,
   firstDayBarSec: number,
   source: VwapPriceSource,
   sessionAnchorSec?: number,
+  validation?: VwapSeedValidationContext,
 ): priorSeed is VwapSessionSeed {
   if (!priorSeed) return false;
+  if (priorSeed.coverageComplete === false) return false;
   if (priorSeed.anchorBucket !== day) return false;
   if (!Number.isFinite(priorSeed.cumVol) || !(priorSeed.cumVol > 0)) return false;
   if (!Number.isFinite(priorSeed.mean) || !(priorSeed.mean > 0)) return false;
   if (!Number.isFinite(priorSeed.sumSqWeightedDiff) || priorSeed.sumSqWeightedDiff < 0) return false;
   if (priorSeed.source && priorSeed.source !== source) return false;
+  if (
+    priorSeed.symbol &&
+    validation?.symbol &&
+    priorSeed.symbol.trim().toUpperCase() !== validation.symbol.trim().toUpperCase()
+  ) {
+    return false;
+  }
+  if (priorSeed.sessionMode && validation?.anchorAtRegularOpen !== undefined) {
+    const expectedMode = validation.anchorAtRegularOpen ? "regular" : "extended";
+    if (priorSeed.sessionMode !== expectedMode) return false;
+  }
+  if (
+    priorSeed.sessionAnchorSec !== undefined &&
+    typeof sessionAnchorSec === "number" &&
+    Number.isFinite(sessionAnchorSec) &&
+    priorSeed.sessionAnchorSec !== sessionAnchorSec
+  ) {
+    return false;
+  }
   if (priorSeed.coveredUntilSec !== undefined) {
     if (!Number.isFinite(priorSeed.coveredUntilSec) || priorSeed.coveredUntilSec > firstDayBarSec) {
       return false;
@@ -1720,8 +1771,101 @@ export function isValidVwapSeedForDay(
     ) {
       return false;
     }
+    if (
+      typeof validation?.simTimeSec === "number" &&
+      Number.isFinite(validation.simTimeSec) &&
+      validation.simTimeSec > 0 &&
+      priorSeed.coveredUntilSec > validation.simTimeSec
+    ) {
+      return false;
+    }
   }
   return true;
+}
+
+interface DayBarIntegrityReport {
+  hasInternalGaps: boolean;
+  hasDuplicateTimestamps: boolean;
+  hasMisalignedTimestamps: boolean;
+}
+
+/**
+ * Inspects raw session bars per day for internal gaps, duplicate timestamps, and misaligned timestamps.
+ * Respects provider-certified `allowSparseZeroTradeGaps` windows when present.
+ */
+function inspectPerDayBarIntegrity(
+  rawCandles: ReadonlyArray<CandleData>,
+  stepSec: number,
+  sessionTimeZone: VwapSessionTimeZone,
+  anchorAtRegularOpen: boolean,
+  coverageByDay: VwapBandsOptions["sessionCoverageByDay"],
+): Map<number, DayBarIntegrityReport> {
+  const perDayRawTimes = new Map<number, number[]>();
+  const reports = new Map<number, DayBarIntegrityReport>();
+
+  for (const c of rawCandles) {
+    if (!c || !Number.isFinite(c.time) || !Number.isFinite(c.close) || c.close <= 0) continue;
+    let day: number;
+    if (anchorAtRegularOpen) {
+      const ny = getNySessionMinutes(c.time);
+      if (ny.minutes < 570 || ny.minutes >= 960) continue;
+      day = ny.dayKey;
+    } else {
+      day = getVwapAnchorBucket(c.time, "session", sessionTimeZone);
+    }
+    const list = perDayRawTimes.get(day);
+    if (list) list.push(c.time);
+    else perDayRawTimes.set(day, [c.time]);
+  }
+
+  for (const [day, times] of perDayRawTimes.entries()) {
+    let hasDuplicateTimestamps = false;
+    let hasMisalignedTimestamps = false;
+    let hasInternalGaps = false;
+
+    const seen = new Set<number>();
+    const uniqueSorted: number[] = [];
+    for (const rawT of times) {
+      const floored = Math.floor(rawT);
+      if (rawT !== floored || floored % stepSec !== 0) {
+        hasMisalignedTimestamps = true;
+      }
+      if (seen.has(floored)) {
+        hasDuplicateTimestamps = true;
+      } else {
+        seen.add(floored);
+        uniqueSorted.push(floored);
+      }
+    }
+    uniqueSorted.sort((a, b) => a - b);
+
+    const explicitDayCov = lookupDayCoverage(coverageByDay, day);
+    const allowSparse = Boolean(explicitDayCov?.allowSparseZeroTradeGaps);
+    for (let i = 1; i < uniqueSorted.length; i++) {
+      const prev = uniqueSorted[i - 1]!;
+      const curr = uniqueSorted[i]!;
+      if (curr - prev > stepSec) {
+        const coveredBySparseMeta =
+          allowSparse &&
+          explicitDayCov !== null &&
+          Number.isFinite(explicitDayCov.startSec) &&
+          explicitDayCov.startSec <= prev &&
+          (explicitDayCov.endSec === undefined || explicitDayCov.endSec >= curr);
+        if (!coveredBySparseMeta) {
+          hasInternalGaps = true;
+          break;
+        }
+      }
+    }
+
+    reports.set(day, {
+      hasInternalGaps,
+      hasDuplicateTimestamps,
+      hasMisalignedTimestamps,
+    });
+  }
+
+  return reports;
 }
 
 function resolveDayCoverageStartSec(
@@ -1828,6 +1972,25 @@ export function assessVwapSessionCoverage(
     };
   }
 
+  const shouldValidateInternalGaps =
+    options.validateInternalGaps === true ||
+    (options.expectedBarStepSec === 60 && options.validateInternalGaps !== false);
+  const integrityStepSec = options.expectedBarStepSec ?? 60;
+  const perDayIntegrity = shouldValidateInternalGaps
+    ? inspectPerDayBarIntegrity(
+        rawCandles,
+        integrityStepSec,
+        sessionTimeZone,
+        anchorAtRegularOpen,
+        options.sessionCoverageByDay,
+      )
+    : null;
+  const seedValidation: VwapSeedValidationContext = {
+    symbol: options.symbol,
+    anchorAtRegularOpen,
+    simTimeSec: options.simTimeSec,
+  };
+
   const days: Record<number, VwapDayCoverageStatus> = {};
   let firstDayInSeries = true;
   let lastDay = -1;
@@ -1854,13 +2017,23 @@ export function assessVwapSessionCoverage(
         earliestDayBarSec,
         source,
         sessionAnchorSec,
+        seedValidation,
       );
+    const integrity = perDayIntegrity?.get(day);
+    const integrityOk =
+      !integrity ||
+      (!integrity.hasInternalGaps &&
+        !integrity.hasDuplicateTimestamps &&
+        !integrity.hasMisalignedTimestamps);
     days[day] = {
-      isComplete: seeded || dayCovStart <= sessionAnchorSec,
+      isComplete: (seeded || dayCovStart <= sessionAnchorSec) && integrityOk,
       sessionAnchorSec,
       earliestBarSec: earliestDayBarSec,
       coverageStartSec: dayCovStart,
       seeded,
+      hasInternalGaps: integrity?.hasInternalGaps ?? false,
+      hasDuplicateTimestamps: integrity?.hasDuplicateTimestamps ?? false,
+      hasMisalignedTimestamps: integrity?.hasMisalignedTimestamps ?? false,
     };
     firstDayInSeries = false;
     lastDay = day;
@@ -1874,6 +2047,9 @@ export function assessVwapSessionCoverage(
     earliestBarSec: latestStatus.earliestBarSec,
     coverageStartSec: latestStatus.coverageStartSec,
     seeded: latestStatus.seeded,
+    hasInternalGaps: latestStatus.hasInternalGaps,
+    hasDuplicateTimestamps: latestStatus.hasDuplicateTimestamps,
+    hasMisalignedTimestamps: latestStatus.hasMisalignedTimestamps,
     days,
   };
 }
@@ -1916,6 +2092,26 @@ export function vwapBands(
     }
   }
 
+  const shouldValidateInternalGaps =
+    anchor === "session" &&
+    (options.validateInternalGaps === true ||
+      (options.expectedBarStepSec === 60 && options.validateInternalGaps !== false));
+  const integrityStepSec = options.expectedBarStepSec ?? 60;
+  const perDayIntegrity = shouldValidateInternalGaps
+    ? inspectPerDayBarIntegrity(
+        rawCandles,
+        integrityStepSec,
+        sessionTimeZone,
+        anchorAtRegularOpen,
+        options.sessionCoverageByDay,
+      )
+    : null;
+  const seedValidation: VwapSeedValidationContext = {
+    symbol: options.symbol,
+    anchorAtRegularOpen,
+    simTimeSec: options.simTimeSec,
+  };
+
   const vwapLine: IndicatorPoint[] = [];
   const upper1: IndicatorPoint[] = [];
   const lower1: IndicatorPoint[] = [];
@@ -1947,14 +2143,28 @@ export function vwapBands(
         anchor === "session"
           ? getSessionAnchorStartSec(c.time, sessionTimeZone, anchorAtRegularOpen)
           : undefined;
+      const dayIntegrity = perDayIntegrity?.get(bucket);
+      const dayIntegrityFailed = Boolean(
+        dayIntegrity &&
+          (dayIntegrity.hasInternalGaps ||
+            dayIntegrity.hasDuplicateTimestamps ||
+            dayIntegrity.hasMisalignedTimestamps),
+      );
       const hasMatchingSeed =
         lastBucket === null &&
-        isValidVwapSeedForDay(priorSeed, bucket, c.time, source, anchorSecForBucket);
+        isValidVwapSeedForDay(
+          priorSeed,
+          bucket,
+          c.time,
+          source,
+          anchorSecForBucket,
+          seedValidation,
+        );
       if (hasMatchingSeed) {
         cumVol = priorSeed!.cumVol;
         mean = priorSeed!.mean;
         sumSqWeightedDiff = Math.max(0, priorSeed!.sumSqWeightedDiff);
-        bucketIncomplete = false;
+        bucketIncomplete = dayIntegrityFailed;
       } else {
         cumVol = 0;
         mean = 0;
@@ -1974,9 +2184,9 @@ export function vwapBands(
             options.sessionCoverageByDay,
             anchorAtRegularOpen,
           );
-          bucketIncomplete = dayCovStart > anchorSec;
+          bucketIncomplete = dayCovStart > anchorSec || dayIntegrityFailed;
         } else {
-          bucketIncomplete = false;
+          bucketIncomplete = dayIntegrityFailed;
         }
       }
       fallbackCount = 0;
@@ -2065,6 +2275,13 @@ export function computeFineGrainedSessionVwap(
 ): VwapBandsResult {
   const anchor: VwapAnchorPeriod = options.anchor ?? "session";
   if (anchor !== "session" || !Number.isFinite(targetTfSec) || targetTfSec <= 60) {
+    if (anchor === "session" && Number.isFinite(targetTfSec) && targetTfSec === 60) {
+      return vwapBands(targetCandles, {
+        ...options,
+        expectedBarStepSec: 60,
+        validateInternalGaps: options.validateInternalGaps ?? true,
+      });
+    }
     return vwapBands(targetCandles, options);
   }
 
@@ -2083,9 +2300,12 @@ export function computeFineGrainedSessionVwap(
   const anchorAtRegularOpen =
     Boolean(options.anchorAtRegularOpen) && sessionTz === "america-new-york";
 
+  // When `targetTfSec > 60`, bucket-by-bucket reconciliation below differentiates provider-omitted
+  // zero-trade minutes from true missing data using `targetCandles`, so disable raw 1m gap pre-rejection here.
   const fineRes = vwapBands(normalizedFine, {
     ...options,
     rawCoverageStartSec: options.fineRawCoverageStartSec,
+    validateInternalGaps: false,
   });
   if (fineRes.vwap.length === 0) {
     return emptyVwapBandsResult();
@@ -2169,6 +2389,11 @@ export function computeFineGrainedSessionVwap(
         fineStart,
         source,
         anchorSec,
+        {
+          symbol: options.symbol,
+          anchorAtRegularOpen,
+          simTimeSec: options.simTimeSec,
+        },
       );
       if (!seeded && sameDayCovStart > anchorSec) continue;
     }

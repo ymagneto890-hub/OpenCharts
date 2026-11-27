@@ -82,6 +82,8 @@ export function useIndicators(
   vwapFineRawCoverageStartSec?: number,
   vwapRequireCompleteSession = false,
   isReplaying = false,
+  symbol?: string,
+  replaySimTimeSec?: number,
 ): void {
   const indicatorSeriesRef = useRef<Map<string, ISeriesApi<"Line"> | ISeriesApi<"Histogram">>>(
     new Map(),
@@ -639,9 +641,11 @@ export function useIndicators(
               rawCoverageStartSec: vwapRawCoverageStartSec,
               fineRawCoverageStartSec: vwapFineRawCoverageStartSec,
               requireCompleteSession: vwapRequireCompleteSession || isReplaying,
+              symbol,
+              simTimeSec: isReplaying ? replaySimTimeSec : undefined,
             },
           );
-          if (isReplaying && anchor === "session" && tfSec > 60 && indCandles.length > 0) {
+          if (isReplaying && anchor === "session" && tfSec >= 60 && indCandles.length > 0) {
             const lastCandle = indCandles[indCandles.length - 1]!;
             const lastDay =
               vwapSessionTimeZone === "america-new-york"

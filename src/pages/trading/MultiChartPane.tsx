@@ -1367,9 +1367,11 @@ export function MultiChartPane({
           rawCoverageStartSec: paneRawCoverageStartSec,
           fineRawCoverageStartSec: paneFine1mVwapBundle.rawCoverageStartSec,
           requireCompleteSession: sessionCtx.isUsStock || isReplaying,
+          symbol: paneSymbol,
+          simTimeSec: isReplaying ? replaySimTimeSec : undefined,
         },
       );
-      if (isReplaying && anchor === "session" && paneTfSec > 60 && indCandles.length > 0) {
+      if (isReplaying && anchor === "session" && paneTfSec >= 60 && indCandles.length > 0) {
         const lastBar = indCandles[indCandles.length - 1]!;
         const lastDay =
           paneVwapTz === "america-new-york"

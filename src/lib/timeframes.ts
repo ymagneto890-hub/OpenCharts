@@ -318,6 +318,98 @@ export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
 }
 
 /**
+ * Validates OHLCV coherence between a higher-timeframe parent candle and its finer sub-candles.
+ * Rejects contradictory prices (sub-high > parent-high, sub-low < parent-low, mismatched opening bar),
+ * non-zero sub-volume under a zero-volume parent candle, or sub-volume exceeding the parent candle's volume.
+ */
+export function isSubIntervalOhlcvCoherent<T extends OhlcvBar>(
+  parentCandle: OhlcvBar,
+  parentSubs: ReadonlyArray<T>,
+  windowSubs: ReadonlyArray<T>,
+): boolean {
+  if (
+    !parentCandle ||
+    !Number.isFinite(parentCandle.open) ||
+    !Number.isFinite(parentCandle.high) ||
+    !Number.isFinite(parentCandle.low) ||
+    !Number.isFinite(parentCandle.close) ||
+    parentCandle.close <= 0
+  ) {
+    return false;
+  }
+  const parentVol =
+    Number.isFinite(parentCandle.volume) && parentCandle.volume >= 0
+      ? parentCandle.volume
+      : -1;
+  if (parentVol < 0) return false;
+
+  const parentHigh = Math.max(parentCandle.high, parentCandle.open, parentCandle.close);
+  const parentLow = Math.min(parentCandle.low, parentCandle.open, parentCandle.close);
+  const priceTol = Math.max(1e-5, Math.abs(parentCandle.close) * 1e-6);
+  // Allow tiny 2-decimal rounding accumulation across summed sub-candles (e.g. 966.68 vs 966.69)
+  // while keeping zero-volume parent candles strictly at 0 (`1e-6`).
+  const volTol = Math.max(0.05, parentVol * 1e-4);
+
+  const checkSubList = (subs: ReadonlyArray<T>): { ok: boolean; totalVol: number } => {
+    let totalVol = 0;
+    for (const c of subs) {
+      if (
+        !c ||
+        !Number.isFinite(c.open) ||
+        !Number.isFinite(c.high) ||
+        !Number.isFinite(c.low) ||
+        !Number.isFinite(c.close) ||
+        c.close <= 0 ||
+        !Number.isFinite(c.volume) ||
+        c.volume < 0
+      ) {
+        return { ok: false, totalVol: 0 };
+      }
+      const cHigh = Math.max(c.high, c.open, c.close);
+      const cLow = Math.min(c.low, c.open, c.close);
+      if (cHigh > parentHigh + priceTol || cLow < parentLow - priceTol) {
+        return { ok: false, totalVol: 0 };
+      }
+      totalVol += c.volume;
+    }
+    return { ok: true, totalVol };
+  };
+
+  const parentCheck = checkSubList(parentSubs);
+  if (!parentCheck.ok) return false;
+  const windowCheck = checkSubList(windowSubs);
+  if (!windowCheck.ok) return false;
+
+  if (parentVol === 0) {
+    if (parentCheck.totalVol > 1e-6 || windowCheck.totalVol > 1e-6) {
+      return false;
+    }
+  } else {
+    if (parentCheck.totalVol > parentVol + volTol || windowCheck.totalVol > parentVol + volTol) {
+      return false;
+    }
+  }
+
+  if (
+    parentSubs.length > 0 &&
+    Math.floor(parentSubs[0]!.time) === Math.floor(parentCandle.time) &&
+    Math.abs(parentSubs[0]!.open - parentCandle.open) > priceTol
+  ) {
+    return false;
+  }
+
+  if (
+    windowSubs.length > 0 &&
+    Math.floor(windowSubs[0]!.time) === Math.floor(parentCandle.time) &&
+    Math.abs(windowSubs[0]!.open - parentCandle.open) > priceTol
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Deterministically aggregates finer OHLCV bars (e.g. 1s or 1m) into any target timeframe or step in seconds.
  */
 export function aggregateCandles<T extends OhlcvBar>(

@@ -15,6 +15,7 @@ import {
   aggregateCandlesWithIntegrity,
   computeRequiredWarmupBars,
   getBucketStartSec,
+  isSubIntervalOhlcvCoherent,
   mergeLive1sBarIntoSeries,
   parseTimeframeSeconds,
 } from "../../lib/timeframes.ts";
@@ -899,11 +900,102 @@ function hasSkippedNyTradingDayBetween(
   return false;
 }
 
+export interface SeriesCoverageCheckOptions {
+  /** Provider-certified sparse coverage where absent bars inside an open session genuinely had zero trades. */
+  allowSparseZeroTradeGaps?: boolean;
+  /** When true, also validates that there are no internal gaps earlier in the active open session up to `targetTimeSec`. */
+  validateSessionContinuity?: boolean;
+}
+
+export interface OpenSessionGapInfo {
+  fromSec: number;
+  toSec: number;
+  missingBars: number;
+}
+
+export interface OpenSessionContinuityReport {
+  isContinuous: boolean;
+  gaps: OpenSessionGapInfo[];
+}
+
+/**
+ * Validates continuity of expected intervals during the open trading session containing `targetTimeSec`,
+ * detecting small and intermediate gaps while respecting legitimate market closes, official early closes,
+ * overnight closures, weekends, and US equity holidays.
+ */
+export function assessSeriesOpenSessionContinuity(
+  bars: ReadonlyArray<Candle>,
+  tfSec: number,
+  targetTimeSec: number,
+  isStock: boolean,
+  options?: { allowSparseZeroTradeGaps?: boolean },
+): OpenSessionContinuityReport {
+  if (bars.length === 0 || !(tfSec > 0) || tfSec >= 86_400 || !Number.isFinite(targetTimeSec)) {
+    return { isContinuous: true, gaps: [] };
+  }
+  if (options?.allowSparseZeroTradeGaps) {
+    return { isContinuous: true, gaps: [] };
+  }
+
+  const gaps: OpenSessionGapInfo[] = [];
+  if (isStock) {
+    const tgtNy = getNyClockParts(targetTimeSec);
+    if (!isNyTradingDay(tgtNy.year, tgtNy.month, tgtNy.day, tgtNy.weekday)) {
+      return { isContinuous: true, gaps: [] };
+    }
+    const closeMin = isUsEquityEarlyCloseDay(tgtNy.year, tgtNy.month, tgtNy.day, tgtNy.weekday)
+      ? 780
+      : 960;
+
+    let prevBar: Candle | null = null;
+    for (const bar of bars) {
+      if (bar.time > targetTimeSec) break;
+      const bNy = getNyClockParts(bar.time);
+      if (bNy.dayKey !== tgtNy.dayKey) continue;
+      // Check continuity strictly inside open Regular Trading Hours [09:30 ET, closeMin)
+      if (bNy.minutes < 570 || bNy.minutes >= closeMin) continue;
+      if (prevBar !== null) {
+        const delta = bar.time - prevBar.time;
+        if (delta > tfSec) {
+          gaps.push({
+            fromSec: prevBar.time + tfSec,
+            toSec: bar.time,
+            missingBars: Math.max(1, Math.round(delta / tfSec) - 1),
+          });
+        }
+      }
+      prevBar = bar;
+    }
+    return { isContinuous: gaps.length === 0, gaps };
+  }
+
+  // 24x7 non-stock instruments (e.g. crypto): no market closures during the target UTC day
+  const targetUtcDay = Math.floor(targetTimeSec / 86_400);
+  let prevBar: Candle | null = null;
+  for (const bar of bars) {
+    if (bar.time > targetTimeSec) break;
+    if (Math.floor(bar.time / 86_400) !== targetUtcDay) continue;
+    if (prevBar !== null) {
+      const delta = bar.time - prevBar.time;
+      if (delta > tfSec) {
+        gaps.push({
+          fromSec: prevBar.time + tfSec,
+          toSec: bar.time,
+          missingBars: Math.max(1, Math.round(delta / tfSec) - 1),
+        });
+      }
+    }
+    prevBar = bar;
+  }
+  return { isContinuous: gaps.length === 0, gaps };
+}
+
 export function doesSeriesCoverTargetTime(
   bars: ReadonlyArray<Candle>,
   tfSec: number,
   targetTimeSec: number,
   isStock: boolean,
+  options?: SeriesCoverageCheckOptions,
 ): boolean {
   if (bars.length === 0 || !Number.isFinite(targetTimeSec) || targetTimeSec <= 0) return false;
   if (bars[0]!.time > targetTimeSec) return false;
@@ -921,21 +1013,38 @@ export function doesSeriesCoverTargetTime(
 
   const lastBar = bars[bars.length - 1]!;
   if (lastBar.time + tfSec >= targetTimeSec) {
-    // Reject large internal missing-data holes during open Regular Trading Hours on the same day
-    if (isStock && tfSec < 86_400 && nearestBefore.time + tfSec < targetTimeSec) {
-      const prevEndNy = getNyClockParts(nearestBefore.time + tfSec);
-      const tgtNy = getNyClockParts(targetTimeSec);
-      if (
-        prevEndNy.dayKey === tgtNy.dayKey &&
-        isNyTradingDay(tgtNy.year, tgtNy.month, tgtNy.day, tgtNy.weekday) &&
-        prevEndNy.minutes >= 570 &&
-        prevEndNy.minutes < 960 &&
-        tgtNy.minutes >= 570 &&
-        tgtNy.minutes < 960 &&
-        targetTimeSec - (nearestBefore.time + tfSec) > Math.max(tfSec * 4, 1_800)
-      ) {
+    // Reject even small missing-data holes during open trading sessions (no arbitrary 30m/60m tolerance!)
+    if (!options?.allowSparseZeroTradeGaps && tfSec < 86_400 && nearestBefore.time + tfSec < targetTimeSec) {
+      if (isStock) {
+        const prevEndNy = getNyClockParts(nearestBefore.time + tfSec);
+        const tgtNy = getNyClockParts(targetTimeSec);
+        const closeMin = isUsEquityEarlyCloseDay(tgtNy.year, tgtNy.month, tgtNy.day, tgtNy.weekday)
+          ? 780
+          : 960;
+        if (
+          prevEndNy.dayKey === tgtNy.dayKey &&
+          isNyTradingDay(tgtNy.year, tgtNy.month, tgtNy.day, tgtNy.weekday) &&
+          prevEndNy.minutes >= 570 &&
+          prevEndNy.minutes < closeMin &&
+          tgtNy.minutes >= 570 &&
+          tgtNy.minutes < closeMin
+        ) {
+          return false;
+        }
+      } else {
+        // 24x7 non-stock instrument has no market closures: any open gap at targetTimeSec is missing data
         return false;
       }
+    }
+    if (options?.validateSessionContinuity) {
+      const continuity = assessSeriesOpenSessionContinuity(
+        bars,
+        tfSec,
+        targetTimeSec,
+        isStock,
+        options,
+      );
+      if (!continuity.isContinuous) return false;
     }
     return true;
   }
@@ -1301,6 +1410,12 @@ export function validateSubIntervalCoverage(
     windowSlots.size === expectedWindowSlots &&
     lastSubTime + subSec >= rangeEnd;
 
+  // Enforce strict OHLCV coherence between `candle` and its sub-candles BEFORE accepting
+  // any partial reconstruction — including when `candle.volume === 0` or all window slots exist.
+  if (!isSubIntervalOhlcvCoherent(candle, parentSubs, windowSubs)) {
+    return false;
+  }
+
   if (hasAllContiguousWindowSlots) {
     return true;
   }
@@ -1342,7 +1457,8 @@ export function validateSubIntervalCoverage(
     return false;
   }
 
-  // `candle.volume === 0`: only valid if sub-series spans across `[rangeStart, rangeEnd)` without missing boundary
+  // `candle.volume === 0`: already verified above that all `parentSubs` and `windowSubs`
+  // have `volume === 0` and OHLC bounds consistent with `candle`.
   return surroundsWindow || Boolean(options?.allowSparseProviderCoverage);
 }
 
@@ -1382,7 +1498,7 @@ export function resolvePartialCandleWindow(
 
     const resolved = getReplaySeriesWithProvenance(symbol, candidate, toSec - 1);
     if (resolved.origin !== "real") continue;
-    const subCandles = resolved.candles;
+    const subCandles = normalizeSortedUniqueBars(resolved.candles);
     if (!doesSubSeriesCoverParentInterval(subCandles, cSec, candle, tfSec, fromSec, toSec)) {
       continue;
     }
@@ -1476,9 +1592,12 @@ export function computeCausalReplayVwapSeed(
     sessionTimeZone?: VwapSessionTimeZone;
     anchorAtRegularOpen?: boolean;
     source?: VwapPriceSource;
+    /** When true, provider metadata certifies that absent 1m bars in `[anchorStartSec, cutoffExclusive)` genuinely had zero trades. */
+    allowSparseZeroTradeGaps?: boolean;
   } = {},
 ): VwapSessionSeed | null {
-  if (!(visibleStartSec > 0) || !(simTimeSec > 0)) return null;
+  if (!symbol || !symbol.trim() || !(visibleStartSec > 0) || !(simTimeSec > 0)) return null;
+  const upperSym = symbol.trim().toUpperCase();
   const sessionTz: VwapSessionTimeZone = options.sessionTimeZone ?? "america-new-york";
   const anchorAtRegularOpen =
     Boolean(options.anchorAtRegularOpen) && sessionTz === "america-new-york";
@@ -1492,9 +1611,10 @@ export function computeCausalReplayVwapSeed(
   );
   if (cutoffExclusive <= anchorStartSec) return null;
 
-  const resolved1m = getReplaySeriesWithProvenance(symbol, "1m", simTimeSec - 1);
+  const resolved1m = getReplaySeriesWithProvenance(upperSym, "1m", simTimeSec - 1);
   if (
-    (resolved1m.origin !== "real" && resolved1m.origin !== "aggregated") ||
+    (resolved1m.origin !== "real" &&
+      !(resolved1m.origin === "aggregated" && resolved1m.sourceTimeframe === "1s")) ||
     resolved1m.candles.length === 0
   ) {
     return null;
@@ -1524,6 +1644,13 @@ export function computeCausalReplayVwapSeed(
   }
   if (earliestSameDayBarSec > anchorStartSec) return null;
 
+  // Validate full 1-minute continuity across `[anchorStartSec, cutoffExclusive)` so internal
+  // unjustified gaps, duplicates, misaligned timestamps, or invalid volumes invalidate the seed.
+  const alignedCutoffSec = Math.floor(cutoffExclusive / 60) * 60;
+  const expectedSlots = Math.floor((alignedCutoffSec - anchorStartSec) / 60);
+  if (expectedSlots <= 0) return null;
+
+  const seenSlots = new Set<number>();
   let cumVol = 0;
   let mean = 0;
   let sumSqWeightedDiff = 0;
@@ -1537,6 +1664,17 @@ export function computeCausalReplayVwapSeed(
         ? getNyTradingDayKey(b.time)
         : Math.floor(b.time / 86400);
     if (bBucket !== targetBucket) continue;
+
+    // Reject misaligned or duplicate timestamps inside the seed window
+    if (b.time !== Math.floor(b.time) || (b.time - anchorStartSec) % 60 !== 0) {
+      return null;
+    }
+    if (seenSlots.has(b.time)) {
+      return null;
+    }
+    seenSlots.add(b.time);
+
+    if (!Number.isFinite(b.volume) || b.volume < 0) return null;
     if (!(b.volume > 0)) continue;
     const tp =
       source === "close"
@@ -1546,11 +1684,15 @@ export function computeCausalReplayVwapSeed(
           : source === "ohlc4"
             ? (b.open + b.high + b.low + b.close) / 4
             : (b.high + b.low + b.close) / 3;
-    if (!Number.isFinite(tp) || tp <= 0) continue;
+    if (!Number.isFinite(tp) || tp <= 0) return null;
     const prevMean = mean;
     cumVol += b.volume;
     mean = prevMean + (b.volume / cumVol) * (tp - prevMean);
     sumSqWeightedDiff += b.volume * (tp - prevMean) * (tp - mean);
+  }
+
+  if (!options.allowSparseZeroTradeGaps && seenSlots.size !== expectedSlots) {
+    return null;
   }
 
   if (!(cumVol > 0)) return null;
@@ -1561,6 +1703,10 @@ export function computeCausalReplayVwapSeed(
     sumSqWeightedDiff: Math.max(0, sumSqWeightedDiff),
     coveredUntilSec: cutoffExclusive,
     source,
+    symbol: upperSym,
+    sessionMode: anchorAtRegularOpen ? "regular" : "extended",
+    sessionAnchorSec: anchorStartSec,
+    coverageComplete: true,
   };
 }
 
@@ -2205,6 +2351,23 @@ export async function ensureReplayHistoricalDataLoaded(
     };
   }
 
+  const primaryTfSec = TF_SECONDS[primaryTimeframe] ?? parseTimeframeSeconds(primaryTimeframe);
+  const primaryContinuity = assessSeriesOpenSessionContinuity(
+    primaryResolved.candles,
+    primaryTfSec,
+    targetTimeSec,
+    isStock,
+  );
+  if (!primaryContinuity.isContinuous) {
+    const totalMissing = primaryContinuity.gaps.reduce((acc, g) => acc + g.missingBars, 0);
+    return {
+      ok: false,
+      error: `Histórico incompleto para ${upperSym} (${primaryTimeframe}) en ${targetDate}: se detectaron ${primaryContinuity.gaps.length} hueco(s) (${totalMissing} velas faltantes) durante la sesión abierta.`,
+      warnings,
+      vwap1mComplete: false,
+    };
+  }
+
   const primaryIdxAtTarget = findBarIndexAtOrBefore(primaryResolved.candles, targetTimeSec);
   const barsAvailableForWarmup = primaryIdxAtTarget >= 0 ? primaryIdxAtTarget + 1 : 0;
   const emaWarmup = assessEmaWarmup(barsAvailableForWarmup, configuredPeriods);
@@ -2229,12 +2392,17 @@ export async function ensureReplayHistoricalDataLoaded(
         anchor: "session",
         sessionTimeZone: sessionTz,
         anchorAtRegularOpen,
+        expectedBarStepSec: 60,
+        validateInternalGaps: true,
+        symbol: upperSym,
       });
       const dayComplete = cov1m.days?.[targetDayBucket]?.isComplete ?? cov1m.isComplete;
       if (!dayComplete) {
         vwap1mComplete = false;
         warnings.push(
-          `El histórico de 1m para ${upperSym} en esta sesión empieza después del inicio (${anchorAtRegularOpen ? "09:30 ET" : "04:00 ET"}); la sesión está incompleta para el VWAP.`,
+          cov1m.hasInternalGaps
+            ? `El histórico de 1m para ${upperSym} en esta sesión presenta huecos internos; el VWAP se oculta para evitar cálculos inexactos.`
+            : `El histórico de 1m para ${upperSym} en esta sesión empieza después del inicio (${anchorAtRegularOpen ? "09:30 ET" : "04:00 ET"}); la sesión está incompleta para el VWAP.`,
         );
       }
     }
