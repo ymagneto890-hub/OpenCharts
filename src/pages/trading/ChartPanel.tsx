@@ -71,6 +71,7 @@ import {
   trackIbkrSymbol,
 } from "../../services/ibkrStream.ts";
 import {
+  computeCausalReplayVwapSeed,
   getHistory,
   getStockSessionMetadata,
   getStockVwapSeed,
@@ -2030,27 +2031,60 @@ export function ChartPanel({
     demoSymForVwap?.exchange,
   ]);
 
-  const activePriorVwapSeed =
-    isUsStockForVwap && !isReplaying
-      ? getStockVwapSeed(selectedSymbol, chartPrefs.showExtendedHours, timeframe)
-      : null;
   const anchorVwapAtRegularOpen =
     isUsStockForVwap && !chartPrefs.showExtendedHours && !hasExtendedFilterFallback;
 
-  const fine1mVwapCandles = useMemo(() => {
+  const activePriorVwapSeed = useMemo(() => {
+    if (!isUsStockForVwap) return null;
+    if (isReplaying) {
+      if (!(replaySimTimeSec > 0) || liveIndicatorData.length === 0) return null;
+      const firstSec = Number(liveIndicatorData[0]!.time);
+      if (!Number.isFinite(firstSec) || firstSec <= 0) return null;
+      return computeCausalReplayVwapSeed(selectedSymbol, firstSec, replaySimTimeSec, {
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: anchorVwapAtRegularOpen,
+        source: indicatorSettings.vwap?.source ?? "hlc3",
+      });
+    }
+    return getStockVwapSeed(selectedSymbol, chartPrefs.showExtendedHours, timeframe);
+  }, [
+    isUsStockForVwap,
+    isReplaying,
+    replaySimTimeSec,
+    liveIndicatorData,
+    selectedSymbol,
+    anchorVwapAtRegularOpen,
+    indicatorSettings.vwap?.source,
+    chartPrefs.showExtendedHours,
+    timeframe,
+  ]);
+
+  const fine1mVwapBundle = useMemo(() => {
     const tfSec = parseTimeframeSeconds(timeframe);
-    if (tfSec <= 60 || tfSec >= 86_400) return null;
-    if (!isStockSymbol && !isCryptoInstrument(selectedSymbol)) return null;
-    if (isStockSymbol && !hasRealStockSeries(selectedSymbol) && !isReplaying) return null;
+    if (tfSec <= 60 || tfSec >= 86_400) {
+      return { candles: null, rawCoverageStartSec: undefined as number | undefined };
+    }
+    if (!isStockSymbol && !isCryptoInstrument(selectedSymbol)) {
+      return { candles: null, rawCoverageStartSec: undefined };
+    }
+    if (isStockSymbol && !hasRealStockSeries(selectedSymbol) && !isReplaying) {
+      return { candles: null, rawCoverageStartSec: undefined };
+    }
     const raw1m =
       isReplaying && replaySimTimeSec > 0
         ? getReplaySliceForTimeframe(selectedSymbol, "1m", replaySimTimeSec)
-        : getHistory(selectedSymbol, "1m", 1_500);
-    if (raw1m.length === 0) return null;
-    if (isStockSymbol && !chartPrefs.showExtendedHours && !hasExtendedFilterFallback) {
-      return filterExtendedHoursCandles(raw1m, false, stockMetaForVwap, demoSymForVwap?.exchange);
+        : getHistory(selectedSymbol, "1m");
+    if (raw1m.length === 0) {
+      return { candles: null, rawCoverageStartSec: undefined };
     }
-    return raw1m;
+    const rawCoverageStartSec = raw1m[0]!.time;
+    if (isStockSymbol && !chartPrefs.showExtendedHours && !hasExtendedFilterFallback) {
+      return {
+        candles: filterExtendedHoursCandles(raw1m, false, stockMetaForVwap, demoSymForVwap?.exchange),
+        rawCoverageStartSec,
+      };
+    }
+    return { candles: raw1m, rawCoverageStartSec };
   }, [
     timeframe,
     selectedSymbol,
@@ -2063,6 +2097,8 @@ export function ChartPanel({
     demoSymForVwap?.exchange,
     liveIndicatorData,
   ]);
+  const fine1mVwapCandles = fine1mVwapBundle.candles;
+  const chartRawCoverageStartSec = candles.length > 0 ? candles[0]!.time : undefined;
 
   useIndicators(
     chartRef,
@@ -2081,6 +2117,9 @@ export function ChartPanel({
     activePriorVwapSeed,
     anchorVwapAtRegularOpen,
     fine1mVwapCandles,
+    chartRawCoverageStartSec,
+    fine1mVwapBundle.rawCoverageStartSec,
+    isUsStockForVwap,
   );
 
   // ── Real-time live stream (IBKR for stocks, Crypto SSE for crypto/perps; persists across TF switches) ──

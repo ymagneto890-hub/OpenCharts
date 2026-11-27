@@ -11,6 +11,7 @@ import {
   MousePointer2,
   CalendarDays,
 } from "lucide-react";
+import { getChartPreferencesFromStorage } from "../../hooks/useChartPreferences.ts";
 import { cn } from "../../lib/utils.ts";
 import {
   getLastReplayTimeSec,
@@ -19,7 +20,7 @@ import {
 } from "../../services/demo/replay.ts";
 import { toast } from "../../services/toast.ts";
 import {
-  fetchHistoryAsync,
+  ensureReplayHistoricalDataLoaded,
   getHistory,
   isReplayDataSynthetic,
 } from "../../services/demo/candles.ts";
@@ -50,9 +51,17 @@ interface ReplayHUDProps {
   accountId?: string | null;
   symbol?: string;
   timeframe?: string;
+  additionalTimeframes?: readonly string[];
+  secondarySymbols?: ReadonlyArray<{ symbol: string; timeframe: string }>;
 }
 
-export function ReplayHUD({ accountId: _accountId, symbol = "BTCUSD", timeframe = "1d" }: ReplayHUDProps) {
+export function ReplayHUD({
+  accountId: _accountId,
+  symbol = "BTCUSD",
+  timeframe = "1d",
+  additionalTimeframes = [],
+  secondarySymbols = [],
+}: ReplayHUDProps) {
   const {
     phase,
     visible,
@@ -62,9 +71,11 @@ export function ReplayHUD({ accountId: _accountId, symbol = "BTCUSD", timeframe 
     speed,
     finished,
     isTemporary,
+    dataWarning,
     beginPick,
     cancelPick,
     start,
+    setDataWarning,
     play,
     pause,
     step,
@@ -133,26 +144,45 @@ export function ReplayHUD({ accountId: _accountId, symbol = "BTCUSD", timeframe 
     }
 
     const timeSec = Math.floor(dateObj.getTime() / 1000);
-    if (isReplayDataSynthetic(symbol, timeframe, timeSec)) {
-      const pad = (n: number) => String(n).padStart(2, "0");
-      const targetDate = `${dateObj.getFullYear()}-${pad(dateObj.getMonth() + 1)}-${pad(dateObj.getDate())}`;
-      setLoadingRemoteDate(true);
-      try {
-        const tfsToLoad = Array.from(new Set([timeframe, "1m", "3m", "5m"]));
-        await Promise.all(
-          tfsToLoad.map((tf) => fetchHistoryAsync(symbol, tf, 1_500, { targetDate }).catch(() => [])),
-        );
-      } finally {
-        setLoadingRemoteDate(false);
-      }
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const targetDate = `${dateObj.getFullYear()}-${pad(dateObj.getMonth() + 1)}-${pad(dateObj.getDate())}`;
+    const anchorAtRegularOpen = !getChartPreferencesFromStorage().showExtendedHours;
+
+    setLoadingRemoteDate(true);
+    let loadRes: Awaited<ReturnType<typeof ensureReplayHistoricalDataLoaded>>;
+    try {
+      loadRes = await ensureReplayHistoricalDataLoaded({
+        symbol,
+        primaryTimeframe: timeframe,
+        additionalTimeframes,
+        secondarySymbols,
+        targetDate,
+        targetTimeSec: timeSec,
+        anchorAtRegularOpen,
+      });
+    } finally {
+      setLoadingRemoteDate(false);
+    }
+
+    if (!loadRes.ok) {
+      toast.warning(
+        "Datos históricos insuficientes",
+        loadRes.error ?? "No se encontraron datos históricos reales para la fecha seleccionada.",
+      );
+      return;
     }
 
     const res = start(symbol, timeframe, timeSec, { temporary: false });
     if (res.ok) {
-      toast.success(
-        "Replay Actualizado",
-        `Posicionado en ${dateObj.toLocaleDateString("es-ES")} ${dateObj.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}. Velas posteriores ocultas.`,
-      );
+      if (loadRes.warnings.length > 0) {
+        setDataWarning(loadRes.warnings[0]!);
+        toast.warning("Aviso de datos históricos", loadRes.warnings[0]!);
+      } else {
+        toast.success(
+          "Replay Actualizado",
+          `Posicionado en ${dateObj.toLocaleDateString("es-ES")} ${dateObj.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}. Velas posteriores ocultas.`,
+        );
+      }
       setShowDatePicker(false);
     } else {
       toast.warning("Replay", res.error);
@@ -219,12 +249,16 @@ export function ReplayHUD({ accountId: _accountId, symbol = "BTCUSD", timeframe 
             </span>
           )}
 
-          {syntheticData && (
+          {(syntheticData || dataWarning) && (
             <span
-              title="Esta fecha queda fuera de las velas reales disponibles para esta temporalidad: las velas se reconstruyen a partir de una temporalidad mayor con trayectorias aleatorias. El cierre/máx/mín de la vela madre es real, pero los indicadores y el orden intravela NO son datos de mercado. Usa una fecha más reciente o una temporalidad mayor."
+              data-testid="replay-data-warning-badge"
+              title={
+                dataWarning ??
+                "Datos históricos incompletos para esta temporalidad en el instante reproducido."
+              }
               className="px-1 rounded bg-red-500/20 text-red-400 text-[9px] font-bold uppercase"
             >
-              Sintético
+              {syntheticData ? "Sin histórico" : "Aviso datos"}
             </span>
           )}
 

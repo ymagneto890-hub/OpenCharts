@@ -1339,6 +1339,28 @@ export interface VwapBandsOptions {
   priorSessionSeed?: VwapSessionSeed | null;
   /** When true on NY sessions, anchors VWAP strictly at 09:30 ET (excluding pre-market bars from VWAP math). */
   anchorAtRegularOpen?: boolean;
+  /**
+   * Earliest unix timestamp (seconds) covered by the underlying historical dataset before UI session filtering.
+   * Used to distinguish genuine zero-trade opening minutes from truncated history that begins mid-session.
+   */
+  rawCoverageStartSec?: number;
+  /** Earliest unix timestamp (seconds) covered by `fine1mCandles` before UI session filtering. */
+  fineRawCoverageStartSec?: number;
+  /**
+   * When true, omits any initial truncated session whose historical coverage starts strictly after
+   * the session anchor (`09:30 ET` for regular, `04:00 ET` for NY extended, `00:00 UTC` for UTC)
+   * unless `priorSessionSeed` supplies the missing pre-window volume.
+   */
+  requireCompleteSession?: boolean;
+}
+
+export interface VwapSessionCoverageAssessment {
+  isComplete: boolean;
+  anchorBucket: number | null;
+  sessionAnchorSec: number | null;
+  earliestBarSec: number | null;
+  coverageStartSec: number | null;
+  seeded: boolean;
 }
 
 export interface VwapBandsResult {
@@ -1495,6 +1517,160 @@ export function vwap(
   return result;
 }
 
+let cachedNyFullPartsFormatter: Intl.DateTimeFormat | null = null;
+function nyDayKeyAndAnchorToUtcSec(dayKey: number, anchorHour: number, anchorMinute: number): number {
+  const y = Math.floor(dayKey / 10_000);
+  const m = Math.floor((dayKey % 10_000) / 100);
+  const d = dayKey % 100;
+  const wallUtcMs = Date.UTC(y, m - 1, d, anchorHour, anchorMinute, 0);
+  try {
+    if (!cachedNyFullPartsFormatter) {
+      cachedNyFullPartsFormatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+      });
+    }
+    const readNyWallMs = (utcMs: number): number => {
+      const parts = cachedNyFullPartsFormatter!.formatToParts(new Date(utcMs));
+      let py = 0;
+      let pm = 0;
+      let pd = 0;
+      let ph = 0;
+      let pmi = 0;
+      let psec = 0;
+      for (const p of parts) {
+        if (p.type === "year") py = Number(p.value);
+        else if (p.type === "month") pm = Number(p.value);
+        else if (p.type === "day") pd = Number(p.value);
+        else if (p.type === "hour") ph = Number(p.value) % 24;
+        else if (p.type === "minute") pmi = Number(p.value);
+        else if (p.type === "second") psec = Number(p.value);
+      }
+      return Date.UTC(py, pm - 1, pd, ph, pmi, psec);
+    };
+    let guessMs = wallUtcMs + 5 * 3600_000;
+    guessMs += wallUtcMs - readNyWallMs(guessMs);
+    guessMs += wallUtcMs - readNyWallMs(guessMs);
+    return Math.floor(guessMs / 1000);
+  } catch {
+    return Math.floor((wallUtcMs + 5 * 3600_000) / 1000);
+  }
+}
+
+export function getSessionAnchorStartSec(
+  sampleBarTimeSec: number,
+  sessionTimeZone: VwapSessionTimeZone = "utc",
+  anchorAtRegularOpen = false,
+): number {
+  if (sessionTimeZone === "america-new-york") {
+    const dayKey = getNyTradingDayKey(sampleBarTimeSec);
+    return anchorAtRegularOpen
+      ? nyDayKeyAndAnchorToUtcSec(dayKey, 9, 30)
+      : nyDayKeyAndAnchorToUtcSec(dayKey, 4, 0);
+  }
+  return Math.floor(sampleBarTimeSec / 86400) * 86400;
+}
+
+/**
+ * Evaluates whether `rawCandles` (plus optional `priorSessionSeed` and `rawCoverageStartSec`)
+ * completely covers the latest session in `rawCandles` from its true session anchor
+ * (`09:30 ET` for NY Regular Session, `04:00 ET` for NY Extended Session, `00:00 UTC` for UTC).
+ */
+export function assessVwapSessionCoverage(
+  rawCandles: CandleData[],
+  options: VwapBandsOptions = {},
+): VwapSessionCoverageAssessment {
+  const anchor: VwapAnchorPeriod = options.anchor ?? "session";
+  const sessionTimeZone: VwapSessionTimeZone = options.sessionTimeZone ?? "utc";
+  const anchorAtRegularOpen =
+    Boolean(options.anchorAtRegularOpen) &&
+    anchor === "session" &&
+    sessionTimeZone === "america-new-york";
+  const candles = normalizeCandles(rawCandles);
+  if (candles.length === 0) {
+    return {
+      isComplete: false,
+      anchorBucket: null,
+      sessionAnchorSec: null,
+      earliestBarSec: null,
+      coverageStartSec: null,
+      seeded: false,
+    };
+  }
+  if (anchor !== "session") {
+    return {
+      isComplete: true,
+      anchorBucket: getVwapAnchorBucket(candles[candles.length - 1]!.time, anchor, sessionTimeZone),
+      sessionAnchorSec: candles[0]!.time,
+      earliestBarSec: candles[0]!.time,
+      coverageStartSec: candles[0]!.time,
+      seeded: false,
+    };
+  }
+
+  const eligible = anchorAtRegularOpen
+    ? candles.filter((c) => {
+        const ny = getNySessionMinutes(c.time);
+        return ny.minutes >= 570 && ny.minutes < 960;
+      })
+    : candles;
+  if (eligible.length === 0) {
+    return {
+      isComplete: false,
+      anchorBucket: null,
+      sessionAnchorSec: null,
+      earliestBarSec: null,
+      coverageStartSec: null,
+      seeded: false,
+    };
+  }
+
+  const lastBar = eligible[eligible.length - 1]!;
+  const targetDay = getVwapAnchorBucket(lastBar.time, "session", sessionTimeZone);
+  const sessionAnchorSec = getSessionAnchorStartSec(
+    lastBar.time,
+    sessionTimeZone,
+    anchorAtRegularOpen,
+  );
+  let earliestDayBarSec = lastBar.time;
+  for (const c of eligible) {
+    if (getVwapAnchorBucket(c.time, "session", sessionTimeZone) === targetDay) {
+      earliestDayBarSec = c.time;
+      break;
+    }
+  }
+  const coverageStartSec =
+    typeof options.rawCoverageStartSec === "number" && Number.isFinite(options.rawCoverageStartSec)
+      ? Math.min(options.rawCoverageStartSec, candles[0]!.time)
+      : candles[0]!.time;
+  const priorSeed = options.priorSessionSeed ?? null;
+  const seeded =
+    priorSeed != null && priorSeed.anchorBucket === targetDay && priorSeed.cumVol > 0;
+  const isComplete = seeded || coverageStartSec <= sessionAnchorSec;
+
+  return {
+    isComplete,
+    anchorBucket: targetDay,
+    sessionAnchorSec,
+    earliestBarSec: earliestDayBarSec,
+    coverageStartSec,
+    seeded,
+  };
+}
+
+export function isVwapSessionCoverageComplete(
+  rawCandles: CandleData[],
+  options: VwapBandsOptions = {},
+): boolean {
+  return assessVwapSessionCoverage(rawCandles, options).isComplete;
+}
+
 /**
  * Causal VWAP with 3 symmetrical standard deviation bands (±1σ, ±2σ, ±3σ)
  * computed via volume-weighted Welford updates over the selected price source.
@@ -1514,7 +1690,16 @@ export function vwapBands(
     Boolean(options.anchorAtRegularOpen) &&
     anchor === "session" &&
     sessionTimeZone === "america-new-york";
+  const enforceCompleteSession =
+    anchor === "session" && (Boolean(options.requireCompleteSession) || anchorAtRegularOpen);
   const candles = normalizeCandles(rawCandles);
+  const coverageStartSec =
+    candles.length > 0
+      ? typeof options.rawCoverageStartSec === "number" &&
+        Number.isFinite(options.rawCoverageStartSec)
+        ? Math.min(options.rawCoverageStartSec, candles[0]!.time)
+        : candles[0]!.time
+      : Infinity;
 
   const vwapLine: IndicatorPoint[] = [];
   const upper1: IndicatorPoint[] = [];
@@ -1531,35 +1716,51 @@ export function vwapBands(
   let fallbackMean = 0;
   let fallbackSumSq = 0;
   let lastBucket: number | null = null;
+  let bucketIncomplete = false;
 
   for (const c of candles) {
     let bucket: number;
     if (anchorAtRegularOpen) {
       const ny = getNySessionMinutes(c.time);
-      if (ny.minutes < 570) continue; // Anchor strictly at 09:30 AM ET (skip pre-market)
+      if (ny.minutes < 570 || ny.minutes >= 960) continue; // Anchor strictly to 09:30–16:00 ET regular session
       bucket = ny.dayKey;
     } else {
       bucket = getVwapAnchorBucket(c.time, anchor, sessionTimeZone);
     }
     if (anchor !== "none" && bucket !== lastBucket) {
-      if (
+      const hasMatchingSeed =
         lastBucket === null &&
-        priorSeed &&
+        priorSeed != null &&
         priorSeed.anchorBucket === bucket &&
-        priorSeed.cumVol > 0
-      ) {
+        priorSeed.cumVol > 0;
+      if (hasMatchingSeed) {
         cumVol = priorSeed.cumVol;
         mean = priorSeed.mean;
         sumSqWeightedDiff = Math.max(0, priorSeed.sumSqWeightedDiff);
+        bucketIncomplete = false;
       } else {
         cumVol = 0;
         mean = 0;
         sumSqWeightedDiff = 0;
+        if (enforceCompleteSession) {
+          const anchorSec = getSessionAnchorStartSec(
+            c.time,
+            sessionTimeZone,
+            anchorAtRegularOpen,
+          );
+          bucketIncomplete = coverageStartSec > anchorSec;
+        } else {
+          bucketIncomplete = false;
+        }
       }
       fallbackCount = 0;
       fallbackMean = 0;
       fallbackSumSq = 0;
       lastBucket = bucket;
+    }
+
+    if (bucketIncomplete) {
+      continue;
     }
 
     const barPrice =
@@ -1631,13 +1832,66 @@ export function computeFineGrainedSessionVwap(
     return vwapBands(targetCandles, options);
   }
 
+  const normalizedFine = normalizeCandles(fine1mCandles);
+  if (normalizedFine.length === 0) {
+    return vwapBands(targetCandles, options);
+  }
+
+  const fineCoverageStartSec =
+    typeof options.fineRawCoverageStartSec === "number" &&
+    Number.isFinite(options.fineRawCoverageStartSec)
+      ? Math.min(options.fineRawCoverageStartSec, normalizedFine[0]!.time)
+      : normalizedFine[0]!.time;
+
   const base = vwapBands(targetCandles, options);
   if (base.vwap.length === 0) return base;
 
-  const fineRes = vwapBands(fine1mCandles, options);
-  if (fineRes.vwap.length === 0) return base;
+  const fineRes = vwapBands(normalizedFine, {
+    ...options,
+    rawCoverageStartSec: fineCoverageStartSec,
+  });
+  if (fineRes.vwap.length === 0) {
+    // If 1m history is present for the same session day(s) as `base`, do NOT silently pretend
+    // a truncated 1m session is covered by falling back to coarse bars when complete session coverage is required.
+    const sessionTzCheck: VwapSessionTimeZone = options.sessionTimeZone ?? "utc";
+    const anchorReg =
+      Boolean(options.anchorAtRegularOpen) && sessionTzCheck === "america-new-york";
+    if (options.requireCompleteSession || anchorReg) {
+      const incompleteFineDays = new Set<number>();
+      for (const c of normalizedFine) {
+        const d = getVwapAnchorBucket(c.time, "session", sessionTzCheck);
+        const anchorSec = getSessionAnchorStartSec(c.time, sessionTzCheck, anchorReg);
+        const seeded =
+          options.priorSessionSeed != null &&
+          options.priorSessionSeed.anchorBucket === d &&
+          options.priorSessionSeed.cumVol > 0;
+        if (!seeded && fineCoverageStartSec > anchorSec) {
+          incompleteFineDays.add(d);
+        }
+      }
+      if (incompleteFineDays.size > 0) {
+        const keepIdx: number[] = [];
+        for (let i = 0; i < base.vwap.length; i++) {
+          const d = getVwapAnchorBucket(base.vwap[i]!.time, "session", sessionTzCheck);
+          if (!incompleteFineDays.has(d)) keepIdx.push(i);
+        }
+        return {
+          vwap: keepIdx.map((i) => base.vwap[i]!),
+          upper1: keepIdx.map((i) => base.upper1[i]!),
+          lower1: keepIdx.map((i) => base.lower1[i]!),
+          upper2: keepIdx.map((i) => base.upper2[i]!),
+          lower2: keepIdx.map((i) => base.lower2[i]!),
+          upper3: keepIdx.map((i) => base.upper3[i]!),
+          lower3: keepIdx.map((i) => base.lower3[i]!),
+        };
+      }
+    }
+    return base;
+  }
 
   const sessionTz: VwapSessionTimeZone = options.sessionTimeZone ?? "utc";
+  const anchorAtRegularOpen =
+    Boolean(options.anchorAtRegularOpen) && sessionTz === "america-new-york";
   const earliestTargetByDay = new Map<number, number>();
   for (const pt of base.vwap) {
     const day = getVwapAnchorBucket(pt.time, "session", sessionTz);
@@ -1658,9 +1912,26 @@ export function computeFineGrainedSessionVwap(
   const coveredDays = new Set<number>();
   for (const [day, targetStart] of earliestTargetByDay.entries()) {
     const fineStart = earliestFineByDay.get(day);
-    if (fineStart !== undefined && fineStart < targetStart + targetTfSec) {
-      coveredDays.add(day);
+    if (fineStart === undefined) continue;
+    // Strict session coverage: never accept a lone mid-bucket 1m bar (e.g. 09:34 inside 09:30..09:35)
+    // unless `fine1mCandles` was already recording at or before `targetStart` (proving 09:30..09:33 had 0 trades).
+    const coversTargetStart =
+      fineStart <= targetStart ||
+      (fineCoverageStartSec <= targetStart && fineStart < targetStart + targetTfSec);
+    if (!coversTargetStart) continue;
+    if (options.requireCompleteSession || anchorAtRegularOpen) {
+      const anchorSec = getSessionAnchorStartSec(
+        targetStart,
+        sessionTz,
+        anchorAtRegularOpen,
+      );
+      const seeded =
+        options.priorSessionSeed != null &&
+        options.priorSessionSeed.anchorBucket === day &&
+        options.priorSessionSeed.cumVol > 0;
+      if (!seeded && fineCoverageStartSec > anchorSec) continue;
     }
+    coveredDays.add(day);
   }
   if (coveredDays.size === 0) return base;
 

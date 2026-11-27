@@ -390,13 +390,13 @@ describe("Comprehensive Audit & Bug Verification Suite", () => {
       expect(lastBar1d.time).toBeLessThanOrEqual(lastBar4h.time);
       expect(lastBar1d.close).toBeCloseTo(priceAt4h, 4);
 
-      // Switch to 15m at the same 2024 historical date -> must synthesize intraday history and match the exact close price
-      useReplayStore.getState().changeTimeframe("15m");
-      const state15m = useReplayStore.getState();
-      expect(state15m.timeframe).toBe("15m");
-      expect(state15m.visible!.length).toBeGreaterThan(200);
-      const lastBar15m = state15m.visible![state15m.visible!.length - 1]!;
-      expect(lastBar15m.close).toBeCloseTo(priceAt4h, 4);
+      // Switch to 15m at the same 2024 historical date where 15m real bars do not exist ->
+      // must NOT invent/subdivide synthetic 15m bars and must preserve compatible 1d timeframe
+      const switched15m = useReplayStore.getState().changeTimeframe("15m");
+      expect(switched15m).toBe(false);
+      const stateAfterRejected15m = useReplayStore.getState();
+      expect(stateAfterRejected15m.timeframe).toBe("1d");
+      expect(stateAfterRejected15m.dataWarning).toBeTruthy();
 
       // Switch back to 4h -> must return to the exact same 12:00 UTC 4h bar without losing intraday timestamp
       useReplayStore.getState().changeTimeframe("4h");

@@ -151,10 +151,8 @@ export function aggregateCandles<T extends OhlcvBar>(
       ? Math.max(1, Math.floor(targetTfOrSec))
       : parseTimeframeSeconds(targetTfOrSec);
 
-  const sorted = [...bars].sort((a, b) => a.time - b.time);
-  const buckets = new Map<number, OhlcvBar>();
-
-  for (const bar of sorted) {
+  const dedupedByTime = new Map<number, T>();
+  for (const bar of bars) {
     if (
       !bar ||
       !Number.isFinite(bar.time) ||
@@ -166,7 +164,14 @@ export function aggregateCandles<T extends OhlcvBar>(
     ) {
       continue;
     }
-    const bTime = getBucketStartSec(bar.time, stepSec);
+    dedupedByTime.set(Math.floor(bar.time), bar);
+  }
+
+  const sorted = Array.from(dedupedByTime.values()).sort((a, b) => a.time - b.time);
+  const buckets = new Map<number, OhlcvBar>();
+
+  for (const bar of sorted) {
+    const bTime = getBucketStartSec(Math.floor(bar.time), stepSec);
     const barHigh = Math.max(bar.high, bar.open, bar.close);
     const barLow = Math.min(bar.low, bar.open, bar.close);
     const barVol = Number.isFinite(bar.volume) && bar.volume >= 0 ? bar.volume : 0;

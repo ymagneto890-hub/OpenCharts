@@ -113,6 +113,10 @@ export interface ChartToolbarProps {
   isReplaying?: boolean;
   /** Effective step timeframe for Bar Replay (finest active timeframe in split-chart layouts). */
   replayTimeframe?: Timeframe;
+  /** Additional active timeframes across split-chart panes to preload when Replay starts. */
+  replayAdditionalTimeframes?: readonly string[];
+  /** Secondary symbols in split-chart panes to preload when Replay starts. */
+  replaySecondarySymbols?: ReadonlyArray<{ symbol: string; timeframe: string }>;
   /** Account whose sessions can be replayed — mounts the replay HUD when set. */
   replayAccountId?: string | null;
   activePlugins?: string[];
@@ -161,6 +165,8 @@ export function ChartToolbar({
   aiTraderEnabled,
   isReplaying: _isReplaying = false,
   replayTimeframe,
+  replayAdditionalTimeframes,
+  replaySecondarySymbols,
   replayAccountId,
   activePlugins = [],
   onSetIndicators,
@@ -821,6 +827,8 @@ export function ChartToolbar({
           accountId={replayAccountId}
           symbol={selectedSymbol}
           timeframe={replayTimeframe ?? timeframe}
+          additionalTimeframes={replayAdditionalTimeframes}
+          secondarySymbols={replaySecondarySymbols}
         />
       )}
 

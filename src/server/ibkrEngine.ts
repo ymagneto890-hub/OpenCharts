@@ -533,6 +533,56 @@ function getNyClockParts(timeSec: number): { dayKey: number; minutes: number; is
   }
 }
 
+let nyFullDateFormatter: Intl.DateTimeFormat | null = null;
+function resolveNyWallClockUtcSec(
+  y: number,
+  moZeroIndexed: number,
+  d: number,
+  h: number,
+  mi: number,
+  sec: number,
+): number {
+  const wallUtcMs = Date.UTC(y, moZeroIndexed, d, h, mi, sec);
+  try {
+    if (!nyFullDateFormatter) {
+      nyFullDateFormatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+      });
+    }
+    const readNyWallMs = (utcMs: number): number => {
+      const parts = nyFullDateFormatter!.formatToParts(new Date(utcMs));
+      let py = 0;
+      let pmo = 0;
+      let pd = 0;
+      let ph = 0;
+      let pmi = 0;
+      let psec = 0;
+      for (const p of parts) {
+        if (p.type === "year") py = Number(p.value);
+        else if (p.type === "month") pmo = Number(p.value);
+        else if (p.type === "day") pd = Number(p.value);
+        else if (p.type === "hour") ph = Number(p.value) % 24;
+        else if (p.type === "minute") pmi = Number(p.value);
+        else if (p.type === "second") psec = Number(p.value);
+      }
+      return Date.UTC(py, pmo - 1, pd, ph, pmi, psec);
+    };
+    let guessMs = wallUtcMs + 5 * 3600_000;
+    guessMs += wallUtcMs - readNyWallMs(guessMs);
+    guessMs += wallUtcMs - readNyWallMs(guessMs);
+    return Math.floor(guessMs / 1000);
+  } catch {
+    return Math.floor((wallUtcMs + 5 * 3600_000) / 1000);
+  }
+}
+
 export function parseIbkrBarTimeSec(rawTime: string | number): number {
   if (typeof rawTime === "number" && Number.isFinite(rawTime)) {
     return rawTime > 1e11 ? Math.floor(rawTime / 1000) : Math.floor(rawTime);
@@ -563,11 +613,14 @@ export function parseIbkrBarTimeSec(rawTime: string | number): number {
     if (!tz || tz === "UTC" || tz === "GMT") {
       return Math.floor(Date.UTC(y, mo, d, h, mi, sec) / 1000);
     }
-    // Approximate Eastern Time when TWS emits US/Eastern string
-    if (tz.includes("EASTERN") || tz === "EST" || tz === "EDT" || tz === "AMERICA/NEW_YORK") {
-      const utcGuess = Date.UTC(y, mo, d, h, mi, sec);
-      const nyOffsetHours = tz === "EST" ? 5 : 4;
-      return Math.floor((utcGuess + nyOffsetHours * 3600_000) / 1000);
+    if (tz === "EST") {
+      return Math.floor((Date.UTC(y, mo, d, h, mi, sec) + 5 * 3600_000) / 1000);
+    }
+    if (tz === "EDT") {
+      return Math.floor((Date.UTC(y, mo, d, h, mi, sec) + 4 * 3600_000) / 1000);
+    }
+    if (tz.includes("EASTERN") || tz === "AMERICA/NEW_YORK") {
+      return resolveNyWallClockUtcSec(y, mo, d, h, mi, sec);
     }
     return Math.floor(Date.UTC(y, mo, d, h, mi, sec) / 1000);
   }
@@ -658,6 +711,7 @@ function updateVwapAccumulator(
 export function computeVwapSessionSeedsFromBars(
   bars: ReadonlyArray<OhlcvBar>,
   visibleStartTimeSec: number,
+  source: "hlc3" | "hl2" | "ohlc4" | "close" = "hlc3",
 ): { extended: VwapSessionSeed | null; regular: VwapSessionSeed | null } {
   if (bars.length === 0) return { extended: null, regular: null };
   const lastTime = bars[bars.length - 1]!.time;
@@ -667,13 +721,26 @@ export function computeVwapSessionSeedsFromBars(
   const extAcc = createVwapAccumulator(targetDayKey);
   const regAcc = createVwapAccumulator(targetDayKey);
 
-  for (const bar of bars) {
+  const sorted = [...bars].sort((a, b) => a.time - b.time);
+  let prevTime = -1;
+  for (const bar of sorted) {
+    if (bar.time === prevTime) continue;
+    prevTime = bar.time;
     if (bar.time >= visibleStartTimeSec) break;
     const ny = getNyClockParts(bar.time);
-    if (ny.dayKey !== targetDayKey) continue;
-    const tp = (bar.high + bar.low + bar.close) / 3;
-    updateVwapAccumulator(extAcc, targetDayKey, tp, bar.volume);
-    if (!ny.isWeekend && ny.minutes >= 570 && ny.minutes < 960) {
+    if (ny.dayKey !== targetDayKey || ny.isWeekend) continue;
+    const tp =
+      source === "close"
+        ? bar.close
+        : source === "hl2"
+          ? (bar.high + bar.low) / 2
+          : source === "ohlc4"
+            ? (bar.open + bar.high + bar.low + bar.close) / 4
+            : (bar.high + bar.low + bar.close) / 3;
+    if (ny.minutes >= 240 && ny.minutes < 1200) {
+      updateVwapAccumulator(extAcc, targetDayKey, tp, bar.volume);
+    }
+    if (ny.minutes >= 570 && ny.minutes < 960) {
       updateVwapAccumulator(regAcc, targetDayKey, tp, bar.volume);
     }
   }
@@ -2364,6 +2431,7 @@ export class IbkrEngine extends EventEmitter {
       try {
         // Fetch 2D of 1m consolidated bars (04:00 ET pre-market -> now) for exact intraday VWAP seeding,
         // plus recent 1800s of 1s bars for instant sub-minute resolution.
+        const backfillStartMs = Date.now();
         const whatToShow =
           stream.contract.secType === SecType.CASH ? WhatToShow.MIDPOINT : WhatToShow.TRADES;
         const [bars1m, bars1s] = await Promise.all([
@@ -2393,11 +2461,49 @@ export class IbkrEngine extends EventEmitter {
 
         if (this.streams.get(stream.symbol) !== stream) return;
 
-        for (const b of bars1m) {
-          stream.sessionBars1m.set(b.time, b);
-        }
+        const latestBackfill1sSec = bars1s.length > 0 ? bars1s[bars1s.length - 1]!.time : 0;
         for (const b of bars1s) {
-          stream.bars1s.set(b.time, b);
+          const existing = stream.bars1s.get(b.time);
+          if (!existing) {
+            stream.bars1s.set(b.time, b);
+          } else {
+            const liveAfterStart = (stream.bars1sIngestedAt.get(b.time) ?? 0) >= backfillStartMs;
+            stream.bars1s.set(b.time, {
+              time: b.time,
+              open: b.open,
+              high: Math.max(b.high, existing.high),
+              low: Math.min(b.low, existing.low),
+              close: liveAfterStart ? existing.close : b.close,
+              volume: Math.max(b.volume, existing.volume),
+            });
+          }
+        }
+        for (const b of bars1m) {
+          const existing1m = stream.sessionBars1m.get(b.time);
+          if (!existing1m) {
+            stream.sessionBars1m.set(b.time, b);
+          } else {
+            // Add only live 1s volume strictly newer than the historical snapshot without double-counting
+            let postSnapshotVol = 0;
+            let latestPostClose: number | null = null;
+            for (const [secKey, b1s] of stream.bars1s.entries()) {
+              if (secKey >= b.time && secKey < b.time + 60) {
+                const ing = stream.bars1sIngestedAt.get(secKey) ?? 0;
+                if (ing >= backfillStartMs && secKey > latestBackfill1sSec) {
+                  postSnapshotVol += b1s.volume;
+                  latestPostClose = b1s.close;
+                }
+              }
+            }
+            stream.sessionBars1m.set(b.time, {
+              time: b.time,
+              open: b.open,
+              high: Math.max(b.high, existing1m.high),
+              low: Math.min(b.low, existing1m.low),
+              close: latestPostClose ?? b.close,
+              volume: Math.max(b.volume + postSnapshotVol, existing1m.volume),
+            });
+          }
         }
         this.prune1sWindow(stream);
         this.rebuildStreamVwapAccumulators(stream);

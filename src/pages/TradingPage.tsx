@@ -16,7 +16,8 @@ import {
 } from "../hooks/useChartPreferences.ts";
 import { useTradeSound } from "../hooks/useTradeSound";
 import { INDICATOR_REGISTRY, type IndicatorType } from "../lib/indicators.ts";
-import { isValidTimeframe } from "../lib/timeframes.ts";
+import { computeRequiredWarmupBars, isValidTimeframe } from "../lib/timeframes.ts";
+import { getIndicatorSettings } from "../hooks/useIndicatorSettings.ts";
 import { computeLivePnl, computeLivePrice } from "../lib/livePnl.ts";
 import { posthog } from "../lib/posthog";
 import type { CreateJournalEntryInput, UpdateJournalEntryInput } from "../services/api/journal.ts";
@@ -24,6 +25,8 @@ import { api } from "../services/api.ts";
 import { subscribeIbkrConfigChanged } from "../services/ibkrConfig.ts";
 import { resetIbkrStreamConnection } from "../services/ibkrStream.ts";
 import {
+  ensureReplayHistoricalDataLoaded,
+  hasAuthenticReplayData,
   invalidateAllStockSeries,
   invalidateStockSeries,
   TF_SECONDS,
@@ -168,12 +171,19 @@ export function TradingPage() {
   const handleTimeframeChange = useCallback(
     (tf: Timeframe) => {
       if (replay.phase === "active" && (chartLayoutRef.current === "1" || replay.isTemporary)) {
-        replay.changeTimeframe(tf);
+        const switched = replay.changeTimeframe(tf);
+        if (!switched) {
+          toast.warning(
+            "Datos históricos insuficientes",
+            `No existen velas históricas reales para ${tf} en esta fecha. Se conserva ${replay.timeframe ?? timeframe}.`,
+          );
+          return;
+        }
       }
       setTimeframe(tf);
       localStorage.setItem(`tf_${selectedSymbol}`, tf);
     },
-    [selectedSymbol, replay],
+    [selectedSymbol, replay, timeframe],
   );
 
   // Capture 1H, 4H, and 1D screenshots offscreen alongside the on-screen chart
@@ -443,16 +453,16 @@ export function TradingPage() {
   const [slot2Symbol, setSlot2Symbol] = useState<string>(selectedSymbol);
   const [slot3Symbol, setSlot3Symbol] = useState<string>(selectedSymbol);
 
-  const activeReplayStepTimeframe = useMemo<Timeframe>(() => {
-    const candidates: Timeframe[] = [timeframe];
+  const replayAdditionalTimeframes = useMemo<Timeframe[]>(() => {
+    const tfs: Timeframe[] = [timeframe];
     if (chartLayout === "2x1" || chartLayout === "2x2") {
-      if (slot1Symbol === selectedSymbol) candidates.push(paneTimeframes[1]);
+      if (slot1Symbol === selectedSymbol) tfs.push(paneTimeframes[1]);
     }
     if (chartLayout === "2x2") {
-      if (slot2Symbol === selectedSymbol) candidates.push(paneTimeframes[2]);
-      if (slot3Symbol === selectedSymbol) candidates.push(paneTimeframes[3]);
+      if (slot2Symbol === selectedSymbol) tfs.push(paneTimeframes[2]);
+      if (slot3Symbol === selectedSymbol) tfs.push(paneTimeframes[3]);
     }
-    return pickFinestTimeframe(candidates) as Timeframe;
+    return Array.from(new Set(tfs));
   }, [
     timeframe,
     chartLayout,
@@ -461,6 +471,46 @@ export function TradingPage() {
     slot2Symbol,
     slot3Symbol,
     paneTimeframes,
+  ]);
+
+  const replaySecondarySymbols = useMemo(() => {
+    const out: Array<{ symbol: string; timeframe: string }> = [];
+    if (chartLayout === "2x1" || chartLayout === "2x2") {
+      if (slot1Symbol && slot1Symbol !== selectedSymbol) {
+        out.push({ symbol: slot1Symbol, timeframe: paneTimeframes[1] });
+      }
+    }
+    if (chartLayout === "2x2") {
+      if (slot2Symbol && slot2Symbol !== selectedSymbol) {
+        out.push({ symbol: slot2Symbol, timeframe: paneTimeframes[2] });
+      }
+      if (slot3Symbol && slot3Symbol !== selectedSymbol) {
+        out.push({ symbol: slot3Symbol, timeframe: paneTimeframes[3] });
+      }
+    }
+    return out;
+  }, [chartLayout, selectedSymbol, slot1Symbol, slot2Symbol, slot3Symbol, paneTimeframes]);
+
+  const activeReplayStepTimeframe = useMemo<Timeframe>(() => {
+    if (replay.phase === "active" && replay.symbol === selectedSymbol && replay.simTimeSec > 0) {
+      const authenticCandidates = replayAdditionalTimeframes.filter((tf) =>
+        hasAuthenticReplayData(selectedSymbol, tf, replay.simTimeSec - 1),
+      );
+      if (authenticCandidates.length > 0) {
+        return pickFinestTimeframe(authenticCandidates) as Timeframe;
+      }
+      if (replay.timeframe) {
+        return replay.timeframe as Timeframe;
+      }
+    }
+    return pickFinestTimeframe(replayAdditionalTimeframes) as Timeframe;
+  }, [
+    replayAdditionalTimeframes,
+    replay.phase,
+    replay.symbol,
+    replay.simTimeSec,
+    replay.timeframe,
+    selectedSymbol,
   ]);
 
   useEffect(() => {
@@ -901,11 +951,12 @@ export function TradingPage() {
   // Prime the active symbol with a fresh server-side snapshot immediately on
   // symbol switch so bid/ask appears without waiting for the next WS tick.
   useEffect(() => {
+    if (isReplayActive) return;
     let cancelled = false;
     void api
       .getTick(selectedSymbol)
       .then((tick) => {
-        if (cancelled || !tick) return;
+        if (cancelled || !tick || useReplayStore.getState().phase !== "idle") return;
         updateTick(
           selectedSymbol,
           Number(tick.bid),
@@ -919,16 +970,17 @@ export function TradingPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedSymbol, updateTick]);
+  }, [selectedSymbol, updateTick, isReplayActive]);
 
   // Pacing-safe prefetch of the active symbol + timeframe (avoids bursting multiple concurrent historical queries)
   useEffect(() => {
+    if (isReplayActive) return;
     void queryClient.prefetchQuery({
       queryKey: [...queryKeys.market.candles(selectedSymbol, timeframe), "auto", 0],
       queryFn: () => api.getCandlesWithMeta(selectedSymbol, timeframe),
       staleTime: 30_000,
     });
-  }, [selectedSymbol, timeframe, queryClient]);
+  }, [selectedSymbol, timeframe, queryClient, isReplayActive]);
 
   // Reload open stock charts immediately when IBKR connection settings are saved or reset
   useEffect(() => {
@@ -1108,23 +1160,69 @@ export function TradingPage() {
   const handlePickReplayBar = useCallback(
     (timeSec: number, sourceTf?: Timeframe) => {
       const clickedTf = sourceTf ?? timeframe;
-      const stepTf = activeReplayStepTimeframe;
+      const candidateStepTf = activeReplayStepTimeframe;
       const clickedSec = TF_SECONDS[clickedTf] ?? 60;
-      const stepSec = TF_SECONDS[stepTf] ?? 60;
-      const adjustedCutSec = clickedSec > stepSec ? timeSec + clickedSec - stepSec : timeSec;
-      const res = replay.start(selectedSymbol, stepTf, adjustedCutSec, { temporary: false });
-      if (res.ok) {
-        toast.success(
-          "Replay Histórico Iniciado",
-          chartLayout === "1"
-            ? "Las velas futuras están ocultas. Avanza vela a vela o realiza operaciones simuladas."
-            : `Replay sincronizado en todas las gráficas (paso ${stepTf}). Avanza vela a vela o reproduce.`,
-        );
-      } else {
-        toast.warning("Replay", res.error);
-      }
+      const candidateStepSec = TF_SECONDS[candidateStepTf] ?? 60;
+      const adjustedCutSec =
+        clickedSec > candidateStepSec ? timeSec + clickedSec - candidateStepSec : timeSec;
+      const effectiveStepTf = hasAuthenticReplayData(
+        selectedSymbol,
+        candidateStepTf,
+        adjustedCutSec,
+      )
+        ? candidateStepTf
+        : clickedTf;
+      const finalCutSec =
+        effectiveStepTf === candidateStepTf ? adjustedCutSec : timeSec;
+
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const d = new Date(finalCutSec * 1000);
+      const targetDate = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+      const launch = async () => {
+        const loadRes = await ensureReplayHistoricalDataLoaded({
+          symbol: selectedSymbol,
+          primaryTimeframe: effectiveStepTf,
+          additionalTimeframes: replayAdditionalTimeframes,
+          secondarySymbols: replaySecondarySymbols,
+          targetDate,
+          targetTimeSec: finalCutSec,
+          anchorAtRegularOpen: !getChartPreferencesFromStorage().showExtendedHours,
+        });
+        const resolvedTf = hasAuthenticReplayData(
+          selectedSymbol,
+          candidateStepTf,
+          adjustedCutSec,
+        )
+          ? candidateStepTf
+          : effectiveStepTf;
+        const resolvedCut = resolvedTf === candidateStepTf ? adjustedCutSec : finalCutSec;
+        const res = replay.start(selectedSymbol, resolvedTf, resolvedCut, { temporary: false });
+        if (res.ok) {
+          if (loadRes.warnings.length > 0) {
+            replay.setDataWarning(loadRes.warnings[0]!);
+          }
+          toast.success(
+            "Replay Histórico Iniciado",
+            chartLayout === "1"
+              ? "Las velas futuras están ocultas. Avanza vela a vela o realiza operaciones simuladas."
+              : `Replay sincronizado en todas las gráficas (paso ${resolvedTf}). Avanza vela a vela o reproduce.`,
+          );
+        } else {
+          toast.warning("Replay", loadRes.error ?? res.error);
+        }
+      };
+      void launch();
     },
-    [replay, selectedSymbol, timeframe, activeReplayStepTimeframe, chartLayout],
+    [
+      replay,
+      selectedSymbol,
+      timeframe,
+      activeReplayStepTimeframe,
+      replayAdditionalTimeframes,
+      replaySecondarySymbols,
+      chartLayout,
+    ],
   );
 
   const handleReplayFromHistory = useCallback(
@@ -1154,12 +1252,10 @@ export function TradingPage() {
   // Older historical bars (from the deep 20,000+ dataset) load on-demand
   // as the user scrolls back in time via the chart's makeHistoryLoader.
   const deepCandleLimit = useMemo(() => {
-    switch (timeframe) {
-      case "1w":
-        return 500;
-      default:
-        return 1_500;
-    }
+    if (timeframe === "1w") return 500;
+    const emaLines = getIndicatorSettings().ema?.lines ?? [];
+    const activePeriods = emaLines.filter((l) => l.enabled && l.period > 0).map((l) => l.period);
+    return Math.max(1_500, computeRequiredWarmupBars(activePeriods));
   }, [timeframe]);
   const { data: candles = [] } = useCandles(
     selectedSymbol,
@@ -1169,11 +1265,13 @@ export function TradingPage() {
   );
   const mainChartCandles = useMemo(() => {
     if (!isReplayActive || !replay.visible) return candles;
-    if (replay.timeframe === timeframe || !(replay.simTimeSec > 0)) {
+    if (replay.timeframe === timeframe) {
       return replay.visible;
     }
-    const slice = getReplaySliceForTimeframe(selectedSymbol, timeframe, replay.simTimeSec);
-    return slice.length > 0 ? slice : replay.visible;
+    if (!(replay.simTimeSec > 0)) {
+      return [];
+    }
+    return getReplaySliceForTimeframe(selectedSymbol, timeframe, replay.simTimeSec);
   }, [
     isReplayActive,
     replay.visible,
@@ -1382,6 +1480,8 @@ export function TradingPage() {
         aiTraderEnabled={false}
         isReplaying={isReplayActive}
         replayTimeframe={activeReplayStepTimeframe}
+        replayAdditionalTimeframes={replayAdditionalTimeframes}
+        replaySecondarySymbols={replaySecondarySymbols}
         replayAccountId={activeAccountId}
         activePlugins={activePlugins}
         onTogglePlugin={handleTogglePlugin}

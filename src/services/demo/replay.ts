@@ -5,9 +5,9 @@ import type { Candle, ClosedPosition } from "../schemas.ts";
 import { publish } from "./bus.ts";
 import {
   buildPartialCandleOrNullUpTo,
-  buildPartialCandleRange,
   getReplayHistory,
   getStockSessionMetadata,
+  resolvePartialCandleWindow,
   subscribeRealSeriesLoaded,
   TF_SECONDS,
 } from "./candles.ts";
@@ -88,6 +88,8 @@ interface ReplayState {
   isTemporary: boolean;
   /** Historical closed trade being inspected when Replay is launched from Trade History. */
   inspectedTrade: ClosedPosition | null;
+  /** Explicit warning when historical sub-candles or timeframe data are incomplete or unavailable. */
+  dataWarning: string | null;
 
   beginPick: () => void;
   cancelPick: () => void;
@@ -98,8 +100,13 @@ interface ReplayState {
     timeSec: number,
     opts?: { temporary?: boolean; trade?: ClosedPosition | null },
   ) => { ok: true } | { ok: false; error: string };
-  /** Change timeframe during active replay while staying at the exact same historical timestamp */
-  changeTimeframe: (newTimeframe: string) => void;
+  /**
+   * Change timeframe during active replay while staying at the exact same historical timestamp.
+   * Returns `false` (preserving the current compatible timeframe) when authentic historical data
+   * is unavailable for `newTimeframe`.
+   */
+  changeTimeframe: (newTimeframe: string) => boolean;
+  setDataWarning: (warning: string | null) => void;
   play: () => void;
   pause: () => void;
   step: () => void;
@@ -229,7 +236,18 @@ export function getReplaySliceForTimeframe(
 
 const IDLE: Pick<
   ReplayState,
-  "phase" | "symbol" | "timeframe" | "visible" | "total" | "cursor" | "simTimeSec" | "playing" | "finished" | "isTemporary" | "inspectedTrade"
+  | "phase"
+  | "symbol"
+  | "timeframe"
+  | "visible"
+  | "total"
+  | "cursor"
+  | "simTimeSec"
+  | "playing"
+  | "finished"
+  | "isTemporary"
+  | "inspectedTrade"
+  | "dataWarning"
 > = {
   phase: "idle",
   symbol: null,
@@ -242,6 +260,7 @@ const IDLE: Pick<
   finished: false,
   isTemporary: false,
   inspectedTrade: null,
+  dataWarning: null,
 };
 
 export const useReplayStore = create<ReplayState>((set, get) => {
@@ -290,12 +309,19 @@ export const useReplayStore = create<ReplayState>((set, get) => {
       }
 
       const candles = getReplayHistory(symbol, timeframe, timeSec);
+      if (candles.length === 0) {
+        return {
+          ok: false,
+          error: `No existen datos históricos reales disponibles para ${symbol} (${timeframe}) en la fecha seleccionada.`,
+        };
+      }
       const idx = indexAtOrBefore(candles, timeSec);
       if (idx < 0) return { ok: false, error: "No candle at or before the selected time" };
       if (idx >= candles.length - 1) {
         return { ok: false, error: "Pick an earlier candle — there is nothing after the latest one to replay" };
       }
       series = candles;
+      replaySliceCache.clear();
       const bar = candles[idx]!;
       const tfSec = TF_SECONDS[timeframe] ?? 60;
       const simTimeSec = bar.time + tfSec;
@@ -332,45 +358,79 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         finished: false,
         isTemporary,
         inspectedTrade: isTemporary && opts?.trade ? engine.resolveClosedPositionLevels(opts.trade) : null,
+        dataWarning: null,
       });
       return { ok: true };
     },
 
+    setDataWarning: (warning) => {
+      set({ dataWarning: warning });
+    },
+
     changeTimeframe: (newTimeframe: string) => {
       const s = get();
-      if (s.phase !== "active" || !s.symbol) return;
-      if (s.timeframe === newTimeframe) return;
+      if (s.phase !== "active" || !s.symbol) return false;
+      if (s.timeframe === newTimeframe) return true;
 
       const oldTfSec = TF_SECONDS[s.timeframe ?? "15m"] ?? 60;
       const fallbackLastBar = s.visible && s.visible.length > 0 ? s.visible[s.visible.length - 1] : series[s.cursor];
       const simTimeSec = s.simTimeSec > 0 ? s.simTimeSec : fallbackLastBar ? fallbackLastBar.time + oldTfSec : 0;
-      if (simTimeSec <= 0) return;
+      if (simTimeSec <= 0) return false;
 
       const newTfSec = TF_SECONDS[newTimeframe] ?? 60;
       const candles = getReplayHistory(s.symbol, newTimeframe, simTimeSec - 1);
-      if (candles.length === 0) return;
+      if (candles.length === 0) {
+        set({
+          dataWarning: `No existen datos históricos reales para ${newTimeframe} en este instante; se conserva ${s.timeframe}.`,
+        });
+        return false;
+      }
 
       let idx = indexAtOrBefore(candles, simTimeSec - 1);
-      if (idx < 0) idx = 0;
-      series = candles;
+      if (idx < 0) {
+        set({
+          dataWarning: `No existen velas históricas anteriores al instante reproducido para ${newTimeframe}; se conserva ${s.timeframe}.`,
+        });
+        return false;
+      }
 
       const visibleSlice = candles.slice(0, idx + 1);
+      let nextWarning: string | null = null;
       const lastCandle = visibleSlice[visibleSlice.length - 1];
       if (lastCandle && lastCandle.time < simTimeSec && lastCandle.time + newTfSec > simTimeSec) {
-        const partial = buildPartialCandleOrNullUpTo(
+        const partialRes = resolvePartialCandleWindow(
           s.symbol,
           lastCandle,
           newTimeframe,
+          lastCandle.time,
           simTimeSec,
         );
-        if (partial === null && visibleSlice.length > 1) {
-          visibleSlice.pop();
-          idx = visibleSlice.length - 1;
-        } else if (partial !== null) {
-          visibleSlice[visibleSlice.length - 1] = partial;
+        if (partialRes.status === "ok") {
+          visibleSlice[visibleSlice.length - 1] = partialRes.candle;
+        } else if (partialRes.status === "empty-verified") {
+          if (visibleSlice.length > 1) {
+            visibleSlice.pop();
+            idx = visibleSlice.length - 1;
+          } else {
+            return false;
+          }
+        } else {
+          // Missing finer sub-candles for mid-bar reconstruction: never expose future parent OHLCV
+          if (visibleSlice.length > 1) {
+            visibleSlice.pop();
+            idx = visibleSlice.length - 1;
+            nextWarning = `Faltan velas inferiores reales para reconstruir la vela en curso de ${newTimeframe}; se muestran únicamente las velas cerradas previas.`;
+          } else {
+            set({
+              dataWarning: `Información histórica insuficiente para reconstruir la vela parcial de ${newTimeframe}; se conserva ${s.timeframe}.`,
+            });
+            return false;
+          }
         }
       }
 
+      series = candles;
+      replaySliceCache.clear();
       const activeBar = visibleSlice[visibleSlice.length - 1];
       if (activeBar) {
         if (!s.isTemporary) {
@@ -379,7 +439,9 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         publishTick(s.symbol, activeBar.close, activeBar.time);
       }
 
-      const atEnd = idx >= candles.length - 1;
+      const atEnd =
+        idx >= candles.length - 1 &&
+        (!activeBar || activeBar.time + newTfSec <= simTimeSec);
       set({
         timeframe: newTimeframe,
         cursor: idx,
@@ -387,7 +449,9 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         total: candles.length,
         visible: visibleSlice,
         finished: atEnd,
+        dataWarning: nextWarning,
       });
+      return true;
     },
 
     play: () => {
@@ -420,8 +484,14 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         if (anchorSec > 0) {
           const refreshed = getReplayHistory(s.symbol, tf, anchorSec);
           if (refreshed.length > 0) {
-            const newIdx = indexAtOrBefore(refreshed, anchorSec - 1);
+            let newIdx = indexAtOrBefore(refreshed, anchorSec - 1);
             if (newIdx >= 0) {
+              // Preserve popped mid-bar cursor position if `visible` had popped an unverified partial candle
+              const lastVis = s.visible && s.visible.length > 0 ? s.visible[s.visible.length - 1] : null;
+              if (lastVis && refreshed[newIdx]!.time > lastVis.time) {
+                const matchVis = indexAtOrBefore(refreshed, lastVis.time);
+                if (matchVis >= 0) newIdx = matchVis;
+              }
               series = refreshed;
               cursor = newIdx;
             }
@@ -446,34 +516,82 @@ export const useReplayStore = create<ReplayState>((set, get) => {
       }
 
       // If the current bar at cursor was only partially revealed (e.g. switched from 4h to 1d mid-day),
-      // evaluate only the unrevealed remainder `[simTimeSec, fullCurrent.time + tfSec)` before advancing into `next`.
+      // reconstruct ONLY the unrevealed remainder `[simTimeSec, fullCurrent.time + tfSec)` from real finer bars.
+      // Block advancement if finer historical data is missing — NEVER feed `fullCurrent` to the engine.
       const fullCurrent = series[cursor];
-      if (fullCurrent && s.simTimeSec > 0 && fullCurrent.time + tfSec > s.simTimeSec) {
-        const rem = buildPartialCandleRange(
+      if (
+        fullCurrent &&
+        s.simTimeSec > 0 &&
+        fullCurrent.time < s.simTimeSec &&
+        fullCurrent.time + tfSec > s.simTimeSec
+      ) {
+        const remRes = resolvePartialCandleWindow(
           s.symbol,
           fullCurrent,
           tf,
           s.simTimeSec,
           fullCurrent.time + tfSec,
         );
-        engine.replayAdvance(s.symbol, {
-          open: rem.open,
-          high: rem.high,
-          low: rem.low,
-          close: rem.close,
-          timeSec: fullCurrent.time,
-        });
+        if (remRes.status === "missing-data") {
+          clearTimer();
+          set({
+            playing: false,
+            dataWarning:
+              "Avance detenido: faltan velas inferiores reales para completar el tramo restante de la vela parcial sin sesgo futuro.",
+          });
+          return;
+        }
+        if (remRes.status === "ok") {
+          engine.replayAdvance(s.symbol, {
+            open: remRes.candle.open,
+            high: remRes.candle.high,
+            low: remRes.candle.low,
+            close: remRes.candle.close,
+            timeSec: fullCurrent.time,
+          });
+        }
       }
 
       const bar = series[next]!;
       const nextSimTimeSec = bar.time + tfSec;
-      engine.replayAdvance(s.symbol, {
-        open: bar.open,
-        high: bar.high,
-        low: bar.low,
-        close: bar.close,
-        timeSec: bar.time,
-      });
+      if (s.simTimeSec > 0 && bar.time < s.simTimeSec && nextSimTimeSec > s.simTimeSec) {
+        // `bar` spans across `s.simTimeSec` (e.g. partial bar was popped during mid-bar timeframe switch).
+        // Evaluate ONLY `[s.simTimeSec, nextSimTimeSec)` and block if finer historical bars are unavailable.
+        const nextRemRes = resolvePartialCandleWindow(
+          s.symbol,
+          bar,
+          tf,
+          s.simTimeSec,
+          nextSimTimeSec,
+        );
+        if (nextRemRes.status === "missing-data") {
+          clearTimer();
+          set({
+            playing: false,
+            dataWarning:
+              "Avance detenido: faltan velas inferiores reales para reconstruir el tramo restante de la vela en curso sin información futura.",
+          });
+          return;
+        }
+        if (nextRemRes.status === "ok") {
+          engine.replayAdvance(s.symbol, {
+            open: nextRemRes.candle.open,
+            high: nextRemRes.candle.high,
+            low: nextRemRes.candle.low,
+            close: nextRemRes.candle.close,
+            timeSec: bar.time,
+          });
+        }
+      } else {
+        engine.replayAdvance(s.symbol, {
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          timeSec: bar.time,
+        });
+      }
+      replaySliceCache.clear();
       if (!s.isTemporary) {
         saveLastReplayTimeSec(bar.time, s.symbol);
       }
@@ -487,6 +605,7 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         visible: series.slice(0, next + 1),
         finished: atEnd,
         playing: atEnd ? false : s.playing,
+        dataWarning: null,
       });
     },
 
@@ -538,6 +657,7 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         close: bar.close,
         timeSec: bar.time,
       });
+      replaySliceCache.clear();
       if (!s.isTemporary) {
         saveLastReplayTimeSec(bar.time, s.symbol);
       }
@@ -549,6 +669,7 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         visible: series.slice(0, prev + 1),
         finished: false,
         playing: false,
+        dataWarning: null,
       });
     },
 
@@ -613,5 +734,6 @@ subscribeRealSeriesLoaded((loadedSymbol) => {
     total: candles.length,
     visible: visibleSlice,
     finished: idx >= candles.length - 1,
+    dataWarning: null,
   });
 });

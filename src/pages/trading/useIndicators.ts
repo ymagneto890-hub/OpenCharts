@@ -74,6 +74,9 @@ export function useIndicators(
   priorVwapSeed: VwapSessionSeed | null = null,
   vwapAnchorAtRegularOpen = false,
   fine1mVwapCandles: CandleData[] | null = null,
+  vwapRawCoverageStartSec?: number,
+  vwapFineRawCoverageStartSec?: number,
+  vwapRequireCompleteSession = false,
 ): void {
   const indicatorSeriesRef = useRef<Map<string, ISeriesApi<"Line"> | ISeriesApi<"Histogram">>>(
     new Map(),
@@ -624,6 +627,9 @@ export function useIndicators(
               source: vwapCfg.source,
               priorSessionSeed: anchor === "session" ? (priorVwapSeed ?? undefined) : undefined,
               anchorAtRegularOpen: vwapAnchorAtRegularOpen,
+              rawCoverageStartSec: vwapRawCoverageStartSec,
+              fineRawCoverageStartSec: vwapFineRawCoverageStartSec,
+              requireCompleteSession: vwapRequireCompleteSession,
             },
           );
           upsertOverlayLine(

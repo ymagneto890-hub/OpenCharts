@@ -307,8 +307,13 @@ describe("Dual-Chart Synchronized Bar Replay & Deep Price/Volume/VWAP/EMA Audit"
   it("renders MultiChartPane synchronized to Replay price and badge while ignoring live ticks", () => {
     const restoreCanvas = installCanvasMock();
     try {
-      const jan2024Sec = 1_705_608_000;
-      const startRes = useReplayStore.getState().start("BTCUSD", "1h", jan2024Sec);
+      const real15m = getHistory("BTCUSD", "15m");
+      const real1h = getHistory("BTCUSD", "1h");
+      const target1hBar = real1h.find(
+        (b, idx) => idx < real1h.length - 5 && b.time >= real15m[25]!.time,
+      )!;
+      expect(target1hBar).toBeDefined();
+      const startRes = useReplayStore.getState().start("BTCUSD", "1h", target1hBar.time);
       expect(startRes.ok).toBe(true);
       const simTimeSec = useReplayStore.getState().simTimeSec;
       const expectedReplayBars = getReplaySliceForTimeframe("BTCUSD", "15m", simTimeSec);
@@ -323,8 +328,8 @@ describe("Dual-Chart Synchronized Bar Replay & Deep Price/Volume/VWAP/EMA Audit"
           timeframe: "15m",
           isDark: true,
           symbols: [{ name: "BTCUSD", displayName: "Bitcoin / USD", category: "CRYPTO" }],
-          // Pass a fake modern $99,999 live tick — MultiChartPane MUST ignore it during Replay!
-          ticks: { BTCUSD: { bid: 99_999, ask: 99_999, timestamp: Date.now() } },
+          // Pass a fake modern $999,999 live tick — MultiChartPane MUST ignore it during Replay!
+          ticks: { BTCUSD: { bid: 999_999, ask: 999_999, timestamp: Date.now() } },
           onPromoteToMain: () => {},
           isReplaying: true,
           replaySimTimeSec: simTimeSec,
@@ -334,8 +339,8 @@ describe("Dual-Chart Synchronized Bar Replay & Deep Price/Volume/VWAP/EMA Audit"
       );
 
       expect(getByTestId("pane-1-replay-badge").textContent).toBe("Replay");
-      expect(container.innerHTML).not.toContain("99,999");
-      expect(expectedReplayClose).toBeLessThan(50_000);
+      expect(container.innerHTML).not.toContain("999,999");
+      expect(expectedReplayClose).toBeLessThan(500_000);
       expect(container.querySelector(".cursor-crosshair")).not.toBeNull();
 
       // Stepping forward advances simTimeSec and updates MultiChartPane smoothly without crashing
@@ -462,16 +467,19 @@ describe("Dual-Chart Synchronized Bar Replay & Deep Price/Volume/VWAP/EMA Audit"
     }));
     const bars5m = aggregateTo5m(bars1m);
 
-    // Initially ONLY 5m is loaded (simulating switching 1 -> 2x1 mid-replay before 1m fetch resolves)
+    // Initially ONLY 5m is loaded: switching to 1m before real 1m bars arrive MUST NOT subdivide 5m artificially
     setRealStockSeries("HOTSWAP", "5m", bars5m);
     const res = useReplayStore.getState().start("HOTSWAP", "5m", t0930 + 5 * 60);
     expect(res.ok).toBe(true);
-    // Switch step engine to 1m while 1m is not loaded yet -> temporarily subdivides 5m
-    useReplayStore.getState().changeTimeframe("1m");
+    const rejected1m = useReplayStore.getState().changeTimeframe("1m");
+    expect(rejected1m).toBe(false);
+    expect(useReplayStore.getState().timeframe).toBe("5m");
     const simBefore = useReplayStore.getState().simTimeSec;
 
-    // Now real 1m stock bars arrive from /__api/stock-candles -> Replay hot-swaps automatically!
+    // Once real 1m stock bars arrive from IBKR, switching to 1m succeeds with 100% authentic 1m OHLCV!
     setRealStockSeries("HOTSWAP", "1m", bars1m);
+    const accepted1m = useReplayStore.getState().changeTimeframe("1m");
+    expect(accepted1m).toBe(true);
     const afterSwap = useReplayStore.getState();
     expect(afterSwap.simTimeSec).toBe(simBefore);
     const lastVisible = afterSwap.visible![afterSwap.visible!.length - 1]!;
@@ -1179,5 +1187,54 @@ describe("Dual-Chart Synchronized Bar Replay & Deep Price/Volume/VWAP/EMA Audit"
 
     const filtered = filterScreenerRows(universeCandidates, bounds);
     expect(filtered.map((r) => r.ticker)).toEqual(["ALGS"]);
+  });
+
+  it("enforces Replay data provenance, zero synthetic subdivision, strict VWAP coverage, and partial-candle look-ahead protection", () => {
+    registerDynamicSymbol({
+      name: "PROVCHK",
+      displayName: "Provenance Check Corp",
+      category: "STOCKS",
+      initialPrice: 9.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    const t0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000);
+    const bars5m: Candle[] = Array.from({ length: 12 }, (_, i) => ({
+      time: t0930 + i * 300,
+      open: 9 + i * 0.1,
+      high: 9.3 + i * 0.1,
+      low: 8.9 + i * 0.1,
+      close: 9.15 + i * 0.1,
+      volume: 15_000 + i * 500,
+    }));
+    setRealStockSeries("PROVCHK", "5m", bars5m);
+
+    // 1. Only 5m exists: starting Replay on 1m or switching 5m -> 1m must never invent synthetic 1m bars
+    expect(useReplayStore.getState().start("PROVCHK", "1m", t0930 + 900).ok).toBe(false);
+    expect(useReplayStore.getState().start("PROVCHK", "5m", t0930 + 900).ok).toBe(true);
+    expect(useReplayStore.getState().changeTimeframe("1m")).toBe(false);
+    expect(useReplayStore.getState().timeframe).toBe("5m");
+    expect(getReplaySliceForTimeframe("PROVCHK", "1m", useReplayStore.getState().simTimeSec)).toEqual([]);
+
+    // 2. Truncated 1m series starting at 09:35 ET without seed must not emit Regular Session VWAP
+    const late1m: Candle[] = Array.from({ length: 10 }, (_, i) => ({
+      time: t0930 + 300 + i * 60,
+      open: 9.2,
+      high: 9.4,
+      low: 9.1,
+      close: 9.3,
+      volume: 4_000,
+    }));
+    expect(
+      vwapBands(late1m, {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+      }).vwap,
+    ).toEqual([]);
+
+    useReplayStore.getState().stop();
+    invalidateStockSeries("PROVCHK");
   });
 });

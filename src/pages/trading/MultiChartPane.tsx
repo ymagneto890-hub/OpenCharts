@@ -36,9 +36,13 @@ import {
   type IndicatorType,
   sma,
 } from "../../lib/indicators.ts";
-import { parseTimeframeSeconds } from "../../lib/timeframes.ts";
+import {
+  computeRequiredWarmupBars,
+  parseTimeframeSeconds,
+} from "../../lib/timeframes.ts";
 import { cn, formatNumber, generateId } from "../../lib/utils.ts";
 import {
+  computeCausalReplayVwapSeed,
   fetchHistoryAsync,
   getHistory,
   getStockSessionMetadata,
@@ -333,6 +337,16 @@ export function MultiChartPane({
     [symbolInfo, paneSymbol],
   );
 
+  const paneCandleLimit = useMemo(() => {
+    const emaLines = (
+      indicatorSettings.ema?.lines ?? DEFAULT_INDICATOR_SETTINGS.ema.lines
+    ).filter((l) => l.enabled && l.period > 0);
+    return Math.max(
+      PANE_CANDLE_LIMIT,
+      computeRequiredWarmupBars(emaLines.map((l) => l.period)),
+    );
+  }, [indicatorSettings.ema?.lines]);
+
   const [candlesState, setCandlesState] = useState<{
     symbol: string;
     tf: Timeframe;
@@ -340,7 +354,7 @@ export function MultiChartPane({
   }>(() => ({
     symbol: paneSymbol,
     tf: paneTf,
-    bars: getHistory(paneSymbol, paneTf, PANE_CANDLE_LIMIT),
+    bars: isReplaying ? EMPTY_CANDLES : getHistory(paneSymbol, paneTf, PANE_CANDLE_LIMIT),
   }));
 
   // Keep real-time live stream bound ONLY to symbol (switching timeframe never restarts stream)
@@ -355,11 +369,15 @@ export function MultiChartPane({
   }, [paneSymbol, isReplaying]);
 
   useEffect(() => {
-    const syncBars = getHistory(paneSymbol, paneTf, PANE_CANDLE_LIMIT);
+    if (isReplaying) {
+      // Never trigger live/current IBKR downloads while Bar Replay is active
+      return;
+    }
+    const syncBars = getHistory(paneSymbol, paneTf, paneCandleLimit);
     setCandlesState({ symbol: paneSymbol, tf: paneTf, bars: syncBars });
     let cancelled = false;
     const refresh = () => {
-      void fetchHistoryAsync(paneSymbol, paneTf, PANE_CANDLE_LIMIT).then((bars) => {
+      void fetchHistoryAsync(paneSymbol, paneTf, paneCandleLimit).then((bars) => {
         if (!cancelled && bars.length > 0) {
           setCandlesState({ symbol: paneSymbol, tf: paneTf, bars });
         }
@@ -371,7 +389,7 @@ export function MultiChartPane({
     const unsubClosed = subscribeCandleBucketClosed((sym, tf) => {
       if (cancelled || isReplaying) return;
       if (sym.toUpperCase() === paneSymbol.toUpperCase() && tf === paneTf) {
-        const fresh = getHistory(paneSymbol, paneTf, PANE_CANDLE_LIMIT);
+        const fresh = getHistory(paneSymbol, paneTf, paneCandleLimit);
         if (fresh.length > 0) {
           setCandlesState({ symbol: paneSymbol, tf: paneTf, bars: fresh });
         }
@@ -381,7 +399,7 @@ export function MultiChartPane({
     const isStock = (getDemoSymbol(paneSymbol)?.category ?? "").toUpperCase() === "STOCKS";
     const isCrypto = isCryptoInstrument(paneSymbol);
     const pollId =
-      (isStock || isCrypto) && !isReplaying
+      isStock || isCrypto
         ? setInterval(() => {
             const liveUp = isCrypto ? isCryptoLiveStreamConnected() : isIbkrLiveStreamConnected();
             if (!liveUp) refresh();
@@ -393,7 +411,7 @@ export function MultiChartPane({
       unsubClosed();
       if (pollId) clearInterval(pollId);
     };
-  }, [paneSymbol, paneTf, isReplaying]);
+  }, [paneSymbol, paneTf, isReplaying, paneCandleLimit]);
 
   const liveCandles =
     candlesState.symbol === paneSymbol && candlesState.tf === paneTf
@@ -401,9 +419,11 @@ export function MultiChartPane({
       : EMPTY_CANDLES;
 
   const candles = useMemo<PaneCandle[]>(() => {
-    if (isReplaying && replaySimTimeSec > 0) {
-      const slice = getReplaySliceForTimeframe(paneSymbol, paneTf, replaySimTimeSec);
-      if (slice.length > 0) return slice;
+    if (isReplaying) {
+      if (replaySimTimeSec > 0) {
+        return getReplaySliceForTimeframe(paneSymbol, paneTf, replaySimTimeSec);
+      }
+      return EMPTY_CANDLES;
     }
     return liveCandles;
   }, [isReplaying, replaySimTimeSec, paneSymbol, paneTf, liveCandles]);
@@ -1124,27 +1144,64 @@ export function MultiChartPane({
     scheduleEmitBounds,
   ]);
 
-  const paneVwapSeed =
-    sessionCtx.isUsStock && !isReplaying
-      ? getStockVwapSeed(paneSymbol, chartPrefs.showExtendedHours, paneTf)
-      : null;
   const paneAnchorAtRegularOpen =
     sessionCtx.isUsStock && !chartPrefs.showExtendedHours && !hasExtendedFilterFallback;
+  const paneVwapSource = (indicatorSettings.vwap ?? DEFAULT_INDICATOR_SETTINGS.vwap).source;
 
-  const paneFine1mVwapCandles = useMemo(() => {
+  const paneVwapSeed = useMemo(() => {
+    if (!sessionCtx.isUsStock) return null;
+    if (isReplaying) {
+      if (!(replaySimTimeSec > 0) || liveDisplayCandles.length === 0) return null;
+      return computeCausalReplayVwapSeed(
+        paneSymbol,
+        liveDisplayCandles[0]!.time,
+        replaySimTimeSec,
+        {
+          sessionTimeZone: "america-new-york",
+          anchorAtRegularOpen: paneAnchorAtRegularOpen,
+          source: paneVwapSource,
+        },
+      );
+    }
+    return getStockVwapSeed(paneSymbol, chartPrefs.showExtendedHours, paneTf);
+  }, [
+    sessionCtx.isUsStock,
+    isReplaying,
+    replaySimTimeSec,
+    liveDisplayCandles,
+    paneSymbol,
+    paneAnchorAtRegularOpen,
+    paneVwapSource,
+    chartPrefs.showExtendedHours,
+    paneTf,
+  ]);
+
+  const paneFine1mVwapBundle = useMemo(() => {
     const tfSec = parseTimeframeSeconds(paneTf);
-    if (tfSec <= 60 || tfSec >= 86_400) return null;
-    if (!sessionCtx.isStock && !isCryptoInstrument(paneSymbol)) return null;
-    if (sessionCtx.isStock && !hasRealStockSeries(paneSymbol) && !isReplaying) return null;
+    if (tfSec <= 60 || tfSec >= 86_400) {
+      return { candles: null as PaneCandle[] | null, rawCoverageStartSec: undefined as number | undefined };
+    }
+    if (!sessionCtx.isStock && !isCryptoInstrument(paneSymbol)) {
+      return { candles: null, rawCoverageStartSec: undefined };
+    }
+    if (sessionCtx.isStock && !hasRealStockSeries(paneSymbol) && !isReplaying) {
+      return { candles: null, rawCoverageStartSec: undefined };
+    }
     const raw1m =
       isReplaying && replaySimTimeSec > 0
         ? getReplaySliceForTimeframe(paneSymbol, "1m", replaySimTimeSec)
-        : getHistory(paneSymbol, "1m", PANE_CANDLE_LIMIT);
-    if (raw1m.length === 0) return null;
-    if (sessionCtx.isStock && !chartPrefs.showExtendedHours && !hasExtendedFilterFallback) {
-      return filterExtendedHoursCandles(raw1m, false, sessionCtx.meta, sessionCtx.exchange);
+        : getHistory(paneSymbol, "1m");
+    if (raw1m.length === 0) {
+      return { candles: null, rawCoverageStartSec: undefined };
     }
-    return raw1m;
+    const rawCoverageStartSec = raw1m[0]!.time;
+    if (sessionCtx.isStock && !chartPrefs.showExtendedHours && !hasExtendedFilterFallback) {
+      return {
+        candles: filterExtendedHoursCandles(raw1m, false, sessionCtx.meta, sessionCtx.exchange),
+        rawCoverageStartSec,
+      };
+    }
+    return { candles: raw1m, rawCoverageStartSec };
   }, [
     paneTf,
     paneSymbol,
@@ -1155,6 +1212,8 @@ export function MultiChartPane({
     hasExtendedFilterFallback,
     liveDisplayCandles,
   ]);
+  const paneFine1mVwapCandles = paneFine1mVwapBundle.candles;
+  const paneRawCoverageStartSec = candles.length > 0 ? candles[0]!.time : undefined;
 
   // Overlay indicators (EMA, VWAP + bands, SMA, BOLL, VPVR, SMC) reused in-place without 5s flicker and updated on live ticks
   useEffect(() => {
@@ -1286,6 +1345,9 @@ export function MultiChartPane({
           source: vwapCfg.source,
           priorSessionSeed: anchor === "session" ? (paneVwapSeed ?? undefined) : undefined,
           anchorAtRegularOpen: paneAnchorAtRegularOpen,
+          rawCoverageStartSec: paneRawCoverageStartSec,
+          fineRawCoverageStartSec: paneFine1mVwapBundle.rawCoverageStartSec,
+          requireCompleteSession: sessionCtx.isUsStock,
         },
       );
       upsertOverlayLine(
@@ -1809,6 +1871,16 @@ export function MultiChartPane({
           >
             Replay
           </span>
+        )}
+        {isReplaying && displayCandles.length === 0 && (
+          <div
+            data-testid={`pane-${slotId}-replay-empty`}
+            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center px-4 text-center"
+          >
+            <span className="px-2.5 py-1 rounded-md bg-card/90 border border-border text-[11px] font-medium text-muted-foreground">
+              Sin datos históricos reales disponibles para {paneSymbol} ({paneTf}) en esta fecha de Replay
+            </span>
+          </div>
         )}
         <div
           ref={syncHorzLineRef}

@@ -274,8 +274,9 @@ describe("Full Audit Bugfixes Regression Suite", () => {
     const fromSec = matchedDay!.time + 2 * TF_SECONDS["4h"]!;
     const toSec = matchedDay!.time + TF_SECONDS["1d"]!;
     const partialRange = buildPartialCandleRange("BTCUSD", matchedDay!, "1d", fromSec, toSec);
-    expect(partialRange.low).toBeGreaterThan(morningLow);
-    expect(partialRange.low).toBe(afternoonMinLow);
+    expect(partialRange).not.toBeNull();
+    expect(partialRange!.low).toBeGreaterThan(morningLow);
+    expect(partialRange!.low).toBe(afternoonMinLow);
 
     // End-to-end replay test: step from 04:00 to 08:00, open SHORT with TP inside morningLow..afternoonMinLow,
     // switch TF to 1d, and step: TP must NOT trigger on already-elapsed morning wick.

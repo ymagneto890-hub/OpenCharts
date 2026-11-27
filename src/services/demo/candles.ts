@@ -1,5 +1,11 @@
 import type { Candle } from "../schemas.ts";
-import type { VwapSessionSeed } from "../../lib/indicators.ts";
+import {
+  getNyTradingDayKey,
+  getSessionAnchorStartSec,
+  type VwapPriceSource,
+  type VwapSessionSeed,
+  type VwapSessionTimeZone,
+} from "../../lib/indicators.ts";
 import {
   aggregateCandles,
   computeRequiredWarmupBars,
@@ -48,8 +54,6 @@ export const TF_SECONDS: Record<string, number> = new Proxy(BASE_TF_SECONDS, {
   },
 });
 
-const TF_HIERARCHY = ["1w", "1d", "4h", "1h", "30m", "15m", "5m", "1m"] as const;
-const TF_HIERARCHY_3M = ["1w", "1d", "4h", "1h", "30m", "15m", "3m", "1m"] as const;
 const TEMPLATE_SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "ADAUSD"] as const;
 
 function isTestEnv(): boolean {
@@ -70,6 +74,7 @@ const modules = isTestEnv()
   : {};
 
 const series = new Map<string, Candle[]>();
+const bundledFixtureKeys = new Set<string>();
 if (isTestEnv()) {
   for (const [path, mod] of Object.entries(modules)) {
     if (!Array.isArray(mod.default)) continue;
@@ -78,8 +83,22 @@ if (isTestEnv()) {
       key,
       (mod.default as Candle[]).map((c) => ({ ...c })),
     );
+    bundledFixtureKeys.add(key);
   }
 }
+
+export type CandleDataOrigin = "real" | "aggregated" | "synthetic" | "unavailable";
+
+export interface ReplaySeriesResolution {
+  candles: Candle[];
+  origin: CandleDataOrigin;
+  sourceTimeframe: string | null;
+}
+
+export type PartialCandleResolution =
+  | { status: "ok"; candle: Candle }
+  | { status: "empty-verified" }
+  | { status: "missing-data" };
 
 export interface SessionRange {
   start: number;
@@ -112,6 +131,8 @@ export interface IbkrLiveVwapState {
 
 const liveSeriesKeys = new Set<string>();
 const realStockSeriesKeys = new Set<string>();
+const syntheticSeriesKeys = new Set<string>();
+const historicalTargetSeries = new Map<string, Candle[]>();
 const latestRealStockBarMs = new Map<string, number>();
 const lastFetchAt = new Map<string, number>();
 const inFlightFetches = new Map<string, Promise<Candle[]>>();
@@ -321,6 +342,12 @@ export function invalidateStockSeries(symbol: string): void {
   for (const k of Array.from(realStockSeriesKeys)) {
     if (k.toUpperCase().startsWith(prefix)) realStockSeriesKeys.delete(k);
   }
+  for (const k of Array.from(syntheticSeriesKeys)) {
+    if (k.toUpperCase().startsWith(prefix)) syntheticSeriesKeys.delete(k);
+  }
+  for (const k of Array.from(historicalTargetSeries.keys())) {
+    if (k.toUpperCase().startsWith(prefix)) historicalTargetSeries.delete(k);
+  }
   stockVwapSeeds.delete(upper);
   for (const k of Array.from(stockVwapSeeds.keys())) {
     if (k.toUpperCase().startsWith(prefix)) stockVwapSeeds.delete(k);
@@ -354,6 +381,9 @@ export function invalidateAllStockSeries(): void {
     if (isStockKey(k)) stockDataSources.delete(k);
   }
   realStockSeriesKeys.clear();
+  for (const k of Array.from(historicalTargetSeries.keys())) {
+    if (isStockKey(k.split("_hist_")[0] ?? k)) historicalTargetSeries.delete(k);
+  }
   bars1sBySymbol.clear();
   stockVwapSeeds.clear();
   liveVwapBySymbol.clear();
@@ -487,7 +517,7 @@ function rawSeries(symbol: string, timeframe: string): Candle[] {
   // Optimistic local aggregation from real 1m series for short intraday multiples (e.g. 2m, 3m, 5m)
   const oneMin = series.get(`${upper}_1m`) ?? series.get(`${symbol}_1m`);
   if (
-    realStockSeriesKeys.has(`${upper}_1m`) &&
+    (realStockSeriesKeys.has(`${upper}_1m`) || realStockSeriesKeys.has(`${symbol}_1m`)) &&
     oneMin &&
     oneMin.length >= 180 &&
     targetSec > 60 &&
@@ -498,7 +528,12 @@ function rawSeries(symbol: string, timeframe: string): Candle[] {
     if (resampled.length > 0) return resampled;
   }
 
-  if (!isTestEnv()) {
+  const sym = getDemoSymbol(symbol);
+  const isStock =
+    (sym?.category ?? "").toUpperCase() === "STOCKS" || hasRealStockSeries(symbol);
+
+  // Never synthesize artificial candles for stocks or instruments backed by real IBKR series, even in tests.
+  if (!isTestEnv() || isStock) {
     return [];
   }
 
@@ -506,12 +541,12 @@ function rawSeries(symbol: string, timeframe: string): Candle[] {
     const resampled3m = resampleCandles(oneMin, 180);
     if (resampled3m.length > 0) {
       series.set(key, resampled3m);
+      bundledFixtureKeys.add(key);
       if (liveSeriesKeys.has(`${symbol}_1m`)) liveSeriesKeys.add(key);
       return resampled3m;
     }
   }
 
-  const sym = getDemoSymbol(symbol);
   if (sym && (sym.isPerpetual || sym.category === "FUTURES")) {
     const raw = sym.name.toUpperCase();
     const base = raw.endsWith("USDT.P")
@@ -533,6 +568,7 @@ function rawSeries(symbol: string, timeframe: string): Candle[] {
     if (bundledSpot && bundledSpot.length > 0) {
       const cloned = bundledSpot.map((c) => ({ ...c }));
       series.set(key, cloned);
+      bundledFixtureKeys.add(key);
       if (liveSeriesKeys.has(liveSourceKey)) liveSeriesKeys.add(key);
       return cloned;
     }
@@ -560,6 +596,7 @@ function rawSeries(symbol: string, timeframe: string): Candle[] {
         return { ...c, open, high, low, close };
       });
       series.set(key, scaled);
+      bundledFixtureKeys.add(key);
       if (liveSeriesKeys.has(liveSourceKey)) liveSeriesKeys.add(key);
       return scaled;
     }
@@ -569,6 +606,8 @@ function rawSeries(symbol: string, timeframe: string): Candle[] {
   if (synthesized.length > 0) {
     series.set(key, synthesized);
     liveSeriesKeys.add(key);
+    syntheticSeriesKeys.add(key);
+    syntheticSeriesKeys.add(upperKey);
   }
   return synthesized;
 }
@@ -629,125 +668,40 @@ export function getRawHistory(symbol: string, timeframe: string): Candle[] {
   return rawSeries(symbol, timeframe);
 }
 
-// ── Test-Only Replay Helpers ───────────────────────────────────────────────────
-function seededRand(seed: number): () => number {
-  let s = (seed ^ 0x9e3779b9) >>> 0;
-  return () => {
-    s = Math.imul(s ^ (s >>> 16), 0x21f0aaad);
-    s = Math.imul(s ^ (s >>> 15), 0x735a2d97);
-    return ((s = s ^ (s >>> 15)) >>> 0) / 4294967296;
-  };
-}
-
-function subdivideCandle(parent: Candle, parentSec: number, childSec: number): Candle[] {
-  const count = Math.max(1, Math.round(parentSec / childSec));
-  if (count <= 1) return [{ ...parent }];
-
-  const rand = seededRand(parent.time ^ Math.imul(childSec, 2654435761));
-  const range = Math.max(0, parent.high - parent.low);
-  const isBull = parent.close >= parent.open;
-
-  let firstIdx = Math.floor(rand() * Math.max(1, Math.floor(count / 2)));
-  let secondIdx =
-    Math.floor(count / 2) + Math.floor(rand() * Math.max(1, count - Math.floor(count / 2)));
-  if (secondIdx >= count) secondIdx = count - 1;
-  if (firstIdx === secondIdx) {
-    firstIdx = 0;
-    secondIdx = count - 1;
-  }
-
-  const lowIdx = isBull ? firstIdx : secondIdx;
-  const highIdx = isBull ? secondIdx : firstIdx;
-
-  const firstExtreme = isBull
-    ? parent.low + range * (0.05 + rand() * 0.15)
-    : parent.high - range * (0.05 + rand() * 0.15);
-  const secondExtreme = isBull
-    ? parent.high - range * (0.05 + rand() * 0.15)
-    : parent.low + range * (0.05 + rand() * 0.15);
-
-  const closes: number[] = new Array(count);
-  for (let i = 0; i < count; i++) {
-    if (i === count - 1) {
-      closes[i] = parent.close;
+function normalizeSortedUniqueBars(bars: ReadonlyArray<Candle>): Candle[] {
+  const byTime = new Map<number, Candle>();
+  for (const b of bars) {
+    if (
+      !b ||
+      !Number.isFinite(b.time) ||
+      !Number.isFinite(b.open) ||
+      !Number.isFinite(b.high) ||
+      !Number.isFinite(b.low) ||
+      !Number.isFinite(b.close) ||
+      b.close <= 0
+    ) {
       continue;
     }
-    let base: number;
-    if (i <= firstIdx) {
-      const t = firstIdx === 0 ? 1 : (i + 1) / (firstIdx + 1);
-      base = parent.open + (firstExtreme - parent.open) * t;
-    } else if (i <= secondIdx) {
-      const t = (i - firstIdx) / Math.max(1, secondIdx - firstIdx);
-      base = firstExtreme + (secondExtreme - firstExtreme) * t;
-    } else {
-      const t = (i - secondIdx) / Math.max(1, count - 1 - secondIdx);
-      base = secondExtreme + (parent.close - secondExtreme) * t;
-    }
-    const noise = (rand() - 0.5) * range * 0.18;
-    closes[i] = Math.min(parent.high, Math.max(parent.low, base + noise));
-  }
-
-  const rawWeights: number[] = new Array(count);
-  let weightSum = 0;
-  for (let i = 0; i < count; i++) {
-    const w = 0.5 + rand();
-    rawWeights[i] = w;
-    weightSum += w;
-  }
-
-  const children: Candle[] = new Array(count);
-  for (let i = 0; i < count; i++) {
-    const open = i === 0 ? parent.open : closes[i - 1]!;
-    const close = closes[i]!;
-    const bodyHigh = Math.max(open, close);
-    const bodyLow = Math.min(open, close);
-    const high =
-      i === highIdx
-        ? parent.high
-        : Math.min(parent.high, bodyHigh + range * (0.02 + rand() * 0.14));
-    const low =
-      i === lowIdx
-        ? parent.low
-        : Math.max(parent.low, bodyLow - range * (0.02 + rand() * 0.14));
-    const volume =
-      weightSum > 0 ? (parent.volume * rawWeights[i]!) / weightSum : parent.volume / count;
-
-    children[i] = {
-      time: parent.time + i * childSec,
-      open,
-      high,
-      low,
-      close,
-      volume,
-    };
-  }
-  return children;
-}
-
-export function setRealStockSeries(symbol: string, timeframe: string, bars: Candle[]): void {
-  const cleanSym = symbol.trim().toUpperCase();
-  const key = `${cleanSym}_${timeframe}`;
-  const sorted = [...bars]
-    .filter(
-      (b) =>
-        b &&
-        Number.isFinite(b.time) &&
-        Number.isFinite(b.open) &&
-        Number.isFinite(b.high) &&
-        Number.isFinite(b.low) &&
-        Number.isFinite(b.close) &&
-        b.close > 0,
-    )
-    .map((b) => ({
-      time: Math.floor(b.time),
+    const t = Math.floor(b.time);
+    byTime.set(t, {
+      time: t,
       open: b.open,
       high: Math.max(b.high, b.open, b.close),
       low: Math.min(b.low, b.open, b.close),
       close: b.close,
       volume: typeof b.volume === "number" && Number.isFinite(b.volume) && b.volume >= 0 ? b.volume : 0,
-    }))
-    .sort((a, b) => a.time - b.time);
+    });
+  }
+  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+}
+
+export function setRealStockSeries(symbol: string, timeframe: string, bars: Candle[]): void {
+  const cleanSym = symbol.trim().toUpperCase();
+  const key = `${cleanSym}_${timeframe}`;
+  const sorted = normalizeSortedUniqueBars(bars);
   series.set(key, sorted);
+  syntheticSeriesKeys.delete(key);
+  syntheticSeriesKeys.delete(`${symbol}_${timeframe}`);
   liveSeriesKeys.add(key);
   const wasMissing = !realStockSeriesKeys.has(key);
   realStockSeriesKeys.add(key);
@@ -756,63 +710,330 @@ export function setRealStockSeries(symbol: string, timeframe: string, bars: Cand
   }
 }
 
-export function isReplayDataSynthetic(symbol: string, timeframe: string, targetTimeSec: number): boolean {
-  const tfSec = TF_SECONDS[timeframe] ?? 60;
-  const direct = getHistory(symbol, timeframe);
-  if (direct.length === 0 || direct[direct.length - 1]!.time + tfSec < targetTimeSec) {
-    return true;
+function findBarIndexAtOrBefore(bars: ReadonlyArray<Candle>, timeSec: number): number {
+  let lo = 0;
+  let hi = bars.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (bars[mid]!.time <= timeSec) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
   }
-  const key = `${symbol.trim().toUpperCase()}_${timeframe}`;
-  if (realStockSeriesKeys.has(key) || realStockSeriesKeys.has(`${symbol}_${timeframe}`)) {
-    return direct[0]!.time > targetTimeSec;
-  }
-  return direct[0]!.time > targetTimeSec - tfSec * 30;
+  return ans;
 }
 
-export function getReplayHistory(symbol: string, timeframe: string, targetTimeSec: number): Candle[] {
-  const direct = getHistory(symbol, timeframe);
-  if (!isReplayDataSynthetic(symbol, timeframe, targetTimeSec)) {
-    return direct;
+function seriesCoversTargetTime(
+  bars: ReadonlyArray<Candle>,
+  tfSec: number,
+  targetTimeSec: number,
+  isStock: boolean,
+): boolean {
+  if (bars.length === 0 || !Number.isFinite(targetTimeSec) || targetTimeSec <= 0) return false;
+  if (bars[0]!.time > targetTimeSec) return false;
+  const idx = findBarIndexAtOrBefore(bars, targetTimeSec);
+  if (idx < 0) return false;
+  const nearestBefore = bars[idx]!;
+  // Reject disjoint series where a multi-week hole separates the nearest bar from `targetTimeSec`
+  const maxAllowedGapSec =
+    tfSec >= 604_800
+      ? 21 * 86_400
+      : tfSec >= 86_400
+        ? 10 * 86_400
+        : 5 * 86_400;
+  if (targetTimeSec - nearestBefore.time > maxAllowedGapSec) return false;
+
+  const lastBar = bars[bars.length - 1]!;
+  if (lastBar.time + tfSec >= targetTimeSec) return true;
+  // Allow post-close / quiet end-of-day timestamps on the SAME NY/UTC trading day,
+  // but never allow an old historical series to masquerade as a future date's data.
+  if (isStock && tfSec < 86_400) {
+    return getNyTradingDayKey(targetTimeSec) <= getNyTradingDayKey(lastBar.time);
   }
+  return targetTimeSec - (lastBar.time + tfSec) <= Math.max(tfSec * 4, 64_800);
+}
 
-  const hierarchy = timeframe === "3m" ? TF_HIERARCHY_3M : TF_HIERARCHY;
-  const targetHIdx = (hierarchy as readonly string[]).indexOf(timeframe);
-  if (targetHIdx <= 0) return direct;
+function getDirectAuthenticCandidates(symbol: string, timeframe: string): Candle[][] {
+  const upper = symbol.trim().toUpperCase();
+  const exactKey = `${symbol}_${timeframe}`;
+  const upperKey = `${upper}_${timeframe}`;
+  const out: Candle[][] = [];
 
-  let ancIdx = -1;
-  for (let i = targetHIdx - 1; i >= 0; i--) {
-    const candidate = getHistory(symbol, hierarchy[i]!);
-    if (candidate.length > 0 && candidate[0]!.time <= targetTimeSec) {
-      ancIdx = i;
-      break;
+  // 1. Check isolated targetDate historical snapshots first so past Replay dates never mix with live bars
+  const histPrefix = `${upper}_${timeframe}_hist_`;
+  for (const [k, bars] of historicalTargetSeries.entries()) {
+    if (k.startsWith(histPrefix) && bars.length > 0) {
+      out.push(bars);
     }
   }
-  if (ancIdx < 0) return direct;
 
-  let currentBars = getHistory(symbol, hierarchy[ancIdx]!);
-  for (let step = ancIdx + 1; step <= targetHIdx; step++) {
-    const parentTf = hierarchy[step - 1]!;
-    const childTf = hierarchy[step]!;
-    const parentSec = TF_SECONDS[parentTf]!;
-    const childSec = TF_SECONDS[childTf]!;
-
-    const spanSec = Math.max(childSec * 1200, parentSec * 60);
-    const minParentTime = targetTimeSec - spanSec;
-    const maxParentTime = targetTimeSec + spanSec;
-    const windowedParents = currentBars.filter(
-      (b) => b.time + parentSec >= minParentTime && b.time <= maxParentTime,
-    );
-    const sourceParents = windowedParents.length > 0 ? windowedParents : currentBars;
-
-    const nextBars: Candle[] = [];
-    for (const p of sourceParents) {
-      const sub = subdivideCandle(p, parentSec, childSec);
-      for (const c of sub) nextBars.push(c);
+  // 2. Check primary in-memory series ONLY if its origin is real (IBKR or real test fixture, never synthetic)
+  const isSynthetic =
+    syntheticSeriesKeys.has(upperKey) || syntheticSeriesKeys.has(exactKey);
+  if (!isSynthetic) {
+    const isRealStock =
+      realStockSeriesKeys.has(upperKey) || realStockSeriesKeys.has(exactKey);
+    if (isRealStock) {
+      const direct = series.get(upperKey) ?? series.get(exactKey);
+      if (direct && direct.length > 0) out.push(direct);
+    } else if (timeframe === "1s") {
+      const b1s = bars1sBySymbol.get(upper);
+      if (b1s && b1s.length > 0) out.push(b1s);
+    } else if (isTestEnv()) {
+      const sym = getDemoSymbol(symbol);
+      const isStock =
+        (sym?.category ?? "").toUpperCase() === "STOCKS" || hasRealStockSeries(symbol);
+      if (!isStock) {
+        // Trigger bundled spot/perp lookup if not yet materialized
+        const raw = rawSeries(symbol, timeframe);
+        const nowSynthetic =
+          syntheticSeriesKeys.has(upperKey) || syntheticSeriesKeys.has(exactKey);
+        if (
+          raw.length > 0 &&
+          !nowSynthetic &&
+          (bundledFixtureKeys.has(upperKey) || bundledFixtureKeys.has(exactKey))
+        ) {
+          const shifted = getHistory(symbol, timeframe);
+          if (shifted.length > 0) out.push(shifted);
+        }
+      }
     }
-    currentBars = nextBars;
   }
 
-  return currentBars;
+  return out;
+}
+
+const FINER_AGGREGATION_ORDER = [
+  "1m",
+  "1s",
+  "2m",
+  "3m",
+  "5m",
+  "10m",
+  "15m",
+  "30m",
+  "1h",
+  "2h",
+  "4h",
+] as const;
+
+/**
+ * Resolves Replay candles for `(symbol, timeframe)` at `targetTimeSec` with explicit provenance:
+ * - `"real"`: Original exchange candles for `timeframe` covering `targetTimeSec`.
+ * - `"aggregated"`: Deterministically aggregated upward from authentic finer-timeframe candles.
+ * - `"synthetic"`: Only non-exchange offline synthetic data exists (NEVER returned as Replay candles).
+ * - `"unavailable"`: No authentic candles cover `targetTimeSec`.
+ *
+ * Artificial downward subdivision (`subdivideCandle`) is strictly prohibited.
+ */
+export function getReplaySeriesWithProvenance(
+  symbol: string,
+  timeframe: string,
+  targetTimeSec: number,
+): ReplaySeriesResolution {
+  const tfSec = TF_SECONDS[timeframe] ?? parseTimeframeSeconds(timeframe);
+  const sym = getDemoSymbol(symbol);
+  const isStock =
+    (sym?.category ?? "").toUpperCase() === "STOCKS" || hasRealStockSeries(symbol);
+
+  // 1. Direct real historical candles for `timeframe`
+  const directCandidates = getDirectAuthenticCandidates(symbol, timeframe);
+  for (const cand of directCandidates) {
+    if (seriesCoversTargetTime(cand, tfSec, targetTimeSec, isStock)) {
+      return { candles: cand, origin: "real", sourceTimeframe: timeframe };
+    }
+  }
+
+  // 2. Valid upward aggregation from authentic finer timeframes (`finerSec < tfSec`)
+  for (const finerTf of FINER_AGGREGATION_ORDER) {
+    const finerSec = TF_SECONDS[finerTf]!;
+    if (finerSec >= tfSec) continue;
+    if (tfSec < 60 && finerSec !== 1 && tfSec % finerSec !== 0) continue;
+    if (tfSec >= 60 && finerSec === 1) continue; // Do not build multi-minute Replay from short 1s tail
+    if (tfSec % finerSec !== 0) continue;
+    if (isStock && tfSec >= 86_400) continue; // US equity daily bars align to NY session dates, not UTC multiples
+
+    const finerCandidates = getDirectAuthenticCandidates(symbol, finerTf);
+    for (const finerBars of finerCandidates) {
+      if (seriesCoversTargetTime(finerBars, finerSec, targetTimeSec, isStock)) {
+        const aggregated = resampleCandles(finerBars, tfSec);
+        if (
+          aggregated.length > 0 &&
+          seriesCoversTargetTime(aggregated, tfSec, targetTimeSec, isStock)
+        ) {
+          return {
+            candles: aggregated,
+            origin: "aggregated",
+            sourceTimeframe: finerTf,
+          };
+        }
+      }
+    }
+  }
+
+  const upper = symbol.trim().toUpperCase();
+  const hasSyntheticOnly =
+    syntheticSeriesKeys.has(`${upper}_${timeframe}`) ||
+    syntheticSeriesKeys.has(`${symbol}_${timeframe}`);
+  return {
+    candles: [],
+    origin: hasSyntheticOnly ? "synthetic" : "unavailable",
+    sourceTimeframe: null,
+  };
+}
+
+export function getCandleSeriesOrigin(
+  symbol: string,
+  timeframe: string,
+  targetTimeSec?: number,
+): CandleDataOrigin {
+  if (typeof targetTimeSec === "number" && Number.isFinite(targetTimeSec) && targetTimeSec > 0) {
+    return getReplaySeriesWithProvenance(symbol, timeframe, targetTimeSec).origin;
+  }
+  const upper = symbol.trim().toUpperCase();
+  const exactKey = `${symbol}_${timeframe}`;
+  const upperKey = `${upper}_${timeframe}`;
+  if (syntheticSeriesKeys.has(upperKey) || syntheticSeriesKeys.has(exactKey)) {
+    return "synthetic";
+  }
+  if (
+    realStockSeriesKeys.has(upperKey) ||
+    realStockSeriesKeys.has(exactKey) ||
+    bundledFixtureKeys.has(upperKey) ||
+    bundledFixtureKeys.has(exactKey)
+  ) {
+    const direct = series.get(upperKey) ?? series.get(exactKey);
+    if (direct && direct.length > 0) return "real";
+  }
+  const probe = rawSeries(symbol, timeframe);
+  if (probe.length === 0) return "unavailable";
+  if (syntheticSeriesKeys.has(upperKey) || syntheticSeriesKeys.has(exactKey)) {
+    return "synthetic";
+  }
+  return "aggregated";
+}
+
+export function hasAuthenticReplayData(
+  symbol: string,
+  timeframe: string,
+  targetTimeSec: number,
+): boolean {
+  const res = getReplaySeriesWithProvenance(symbol, timeframe, targetTimeSec);
+  return (res.origin === "real" || res.origin === "aggregated") && res.candles.length > 0;
+}
+
+export function isReplayDataSynthetic(
+  symbol: string,
+  timeframe: string,
+  targetTimeSec: number,
+): boolean {
+  return !hasAuthenticReplayData(symbol, timeframe, targetTimeSec);
+}
+
+export function getReplayHistory(
+  symbol: string,
+  timeframe: string,
+  targetTimeSec: number,
+): Candle[] {
+  const resolved = getReplaySeriesWithProvenance(symbol, timeframe, targetTimeSec);
+  if (resolved.origin === "real" || resolved.origin === "aggregated") {
+    return resolved.candles;
+  }
+  return [];
+}
+
+const PARTIAL_SUB_CANDIDATES = [
+  "1m",
+  "3m",
+  "5m",
+  "15m",
+  "30m",
+  "1h",
+  "4h",
+  "1s",
+] as const;
+
+function doesSubSeriesCoverParentInterval(
+  subCandles: ReadonlyArray<Candle>,
+  subSec: number,
+  candle: Candle,
+  tfSec: number,
+  rangeStart: number,
+  rangeEnd: number,
+): boolean {
+  if (subCandles.length === 0) return false;
+  if (subCandles[0]!.time > rangeStart) return false;
+  const lastSub = subCandles[subCandles.length - 1]!;
+  if (lastSub.time + subSec >= rangeEnd) return true;
+  // Also accept when `subCandles` starts at/before `candle.time` and already accounts for 100%
+  // of `candle.volume` (e.g. final minutes of session had 0 trades after `lastSub.time`).
+  if (subCandles[0]!.time <= candle.time && candle.volume > 0) {
+    let bucketVol = 0;
+    const parentEnd = candle.time + tfSec;
+    for (const c of subCandles) {
+      if (c.time < candle.time) continue;
+      if (c.time >= parentEnd) break;
+      bucketVol += c.volume;
+    }
+    if (Math.abs(bucketVol - candle.volume) <= Math.max(1e-6, candle.volume * 1e-6)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function resolvePartialCandleWindow(
+  symbol: string,
+  candle: Candle,
+  timeframe: string,
+  fromSec: number,
+  toSec: number,
+): PartialCandleResolution {
+  const tfSec = TF_SECONDS[timeframe] ?? parseTimeframeSeconds(timeframe);
+  if (toSec <= fromSec) return { status: "missing-data" };
+
+  let sawVerifiedEmptyCoverage = false;
+  for (const candidate of PARTIAL_SUB_CANDIDATES) {
+    const cSec = TF_SECONDS[candidate]!;
+    if (cSec >= tfSec) continue;
+    if ((fromSec - candle.time) % cSec !== 0 || (toSec - fromSec) % cSec !== 0) continue;
+
+    const resolved = getReplaySeriesWithProvenance(symbol, candidate, toSec - 1);
+    if (resolved.origin !== "real") continue;
+    const subCandles = resolved.candles;
+    if (!doesSubSeriesCoverParentInterval(subCandles, cSec, candle, tfSec, fromSec, toSec)) {
+      continue;
+    }
+
+    const slice = subCandles.filter((c) => c.time >= fromSec && c.time < toSec);
+    if (slice.length === 0) {
+      sawVerifiedEmptyCoverage = true;
+      continue;
+    }
+
+    const open = slice[0]!.open;
+    const close = slice[slice.length - 1]!.close;
+    let high = Math.max(open, close);
+    let low = Math.min(open, close);
+    let volume = 0;
+    for (const c of slice) {
+      if (c.high > high) high = c.high;
+      if (c.low < low) low = c.low;
+      volume += c.volume;
+    }
+    return {
+      status: "ok",
+      candle: { time: candle.time, open, high, low, close, volume },
+    };
+  }
+
+  if (sawVerifiedEmptyCoverage) {
+    return { status: "empty-verified" };
+  }
+  return { status: "missing-data" };
 }
 
 export function buildPartialCandleOrNullUpTo(
@@ -821,62 +1042,12 @@ export function buildPartialCandleOrNullUpTo(
   timeframe: string,
   simTimeSec: number,
 ): Candle | null {
-  const tfSec = TF_SECONDS[timeframe] ?? 60;
+  const tfSec = TF_SECONDS[timeframe] ?? parseTimeframeSeconds(timeframe);
   if (simTimeSec <= candle.time || simTimeSec >= candle.time + tfSec) {
     return candle;
   }
-
-  const elapsed = simTimeSec - candle.time;
-  const upperSym = symbol.trim().toUpperCase();
-  const hasReal1m =
-    realStockSeriesKeys.has(`${upperSym}_1m`) || realStockSeriesKeys.has(`${symbol}_1m`);
-  let subTf = "1m";
-  for (const candidate of ["1d", "4h", "1h", "30m", "15m", "5m", "3m", "1m"] as const) {
-    const cSec = TF_SECONDS[candidate]!;
-    if (tfSec > cSec && elapsed % cSec === 0) {
-      if (
-        hasReal1m &&
-        candidate !== "1m" &&
-        !realStockSeriesKeys.has(`${upperSym}_${candidate}`) &&
-        !realStockSeriesKeys.has(`${symbol}_${candidate}`)
-      ) {
-        continue;
-      }
-      subTf = candidate;
-      break;
-    }
-  }
-
-  const subCandles = getReplayHistory(symbol, subTf, simTimeSec);
-  const slice = subCandles.filter((c) => c.time >= candle.time && c.time < simTimeSec);
-  if (slice.length === 0) {
-    const subCoversBucket =
-      subCandles.length > 0 &&
-      subCandles[0]!.time <= candle.time &&
-      subCandles[subCandles.length - 1]!.time >= candle.time;
-    if (subCoversBucket) return null;
-    return {
-      time: candle.time,
-      open: candle.open,
-      high: candle.open,
-      low: candle.open,
-      close: candle.open,
-      volume: 0,
-    };
-  }
-
-  const open = slice[0]!.open;
-  const close = slice[slice.length - 1]!.close;
-  let high = Math.max(open, close);
-  let low = Math.min(open, close);
-  let volume = 0;
-  for (const c of slice) {
-    if (c.high > high) high = c.high;
-    if (c.low < low) low = c.low;
-    volume += c.volume;
-  }
-
-  return { time: candle.time, open, high, low, close, volume };
+  const res = resolvePartialCandleWindow(symbol, candle, timeframe, candle.time, simTimeSec);
+  return res.status === "ok" ? res.candle : null;
 }
 
 export function buildPartialCandleUpTo(
@@ -897,37 +1068,103 @@ export function buildPartialCandleUpTo(
   );
 }
 
+/**
+ * Reconstructs the exact OHLCV of `candle` strictly inside `[fromSec, toSec)` using
+ * authentic finer-timeframe historical candles. Returns `null` when finer historical data
+ * covering `[fromSec, toSec)` is unavailable — NEVER returns the full parent `candle`.
+ */
 export function buildPartialCandleRange(
   symbol: string,
   candle: Candle,
   timeframe: string,
   fromSec: number,
   toSec: number,
-): Candle {
-  const tfSec = TF_SECONDS[timeframe] ?? 60;
-  let subTf = "1m";
-  for (const candidate of ["1d", "4h", "1h", "30m", "15m", "5m", "3m", "1m"] as const) {
-    const cSec = TF_SECONDS[candidate]!;
-    if (tfSec > cSec && (fromSec - candle.time) % cSec === 0 && (toSec - fromSec) % cSec === 0) {
-      subTf = candidate;
-      break;
-    }
-  }
-  const subCandles = getReplayHistory(symbol, subTf, toSec);
-  const slice = subCandles.filter((c) => c.time >= fromSec && c.time < toSec);
-  if (slice.length === 0) return candle;
+): Candle | null {
+  const res = resolvePartialCandleWindow(symbol, candle, timeframe, fromSec, toSec);
+  return res.status === "ok" ? res.candle : null;
+}
 
-  const open = slice[0]!.open;
-  const close = slice[slice.length - 1]!.close;
-  let high = Math.max(open, close);
-  let low = Math.min(open, close);
-  let volume = 0;
-  for (const c of slice) {
-    if (c.high > high) high = c.high;
-    if (c.low < low) low = c.low;
-    volume += c.volume;
+/**
+ * Computes a strictly causal `VwapSessionSeed` for Replay when `visibleStartSec` begins after
+ * the session anchor (`04:00 ET` / `09:30 ET` / `00:00 UTC`), using ONLY authentic 1-minute bars
+ * in `[sessionAnchorSec, Math.min(visibleStartSec, simTimeSec))` whose bar end is `<= simTimeSec`.
+ */
+export function computeCausalReplayVwapSeed(
+  symbol: string,
+  visibleStartSec: number,
+  simTimeSec: number,
+  options: {
+    sessionTimeZone?: VwapSessionTimeZone;
+    anchorAtRegularOpen?: boolean;
+    source?: VwapPriceSource;
+  } = {},
+): VwapSessionSeed | null {
+  if (!(visibleStartSec > 0) || !(simTimeSec > 0)) return null;
+  const sessionTz: VwapSessionTimeZone = options.sessionTimeZone ?? "america-new-york";
+  const anchorAtRegularOpen =
+    Boolean(options.anchorAtRegularOpen) && sessionTz === "america-new-york";
+  const source: VwapPriceSource = options.source ?? "hlc3";
+
+  const cutoffExclusive = Math.min(visibleStartSec, simTimeSec);
+  const anchorStartSec = getSessionAnchorStartSec(
+    visibleStartSec,
+    sessionTz,
+    anchorAtRegularOpen,
+  );
+  if (cutoffExclusive <= anchorStartSec) return null;
+
+  const resolved1m = getReplaySeriesWithProvenance(symbol, "1m", simTimeSec - 1);
+  if (
+    (resolved1m.origin !== "real" && resolved1m.origin !== "aggregated") ||
+    resolved1m.candles.length === 0
+  ) {
+    return null;
   }
-  return { time: candle.time, open, high, low, close, volume };
+  const bars1m = resolved1m.candles;
+  // Require authentic 1m coverage from the session anchor so we never seed an incomplete session
+  if (bars1m[0]!.time > anchorStartSec) return null;
+
+  const targetBucket =
+    sessionTz === "america-new-york"
+      ? getNyTradingDayKey(visibleStartSec)
+      : Math.floor(visibleStartSec / 86400);
+
+  let cumVol = 0;
+  let mean = 0;
+  let sumSqWeightedDiff = 0;
+
+  for (const b of bars1m) {
+    if (b.time < anchorStartSec) continue;
+    // Strict zero-look-ahead: bar must be completely closed by `simTimeSec` AND strictly prior to `visibleStartSec`
+    if (b.time >= cutoffExclusive || b.time + 60 > simTimeSec) break;
+    const bBucket =
+      sessionTz === "america-new-york"
+        ? getNyTradingDayKey(b.time)
+        : Math.floor(b.time / 86400);
+    if (bBucket !== targetBucket) continue;
+    if (!(b.volume > 0)) continue;
+    const tp =
+      source === "close"
+        ? b.close
+        : source === "hl2"
+          ? (b.high + b.low) / 2
+          : source === "ohlc4"
+            ? (b.open + b.high + b.low + b.close) / 4
+            : (b.high + b.low + b.close) / 3;
+    if (!Number.isFinite(tp) || tp <= 0) continue;
+    const prevMean = mean;
+    cumVol += b.volume;
+    mean = prevMean + (b.volume / cumVol) * (tp - prevMean);
+    sumSqWeightedDiff += b.volume * (tp - prevMean) * (tp - mean);
+  }
+
+  if (!(cumVol > 0)) return null;
+  return {
+    anchorBucket: targetBucket,
+    cumVol,
+    mean,
+    sumSqWeightedDiff: Math.max(0, sumSqWeightedDiff),
+  };
 }
 
 /**
@@ -1100,6 +1337,20 @@ export function applyCryptoLiveBar(
   return updates;
 }
 
+function parseTargetDateBoundsUtcSec(targetDate: string): {
+  dayStartUtcSec: number;
+  dayEndNyUtcSec: number;
+} | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(targetDate.trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const d = Number(m[3]);
+  const dayStartUtcSec = Math.floor(Date.UTC(y, mo, d, 0, 0, 0) / 1000);
+  const dayEndNyUtcSec = Math.floor(Date.UTC(y, mo, d + 1, 4, 59, 59) / 1000);
+  return { dayStartUtcSec, dayEndNyUtcSec };
+}
+
 /**
  * Fetches historical OHLCV bars + stabilized EMA warmup history + NY VWAP seeds.
  * - US Equities & Forex route exclusively to Interactive Brokers (`/__api/ibkr-candles`).
@@ -1111,15 +1362,23 @@ export async function fetchHistoryAsync(
   limit?: number,
   range?: { from?: number; to?: number; fromMs?: number; toMs?: number; targetDate?: string },
 ): Promise<Candle[]> {
-  if (isTestEnv() || typeof fetch !== "function") {
-    return getHistory(symbol, timeframe, limit, range);
-  }
-
   const upperSym = symbol.trim().toUpperCase();
   const targetDate =
     typeof range?.targetDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(range.targetDate.trim())
       ? range.targetDate.trim()
       : undefined;
+
+  const hasMockedFetch =
+    typeof fetch === "function" &&
+    typeof (fetch as unknown as { mock?: unknown }).mock === "object";
+  if ((isTestEnv() && !hasMockedFetch) || typeof fetch !== "function") {
+    if (targetDate) {
+      const bounds = parseTargetDateBoundsUtcSec(targetDate);
+      return bounds ? getReplayHistory(symbol, timeframe, bounds.dayEndNyUtcSec) : [];
+    }
+    return getHistory(symbol, timeframe, limit, range);
+  }
+
   const key = targetDate ? `${upperSym}_${timeframe}_hist_${targetDate}` : `${upperSym}_${timeframe}`;
   const toMs = range?.toMs ?? range?.to;
   if (toMs && !targetDate) {
@@ -1128,8 +1387,9 @@ export async function fetchHistoryAsync(
 
   const now = Date.now();
   const lastAt = lastFetchAt.get(key) ?? 0;
-  if (targetDate && now - lastAt < 300_000 && series.has(key)) {
-    return [...(series.get(key) ?? [])];
+  if (targetDate && now - lastAt < 300_000 && historicalTargetSeries.has(key)) {
+    const cachedHist = historicalTargetSeries.get(key) ?? [];
+    if (cachedHist.length > 0) return [...cachedHist];
   }
   if (!targetDate && now - lastAt < 4_500 && realStockSeriesKeys.has(key)) {
     return getHistory(upperSym, timeframe, limit, range);
@@ -1162,9 +1422,11 @@ export async function fetchHistoryAsync(
     try {
       const res = await fetch(endpoint);
       if (!res.ok) {
-        return getHistory(upperSym, timeframe, limit, range);
+        // Never substitute live/current candles when a historical targetDate download fails
+        return targetDate ? [] : getHistory(upperSym, timeframe, limit, range);
       }
       const payload = (await res.json()) as {
+        symbol?: string | null;
         candles?: Candle[];
         regularMarketPrice?: number | null;
         preMarketRanges?: SessionRange[];
@@ -1177,6 +1439,14 @@ export async function fetchHistoryAsync(
         };
         dataSource?: string | null;
       };
+
+      if (
+        typeof payload.symbol === "string" &&
+        payload.symbol.trim().length > 0 &&
+        payload.symbol.trim().toUpperCase() !== upperSym
+      ) {
+        return targetDate ? [] : getHistory(upperSym, timeframe, limit, range);
+      }
 
       const sanitizeRanges = (raw: unknown): SessionRange[] =>
         Array.isArray(raw)
@@ -1196,8 +1466,9 @@ export async function fetchHistoryAsync(
           extended: payload.vwapSeeds.extended ?? null,
           regular: payload.vwapSeeds.regular ?? null,
         };
-        stockVwapSeeds.set(targetDate ? `${upperSym}_${timeframe}` : key, seedEntry);
-        if (seedEntry.extended || seedEntry.regular) {
+        // Isolate historical targetDate VWAP seeds from live trading VWAP seeds
+        stockVwapSeeds.set(key, seedEntry);
+        if (!targetDate && (seedEntry.extended || seedEntry.regular)) {
           stockVwapSeeds.set(upperSym, seedEntry);
         }
       }
@@ -1209,7 +1480,7 @@ export async function fetchHistoryAsync(
         if (prevSrc !== nextSrc) notifyStockDataSourceChanged();
       }
 
-      stockSessionMeta.set(targetDate ? `${upperSym}_${timeframe}` : key, {
+      const incomingMeta: StockSessionMetadata = {
         pre: sanitizeRanges(payload.preMarketRanges),
         regular: sanitizeRanges(payload.regularMarketRanges),
         post: sanitizeRanges(payload.postMarketRanges),
@@ -1217,56 +1488,91 @@ export async function fetchHistoryAsync(
           typeof payload.exchangeTimezoneName === "string"
             ? payload.exchangeTimezoneName
             : "America/New_York",
-      });
+      };
+      stockSessionMeta.set(key, incomingMeta);
+      const baseMetaKey = `${upperSym}_${timeframe}`;
+      if (targetDate) {
+        const prevMeta = stockSessionMeta.get(baseMetaKey);
+        if (!prevMeta) {
+          stockSessionMeta.set(baseMetaKey, incomingMeta);
+        } else {
+          const mergeRangeLists = (a: SessionRange[], b: SessionRange[]): SessionRange[] => {
+            const byStart = new Map<number, SessionRange>();
+            for (const r of a) byStart.set(r.start, r);
+            for (const r of b) {
+              const cur = byStart.get(r.start);
+              byStart.set(r.start, cur ? { start: r.start, end: Math.max(cur.end, r.end) } : r);
+            }
+            return Array.from(byStart.values()).sort((x, y) => x.start - y.start);
+          };
+          stockSessionMeta.set(baseMetaKey, {
+            pre: mergeRangeLists(prevMeta.pre, incomingMeta.pre),
+            regular: mergeRangeLists(prevMeta.regular ?? [], incomingMeta.regular ?? []),
+            post: mergeRangeLists(prevMeta.post, incomingMeta.post),
+            timezone: incomingMeta.timezone ?? prevMeta.timezone,
+          });
+        }
+      }
 
       if (Array.isArray(payload.candles) && payload.candles.length > 0) {
-        const validBars = payload.candles
-          .filter(
-            (b) =>
-              b &&
-              Number.isFinite(b.time) &&
-              Number.isFinite(b.open) &&
-              Number.isFinite(b.high) &&
-              Number.isFinite(b.low) &&
-              Number.isFinite(b.close) &&
-              b.close > 0,
-          )
-          .map((b) => ({
-            time: Math.floor(b.time),
-            open: b.open,
-            high: Math.max(b.high, b.open, b.close),
-            low: Math.min(b.low, b.open, b.close),
-            close: b.close,
-            volume: typeof b.volume === "number" && Number.isFinite(b.volume) ? b.volume : 0,
-          }));
+        let validBars = normalizeSortedUniqueBars(payload.candles);
+        const tfSec = TF_SECONDS[timeframe] ?? parseTimeframeSeconds(timeframe);
 
-        if (validBars.length > 0) {
-          if (targetDate) {
-            series.set(key, validBars);
-            lastFetchAt.set(key, Date.now());
-            // Merge historical targetDate bars into the primary symbol/timeframe store so
-            // Bar Replay (1m, 3m, 5m) steps over 100% real IBKR candles & volume without synthetic fallback.
-            const baseKey = `${upperSym}_${timeframe}`;
-            const mergedMap = new Map<number, Candle>();
-            for (const b of validBars) mergedMap.set(b.time, b);
-            for (const b of series.get(baseKey) ?? []) mergedMap.set(b.time, b);
-            const mergedBars = Array.from(mergedMap.values()).sort((a, b) => a.time - b.time);
-            series.set(baseKey, mergedBars);
-            liveSeriesKeys.add(baseKey);
-            const wasBaseMissing = !realStockSeriesKeys.has(baseKey);
-            realStockSeriesKeys.add(baseKey);
-            notifyRealSeriesLoaded(upperSym, timeframe);
-            if (wasBaseMissing) {
-              lastFetchAt.set(baseKey, Date.now());
-            }
-            return [...validBars];
+        if (targetDate) {
+          const bounds = parseTargetDateBoundsUtcSec(targetDate);
+          if (!bounds) return [];
+          // Strip any stray bar past the requested targetDate session end so future dates can never leak in
+          validBars = validBars.filter((b) => b.time <= bounds.dayEndNyUtcSec);
+          const isStock =
+            (symMeta?.category ?? "").toUpperCase() === "STOCKS" || !isCrypto;
+          if (
+            validBars.length === 0 ||
+            !seriesCoversTargetTime(validBars, tfSec, bounds.dayEndNyUtcSec, isStock) &&
+              validBars[validBars.length - 1]!.time < bounds.dayStartUtcSec - 5 * 86_400
+          ) {
+            return [];
           }
 
+          historicalTargetSeries.set(key, validBars);
+          lastFetchAt.set(key, Date.now());
+
+          // Only merge into `baseKey` when `baseKey` is empty or contiguous with `validBars`
+          // (no multi-day gap that would distort EMA warmup or mix disjoint dates).
+          const baseKey = `${upperSym}_${timeframe}`;
+          const existingBase = series.get(baseKey);
+          const maxContiguousGap = Math.max(tfSec * 10, 5 * 86_400);
+          if (!existingBase || existingBase.length === 0) {
+            series.set(baseKey, [...validBars]);
+            syntheticSeriesKeys.delete(baseKey);
+            liveSeriesKeys.add(baseKey);
+            realStockSeriesKeys.add(baseKey);
+          } else if (realStockSeriesKeys.has(baseKey)) {
+            const histEnd = validBars[validBars.length - 1]!.time;
+            const histStart = validBars[0]!.time;
+            const baseStart = existingBase[0]!.time;
+            const baseEnd = existingBase[existingBase.length - 1]!.time;
+            const isContiguous =
+              histEnd + maxContiguousGap >= baseStart &&
+              baseEnd + maxContiguousGap >= histStart;
+            if (isContiguous) {
+              const mergedMap = new Map<number, Candle>();
+              for (const b of validBars) mergedMap.set(b.time, b);
+              for (const b of existingBase) mergedMap.set(b.time, b);
+              series.set(
+                baseKey,
+                Array.from(mergedMap.values()).sort((a, b) => a.time - b.time),
+              );
+            }
+          }
+          notifyRealSeriesLoaded(upperSym, timeframe);
+          return [...validBars];
+        }
+
+        if (validBars.length > 0) {
           const prevBars = realStockSeriesKeys.has(key) ? series.get(key) : undefined;
           if (prevBars && prevBars.length > 0) {
             const prevLast = prevBars[prevBars.length - 1]!;
             const nextLast = validBars[validBars.length - 1]!;
-            const tfSec = TF_SECONDS[timeframe] ?? 60;
             if (prevLast.time === nextLast.time) {
               nextLast.high = Math.max(nextLast.high, prevLast.high);
               nextLast.low = Math.min(nextLast.low, prevLast.low);
@@ -1282,6 +1588,7 @@ export async function fetchHistoryAsync(
 
           const wasMissing = !realStockSeriesKeys.has(key);
           series.set(key, validBars);
+          syntheticSeriesKeys.delete(key);
           liveSeriesKeys.add(key);
           realStockSeriesKeys.add(key);
           lastFetchAt.set(key, Date.now());
@@ -1292,7 +1599,6 @@ export async function fetchHistoryAsync(
           const latestBar = validBars[validBars.length - 1]!;
           const latestClose = latestBar.close;
           const prevTsMs = latestRealStockBarMs.get(upperSym) ?? 0;
-          const tfSec = TF_SECONDS[timeframe] ?? 60;
           const { isFresherBar, quoteTsMs } = evaluateStockBarQuoteFreshness(
             latestBar.time,
             timeframe,
@@ -1327,18 +1633,178 @@ export async function fetchHistoryAsync(
         }
       }
     } catch {
-      // Request aborted or gateway temporarily unavailable — preserve existing cached real series
+      // Request aborted or gateway temporarily unavailable — never return current live series for targetDate
+      if (targetDate) return [];
     } finally {
       inFlightFetches.delete(flightKey);
     }
     if (targetDate) {
-      return [...(series.get(key) ?? [])];
+      return [];
     }
     return getHistory(upperSym, timeframe, limit, range);
   })();
 
   inFlightFetches.set(flightKey, reqPromise);
   return reqPromise;
+}
+
+export interface EnsureReplayHistoryParams {
+  symbol: string;
+  primaryTimeframe: string;
+  additionalTimeframes?: ReadonlyArray<string>;
+  secondarySymbols?: ReadonlyArray<{ symbol: string; timeframe: string }>;
+  targetDate: string;
+  targetTimeSec: number;
+  anchorAtRegularOpen?: boolean;
+}
+
+export interface EnsureReplayHistoryResult {
+  ok: boolean;
+  error?: string;
+  warnings: string[];
+}
+
+/**
+ * Ensures all authentic historical series required for a Replay session are downloaded,
+ * validated for symbol & date coverage, and ready BEFORE playback begins:
+ * 1. Primary selected timeframe (`primaryTimeframe`).
+ * 2. Real `1m` candles whenever any active timeframe is intraday (`> 1m` and `< 1d`) so Session VWAP
+ *    and intrabar partial reconstruction use authentic 1-minute volume & prices.
+ * 3. Any additional active timeframes across `2x1` / `2x2` multi-chart panes.
+ */
+export async function ensureReplayHistoricalDataLoaded(
+  params: EnsureReplayHistoryParams,
+): Promise<EnsureReplayHistoryResult> {
+  const {
+    symbol,
+    primaryTimeframe,
+    additionalTimeframes = [],
+    secondarySymbols = [],
+    targetDate,
+    targetTimeSec,
+    anchorAtRegularOpen = false,
+  } = params;
+  const upperSym = symbol.trim().toUpperCase();
+  const symMeta = getDemoSymbol(upperSym);
+  const isStock =
+    (symMeta?.category ?? "").toUpperCase() === "STOCKS" || hasRealStockSeries(upperSym);
+  const isCrypto = isCryptoInstrument(upperSym);
+  const warnings: string[] = [];
+
+  const allSameSymbolTfs = new Set<string>([primaryTimeframe, ...additionalTimeframes]);
+  let needs1mForIntraday = false;
+  for (const tf of allSameSymbolTfs) {
+    const sec = TF_SECONDS[tf] ?? parseTimeframeSeconds(tf);
+    if (sec > 60 && sec < 86_400) {
+      needs1mForIntraday = true;
+    }
+  }
+  if ((isStock || isCrypto) && needs1mForIntraday) {
+    allSameSymbolTfs.add("1m");
+  }
+
+  const sessionTz: VwapSessionTimeZone = isStock ? "america-new-york" : "utc";
+  const sessionAnchorSec = getSessionAnchorStartSec(
+    targetTimeSec,
+    sessionTz,
+    anchorAtRegularOpen,
+  );
+
+  const needsFetchForTf = (sym: string, tf: string): boolean => {
+    const directCandidates = getDirectAuthenticCandidates(sym, tf);
+    const tfSec = TF_SECONDS[tf] ?? parseTimeframeSeconds(tf);
+    const symIsStock =
+      (getDemoSymbol(sym)?.category ?? "").toUpperCase() === "STOCKS" || hasRealStockSeries(sym);
+    for (const bars of directCandidates) {
+      if (!seriesCoversTargetTime(bars, tfSec, targetTimeSec, symIsStock)) continue;
+      if (tf === "1m" && tfSec < 86_400 && bars[0]!.time > sessionAnchorSec) {
+        continue; // 1m loaded so far starts after session open; fetch full targetDate history
+      }
+      return false;
+    }
+    return true;
+  };
+
+  const emaLines = getIndicatorSettings().ema?.lines ?? [];
+  const activePeriods = emaLines.filter((l) => l.enabled && l.period > 0).map((l) => l.period);
+  const minBars = computeRequiredWarmupBars(activePeriods);
+
+  const fetchTasks: Array<Promise<{ sym: string; tf: string; bars: Candle[] }>> = [];
+  for (const tf of allSameSymbolTfs) {
+    if (needsFetchForTf(upperSym, tf)) {
+      fetchTasks.push(
+        fetchHistoryAsync(upperSym, tf, minBars, { targetDate }).then((bars) => ({
+          sym: upperSym,
+          tf,
+          bars,
+        })),
+      );
+    }
+  }
+  for (const item of secondarySymbols) {
+    const cleanSecSym = item.symbol.trim().toUpperCase();
+    if (!cleanSecSym || cleanSecSym === upperSym) continue;
+    if (needsFetchForTf(cleanSecSym, item.timeframe)) {
+      fetchTasks.push(
+        fetchHistoryAsync(cleanSecSym, item.timeframe, minBars, { targetDate }).then((bars) => ({
+          sym: cleanSecSym,
+          tf: item.timeframe,
+          bars,
+        })),
+      );
+    }
+    const secTfSec = TF_SECONDS[item.timeframe] ?? parseTimeframeSeconds(item.timeframe);
+    if (secTfSec > 60 && secTfSec < 86_400 && needsFetchForTf(cleanSecSym, "1m")) {
+      fetchTasks.push(
+        fetchHistoryAsync(cleanSecSym, "1m", minBars, { targetDate }).then((bars) => ({
+          sym: cleanSecSym,
+          tf: "1m",
+          bars,
+        })),
+      );
+    }
+  }
+
+  if (fetchTasks.length > 0) {
+    await Promise.all(fetchTasks);
+  }
+
+  const primaryResolved = getReplaySeriesWithProvenance(upperSym, primaryTimeframe, targetTimeSec);
+  if (
+    (primaryResolved.origin !== "real" && primaryResolved.origin !== "aggregated") ||
+    primaryResolved.candles.length === 0
+  ) {
+    return {
+      ok: false,
+      error: `No hay datos históricos reales disponibles de ${upperSym} (${primaryTimeframe}) para ${targetDate}.`,
+      warnings,
+    };
+  }
+
+  if (needs1mForIntraday && (isStock || isCrypto)) {
+    const resolved1m = getReplaySeriesWithProvenance(upperSym, "1m", targetTimeSec);
+    if (resolved1m.origin !== "real" || resolved1m.candles.length === 0) {
+      warnings.push(
+        `No se pudieron cargar velas reales de 1m para ${upperSym} en ${targetDate}; el VWAP intradía y las velas parciales de 1m no disponen de resolución de 1 minuto.`,
+      );
+    } else if (resolved1m.candles[0]!.time > sessionAnchorSec) {
+      warnings.push(
+        `El histórico de 1m para ${upperSym} empieza después del inicio de sesión (${anchorAtRegularOpen ? "09:30 ET" : "04:00 ET"}); la sesión está incompleta para el VWAP.`,
+      );
+    }
+  }
+
+  for (const tf of additionalTimeframes) {
+    if (tf === primaryTimeframe) continue;
+    const secRes = getReplaySeriesWithProvenance(upperSym, tf, targetTimeSec);
+    if (secRes.origin !== "real" && secRes.origin !== "aggregated") {
+      warnings.push(
+        `El panel secundario (${tf}) no dispone de datos históricos reales para ${targetDate}.`,
+      );
+    }
+  }
+
+  return { ok: true, warnings };
 }
 
 /** Update the latest bar in memory when a live quote/tick arrives. */
