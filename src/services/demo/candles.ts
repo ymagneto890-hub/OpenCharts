@@ -1,5 +1,9 @@
 import type { Candle } from "../schemas.ts";
 import {
+  assessEmaWarmup,
+  assessVwapSessionCoverage,
+  computeMinEmaWarmupBars,
+  type EmaWarmupAssessment,
   getNyTradingDayKey,
   getSessionAnchorStartSec,
   type VwapPriceSource,
@@ -8,6 +12,7 @@ import {
 } from "../../lib/indicators.ts";
 import {
   aggregateCandles,
+  aggregateCandlesWithIntegrity,
   computeRequiredWarmupBars,
   getBucketStartSec,
   mergeLive1sBarIntoSeries,
@@ -859,13 +864,16 @@ export function getReplaySeriesWithProvenance(
     const finerCandidates = getDirectAuthenticCandidates(symbol, finerTf);
     for (const finerBars of finerCandidates) {
       if (seriesCoversTargetTime(finerBars, finerSec, targetTimeSec, isStock)) {
-        const aggregated = resampleCandles(finerBars, tfSec);
+        const res = aggregateCandlesWithIntegrity(finerBars, tfSec, {
+          sourceStepSec: finerSec,
+          requireCompleteBuckets: true,
+        });
         if (
-          aggregated.length > 0 &&
-          seriesCoversTargetTime(aggregated, tfSec, targetTimeSec, isStock)
+          res.candles.length > 0 &&
+          seriesCoversTargetTime(res.candles, tfSec, targetTimeSec, isStock)
         ) {
           return {
-            candles: aggregated,
+            candles: res.candles,
             origin: "aggregated",
             sourceTimeframe: finerTf,
           };
@@ -956,6 +964,92 @@ const PARTIAL_SUB_CANDIDATES = [
   "1s",
 ] as const;
 
+export function validateSubIntervalCoverage(
+  subCandles: ReadonlyArray<Candle>,
+  subSec: number,
+  candle: Candle,
+  tfSec: number,
+  rangeStart: number,
+  rangeEnd: number,
+  options?: { allowSparseProviderCoverage?: boolean },
+): boolean {
+  if (!Array.isArray(subCandles) || subCandles.length === 0 || !(subSec > 0)) return false;
+
+  const orderedSubs = normalizeSortedUniqueBars(subCandles);
+  if (orderedSubs.length === 0) return false;
+
+  const firstSubTime = orderedSubs[0]!.time;
+  const lastSubTime = orderedSubs[orderedSubs.length - 1]!.time;
+  if (firstSubTime > rangeStart) return false;
+
+  const parentEnd = candle.time + tfSec;
+  const parentSubs: Candle[] = [];
+  const windowSubs: Candle[] = [];
+  const windowSlots = new Set<number>();
+
+  for (const c of orderedSubs) {
+    if (c.time >= candle.time && c.time < parentEnd) {
+      parentSubs.push(c);
+    }
+    if (c.time >= rangeStart && c.time < rangeEnd) {
+      windowSubs.push(c);
+      if ((c.time - rangeStart) % subSec === 0) {
+        windowSlots.add(c.time);
+      }
+    }
+  }
+
+  const expectedWindowSlots = Math.max(1, Math.round((rangeEnd - rangeStart) / subSec));
+  const hasAllContiguousWindowSlots =
+    (rangeEnd - rangeStart) % subSec === 0 &&
+    windowSlots.size === expectedWindowSlots &&
+    lastSubTime + subSec >= rangeEnd;
+
+  if (hasAllContiguousWindowSlots) {
+    return true;
+  }
+
+  // If any intermediate slot inside `[rangeStart, rangeEnd)` is absent:
+  // Never assume absent minutes had zero volume unless provider coverage is verified OR
+  // the present sub-candles reconcile 100% of the parent candle's volume & OHLC extremes.
+  const surroundsWindow =
+    firstSubTime <= candle.time && lastSubTime + subSec >= rangeEnd;
+
+  if (parentSubs.length === 0) {
+    return (
+      candle.volume === 0 &&
+      (surroundsWindow || Boolean(options?.allowSparseProviderCoverage))
+    );
+  }
+
+  if (candle.volume > 0) {
+    let parentSubVol = 0;
+    let subHigh = -Infinity;
+    let subLow = Infinity;
+    for (const c of parentSubs) {
+      parentSubVol += c.volume;
+      if (c.high > subHigh) subHigh = c.high;
+      if (c.low < subLow) subLow = c.low;
+    }
+    const volTol = Math.max(1e-6, candle.volume * 1e-6);
+    const volMatches = Math.abs(parentSubVol - candle.volume) <= volTol;
+    const priceTol = Math.max(1e-5, Math.abs(candle.close) * 1e-6);
+    const ohlcMatches =
+      Math.abs(parentSubs[0]!.open - candle.open) <= priceTol &&
+      Math.abs(parentSubs[parentSubs.length - 1]!.close - candle.close) <= priceTol &&
+      Math.abs(subHigh - candle.high) <= priceTol &&
+      Math.abs(subLow - candle.low) <= priceTol;
+
+    if (volMatches && ohlcMatches && (surroundsWindow || lastSubTime + subSec >= candle.time + tfSec || lastSubTime >= candle.time)) {
+      return true;
+    }
+    return false;
+  }
+
+  // `candle.volume === 0`: only valid if sub-series spans across `[rangeStart, rangeEnd)` without missing boundary
+  return surroundsWindow || Boolean(options?.allowSparseProviderCoverage);
+}
+
 function doesSubSeriesCoverParentInterval(
   subCandles: ReadonlyArray<Candle>,
   subSec: number,
@@ -964,25 +1058,14 @@ function doesSubSeriesCoverParentInterval(
   rangeStart: number,
   rangeEnd: number,
 ): boolean {
-  if (subCandles.length === 0) return false;
-  if (subCandles[0]!.time > rangeStart) return false;
-  const lastSub = subCandles[subCandles.length - 1]!;
-  if (lastSub.time + subSec >= rangeEnd) return true;
-  // Also accept when `subCandles` starts at/before `candle.time` and already accounts for 100%
-  // of `candle.volume` (e.g. final minutes of session had 0 trades after `lastSub.time`).
-  if (subCandles[0]!.time <= candle.time && candle.volume > 0) {
-    let bucketVol = 0;
-    const parentEnd = candle.time + tfSec;
-    for (const c of subCandles) {
-      if (c.time < candle.time) continue;
-      if (c.time >= parentEnd) break;
-      bucketVol += c.volume;
-    }
-    if (Math.abs(bucketVol - candle.volume) <= Math.max(1e-6, candle.volume * 1e-6)) {
-      return true;
-    }
-  }
-  return false;
+  return validateSubIntervalCoverage(
+    subCandles,
+    subSec,
+    candle,
+    tfSec,
+    rangeStart,
+    rangeEnd,
+  );
 }
 
 export function resolvePartialCandleWindow(
@@ -1129,6 +1212,20 @@ export function computeCausalReplayVwapSeed(
       ? getNyTradingDayKey(visibleStartSec)
       : Math.floor(visibleStartSec / 86400);
 
+  // Per-day independent check: never rely on a prior day's bars to assume today's session started at `anchorStartSec`.
+  let earliestSameDayBarSec = Infinity;
+  for (const b of bars1m) {
+    const bBucket =
+      sessionTz === "america-new-york"
+        ? getNyTradingDayKey(b.time)
+        : Math.floor(b.time / 86400);
+    if (bBucket === targetBucket) {
+      earliestSameDayBarSec = b.time;
+      break;
+    }
+  }
+  if (earliestSameDayBarSec > anchorStartSec) return null;
+
   let cumVol = 0;
   let mean = 0;
   let sumSqWeightedDiff = 0;
@@ -1164,6 +1261,8 @@ export function computeCausalReplayVwapSeed(
     cumVol,
     mean,
     sumSqWeightedDiff: Math.max(0, sumSqWeightedDiff),
+    coveredUntilSec: cutoffExclusive,
+    source,
   };
 }
 
@@ -1656,21 +1755,22 @@ export interface EnsureReplayHistoryParams {
   targetDate: string;
   targetTimeSec: number;
   anchorAtRegularOpen?: boolean;
+  /** Active EMA periods to validate warm-up bar depth up to `targetTimeSec`. */
+  emaPeriods?: ReadonlyArray<number>;
 }
 
 export interface EnsureReplayHistoryResult {
   ok: boolean;
   error?: string;
   warnings: string[];
+  emaWarmup?: EmaWarmupAssessment;
+  vwap1mComplete?: boolean;
 }
 
 /**
  * Ensures all authentic historical series required for a Replay session are downloaded,
- * validated for symbol & date coverage, and ready BEFORE playback begins:
- * 1. Primary selected timeframe (`primaryTimeframe`).
- * 2. Real `1m` candles whenever any active timeframe is intraday (`> 1m` and `< 1d`) so Session VWAP
- *    and intrabar partial reconstruction use authentic 1-minute volume & prices.
- * 3. Any additional active timeframes across `2x1` / `2x2` multi-chart panes.
+ * validated for symbol, date coverage, 1m session-anchor coverage, and EMA warm-up depth
+ * BEFORE playback begins.
  */
 export async function ensureReplayHistoricalDataLoaded(
   params: EnsureReplayHistoryParams,
@@ -1683,6 +1783,7 @@ export async function ensureReplayHistoricalDataLoaded(
     targetDate,
     targetTimeSec,
     anchorAtRegularOpen = false,
+    emaPeriods,
   } = params;
   const upperSym = symbol.trim().toUpperCase();
   const symMeta = getDemoSymbol(upperSym);
@@ -1704,30 +1805,54 @@ export async function ensureReplayHistoricalDataLoaded(
   }
 
   const sessionTz: VwapSessionTimeZone = isStock ? "america-new-york" : "utc";
-  const sessionAnchorSec = getSessionAnchorStartSec(
-    targetTimeSec,
-    sessionTz,
-    anchorAtRegularOpen,
-  );
+  const targetDayBucket =
+    sessionTz === "america-new-york"
+      ? getNyTradingDayKey(targetTimeSec)
+      : Math.floor(targetTimeSec / 86400);
+
+  const configuredPeriods =
+    emaPeriods ??
+    (getIndicatorSettings().ema?.lines ?? [])
+      .filter((l) => l.enabled && l.period > 0)
+      .map((l) => l.period);
+  const minEmaWarmupBars =
+    configuredPeriods.length > 0
+      ? Math.max(...configuredPeriods.map((p) => computeMinEmaWarmupBars(p)))
+      : 0;
+  const minBars = Math.max(computeRequiredWarmupBars(configuredPeriods), minEmaWarmupBars);
 
   const needsFetchForTf = (sym: string, tf: string): boolean => {
+    const cleanSym = sym.trim().toUpperCase();
+    const histCacheKey = `${cleanSym}_${tf}_hist_${targetDate}`;
+    const alreadyFetchedTarget = historicalTargetSeries.has(histCacheKey);
     const directCandidates = getDirectAuthenticCandidates(sym, tf);
     const tfSec = TF_SECONDS[tf] ?? parseTimeframeSeconds(tf);
     const symIsStock =
       (getDemoSymbol(sym)?.category ?? "").toUpperCase() === "STOCKS" || hasRealStockSeries(sym);
     for (const bars of directCandidates) {
       if (!seriesCoversTargetTime(bars, tfSec, targetTimeSec, symIsStock)) continue;
-      if (tf === "1m" && tfSec < 86_400 && bars[0]!.time > sessionAnchorSec) {
-        continue; // 1m loaded so far starts after session open; fetch full targetDate history
+      if (tf === "1m" && tfSec < 86_400) {
+        const upToTarget = bars.filter((b) => b.time <= targetTimeSec);
+        const cov = assessVwapSessionCoverage(upToTarget, {
+          anchor: "session",
+          sessionTimeZone: symIsStock ? "america-new-york" : "utc",
+          anchorAtRegularOpen,
+        });
+        const targetDayOk = cov.days?.[targetDayBucket]?.isComplete ?? cov.isComplete;
+        if (!targetDayOk && !alreadyFetchedTarget) {
+          continue;
+        }
+      }
+      if (minEmaWarmupBars > 0 && !alreadyFetchedTarget) {
+        const barsUpToTarget = findBarIndexAtOrBefore(bars, targetTimeSec) + 1;
+        if (barsUpToTarget < minEmaWarmupBars) {
+          continue; // Insufficient prior warmup bars cached -> try fetching deeper targetDate history
+        }
       }
       return false;
     }
     return true;
   };
-
-  const emaLines = getIndicatorSettings().ema?.lines ?? [];
-  const activePeriods = emaLines.filter((l) => l.enabled && l.period > 0).map((l) => l.period);
-  const minBars = computeRequiredWarmupBars(activePeriods);
 
   const fetchTasks: Array<Promise<{ sym: string; tf: string; bars: Candle[] }>> = [];
   for (const tf of allSameSymbolTfs) {
@@ -1778,19 +1903,42 @@ export async function ensureReplayHistoricalDataLoaded(
       ok: false,
       error: `No hay datos históricos reales disponibles de ${upperSym} (${primaryTimeframe}) para ${targetDate}.`,
       warnings,
+      vwap1mComplete: false,
     };
   }
 
+  const primaryIdxAtTarget = findBarIndexAtOrBefore(primaryResolved.candles, targetTimeSec);
+  const barsAvailableForWarmup = primaryIdxAtTarget >= 0 ? primaryIdxAtTarget + 1 : 0;
+  const emaWarmup = assessEmaWarmup(barsAvailableForWarmup, configuredPeriods);
+  if (!emaWarmup.isSufficient) {
+    const firstInsuff = emaWarmup.insufficientPeriods[0]!;
+    warnings.push(
+      `Histórico insuficiente para calentamiento completo de EMA ${firstInsuff.period} (${firstInsuff.availableBars}/${firstInsuff.requiredMinBars} velas previas).`,
+    );
+  }
+
+  let vwap1mComplete = true;
   if (needs1mForIntraday && (isStock || isCrypto)) {
     const resolved1m = getReplaySeriesWithProvenance(upperSym, "1m", targetTimeSec);
     if (resolved1m.origin !== "real" || resolved1m.candles.length === 0) {
+      vwap1mComplete = false;
       warnings.push(
-        `No se pudieron cargar velas reales de 1m para ${upperSym} en ${targetDate}; el VWAP intradía y las velas parciales de 1m no disponen de resolución de 1 minuto.`,
+        `No se pudieron cargar velas reales de 1m para ${upperSym} en ${targetDate}; el VWAP intradía requiere histórico real de 1 minuto.`,
       );
-    } else if (resolved1m.candles[0]!.time > sessionAnchorSec) {
-      warnings.push(
-        `El histórico de 1m para ${upperSym} empieza después del inicio de sesión (${anchorAtRegularOpen ? "09:30 ET" : "04:00 ET"}); la sesión está incompleta para el VWAP.`,
-      );
+    } else {
+      const bars1mUpToTarget = resolved1m.candles.filter((b) => b.time <= targetTimeSec);
+      const cov1m = assessVwapSessionCoverage(bars1mUpToTarget, {
+        anchor: "session",
+        sessionTimeZone: sessionTz,
+        anchorAtRegularOpen,
+      });
+      const dayComplete = cov1m.days?.[targetDayBucket]?.isComplete ?? cov1m.isComplete;
+      if (!dayComplete) {
+        vwap1mComplete = false;
+        warnings.push(
+          `El histórico de 1m para ${upperSym} en esta sesión empieza después del inicio (${anchorAtRegularOpen ? "09:30 ET" : "04:00 ET"}); la sesión está incompleta para el VWAP.`,
+        );
+      }
     }
   }
 
@@ -1804,7 +1952,7 @@ export async function ensureReplayHistoricalDataLoaded(
     }
   }
 
-  return { ok: true, warnings };
+  return { ok: true, warnings, emaWarmup, vwap1mComplete };
 }
 
 /** Update the latest bar in memory when a live quote/tick arrives. */

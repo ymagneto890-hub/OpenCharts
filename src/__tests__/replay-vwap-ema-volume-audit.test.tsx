@@ -5,18 +5,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { updateChartPreferences } from "../hooks/useChartPreferences.ts";
 import { filterExtendedHoursCandles } from "../lib/chart-plugins/extended-hours-primitive.ts";
 import {
+  assessEmaWarmup,
   assessVwapSessionCoverage,
   computeFineGrainedSessionVwap,
+  computeMinEmaWarmupBars,
+  computeReplayEmaWithWarmup,
   ema,
   getNyTradingDayKey,
   isVwapSessionCoverageComplete,
   type VwapPriceSource,
   vwapBands,
 } from "../lib/indicators.ts";
-import { aggregateCandles, computeRequiredWarmupBars } from "../lib/timeframes.ts";
+import {
+  aggregateCandles,
+  aggregateCandlesWithIntegrity,
+  computeRequiredWarmupBars,
+} from "../lib/timeframes.ts";
+import { resolveMainChartCandles } from "../pages/TradingPage.tsx";
 import { MultiChartPane } from "../pages/trading/MultiChartPane.tsx";
 import { ReplayHUD } from "../pages/trading/ReplayHUD.tsx";
-import { calculateVolumeMa } from "../pages/trading/utils.ts";
+import { calculateReplayVolumeMa, calculateVolumeMa } from "../pages/trading/utils.ts";
 import {
   computeVwapSessionSeedsFromBars,
   parseIbkrBarTimeSec,
@@ -33,7 +41,9 @@ import {
   getReplayHistory,
   getReplaySeriesWithProvenance,
   invalidateStockSeries,
+  resolvePartialCandleWindow,
   setRealStockSeries,
+  validateSubIntervalCoverage,
 } from "../services/demo/candles.ts";
 import * as engine from "../services/demo/engine.ts";
 import { registerDynamicSymbol } from "../services/demo/instruments.ts";
@@ -792,9 +802,8 @@ describe("Auditoría Exhaustiva de Replay, VWAP, EMA, Volumen e IBKR (Escenarios
         sessionTimeZone: "america-new-york",
       },
     );
-    // Because 09:30..09:33 are missing from `truncated1mAt0934`, it must NOT overwrite 5m VWAP (~11.09) with 14.47!
-    expect(notCoveredRes.vwap[0]!.value).toBeCloseTo((12 + 10 + 11) / 3, 6);
-    expect(notCoveredRes.vwap[1]!.value).toBeLessThan(12.0);
+    // Because 09:30..09:33 are missing from `truncated1mAt0934`, it must NEVER fall back silently to coarse 5m VWAP
+    expect(notCoveredRes.vwap).toEqual([]);
 
     // 3. Conversely, if `priorSessionSeed` supplies the [09:30..09:35) opening volume, coverage IS complete
     const full1mFrom0930: Candle[] = [
@@ -1334,5 +1343,337 @@ describe("Auditoría Exhaustiva de Replay, VWAP, EMA, Volumen e IBKR (Escenarios
     expect(pendingOrdersAfter).toHaveLength(1);
 
     invalidateStockSeries("PARTIALBLK");
+  });
+
+  it("K. VWAP estricto: histórico 1m inexistente, multi-día con sesión anterior completa y actual incompleta, semilla válida vs inválida y anclajes week/month intactos", () => {
+    const day1_0930 = Math.floor(Date.UTC(2026, 10, 23, 14, 30, 0) / 1000); // Mon 2026-11-23 09:30 ET
+    const day2_0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000); // Tue 2026-11-24 09:30 ET
+
+    const day1Bars1m: Candle[] = Array.from({ length: 30 }, (_, i) => ({
+      time: day1_0930 + i * 60,
+      open: 10 + i * 0.05,
+      high: 10.2 + i * 0.05,
+      low: 9.9 + i * 0.05,
+      close: 10.1 + i * 0.05,
+      volume: 10_000 + i * 100,
+    }));
+    // Day 2 starts late at 09:45 ET (missing 09:30..09:44!)
+    const day2LateBars1m: Candle[] = Array.from({ length: 15 }, (_, i) => ({
+      time: day2_0930 + (15 + i) * 60,
+      open: 22 + i * 0.1,
+      high: 22.3 + i * 0.1,
+      low: 21.8 + i * 0.1,
+      close: 22.2 + i * 0.1,
+      volume: 15_000,
+    }));
+
+    const multiDay1m = [...day1Bars1m, ...day2LateBars1m];
+    const day1Bars5m = aggregateCandles(day1Bars1m, 300) as Candle[];
+    const day2LateBars5m = aggregateCandles(day2LateBars1m, 300) as Candle[];
+    const multiDay5m = [...day1Bars5m, ...day2LateBars5m];
+    const multiDay15m = aggregateCandles(multiDay1m, 900) as Candle[];
+
+    // 1. Missing 1m on 3m/5m/15m/1h session VWAP -> NEVER falls back to coarse bars!
+    for (const tfSec of [180, 300, 900, 3600]) {
+      const no1m = computeFineGrainedSessionVwap(multiDay5m, null, tfSec, {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        source: "hlc3",
+      });
+      expect(no1m.vwap).toEqual([]);
+      expect(
+        computeFineGrainedSessionVwap(multiDay5m, [], tfSec, {
+          anchor: "session",
+          sessionTimeZone: "america-new-york",
+          source: "hlc3",
+        }).vwap,
+      ).toEqual([]);
+    }
+
+    // 2. Weekly / Monthly / Yearly anchors MUST continue working normally
+    const weeklyVwap = computeFineGrainedSessionVwap(multiDay5m, null, 300, {
+      anchor: "week",
+      sessionTimeZone: "america-new-york",
+    });
+    expect(weeklyVwap.vwap.length).toBe(multiDay5m.length);
+    const monthlyVwap = computeFineGrainedSessionVwap(multiDay15m, null, 900, {
+      anchor: "month",
+      sessionTimeZone: "america-new-york",
+    });
+    expect(monthlyVwap.vwap.length).toBe(multiDay15m.length);
+
+    // 3. Multi-day check: Day 1 (09:30 ET) IS complete, Day 2 (09:45 ET) is INCOMPLETE.
+    // Day 1 MUST NOT prove Day 2 is covered!
+    const cov = assessVwapSessionCoverage(multiDay1m, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+    });
+    const d1Key = getNyTradingDayKey(day1_0930);
+    const d2Key = getNyTradingDayKey(day2_0930);
+    expect(cov.days?.[d1Key]?.isComplete).toBe(true);
+    expect(cov.days?.[d2Key]?.isComplete).toBe(false);
+    expect(cov.isComplete).toBe(false);
+
+    const fineMixed = computeFineGrainedSessionVwap(multiDay5m, multiDay1m, 300, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+    });
+    // Day 1 emits exact 6 bars, Day 2 (incomplete) emits 0 bars!
+    expect(fineMixed.vwap.every((pt) => getNyTradingDayKey(pt.time) === d1Key)).toBe(true);
+    expect(fineMixed.vwap).toHaveLength(6);
+
+    // 4. Valid vs Invalid priorSessionSeed checks
+    const fullDay2_0930To1000: Candle[] = [
+      ...Array.from({ length: 15 }, (_, i) => ({
+        time: day2_0930 + i * 60,
+        open: 20 + i * 0.05,
+        high: 20.2 + i * 0.05,
+        low: 19.8 + i * 0.05,
+        close: 20.1 + i * 0.05,
+        volume: 12_000,
+      })),
+      ...day2LateBars1m,
+    ];
+    const validSeed = computeVwapSessionSeedsFromBars(
+      fullDay2_0930To1000,
+      day2_0930 + 15 * 60,
+      "hlc3",
+    ).regular!;
+    expect(validSeed).not.toBeNull();
+    const seededFull = computeFineGrainedSessionVwap(day2LateBars5m, day2LateBars1m, 300, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      source: "hlc3",
+      priorSessionSeed: { ...validSeed, source: "hlc3", coveredUntilSec: day2_0930 + 15 * 60 },
+    });
+    const unwindowedFull = vwapBands(fullDay2_0930To1000, {
+      anchor: "session",
+      sessionTimeZone: "america-new-york",
+      anchorAtRegularOpen: true,
+      source: "hlc3",
+    });
+    expect(seededFull.vwap.at(-1)!.value).toBeCloseTo(unwindowedFull.vwap.at(-1)!.value, 8);
+
+    // Invalid seeds MUST be rejected (mismatching source, future coveredUntilSec, wrong bucket, cumVol<=0)
+    for (const badSeed of [
+      { ...validSeed, cumVol: 0 },
+      { ...validSeed, anchorBucket: d1Key },
+      { ...validSeed, source: "close" as const },
+      { ...validSeed, coveredUntilSec: day2_0930 + 20 * 60 },
+    ]) {
+      const resBad = computeFineGrainedSessionVwap(day2LateBars5m, day2LateBars1m, 300, {
+        anchor: "session",
+        sessionTimeZone: "america-new-york",
+        anchorAtRegularOpen: true,
+        source: "hlc3",
+        priorSessionSeed: badSeed,
+      });
+      expect(resBad.vwap).toEqual([]);
+    }
+  });
+
+  it("L. Volumen e integridad de subintervalos: detecta huecos intermedios, deduplica/ordena, diferencia periodos sin operaciones y excluye volumen parcial en Volume MA20", () => {
+    registerDynamicSymbol({
+      name: "VOLCOV",
+      displayName: "Volume Coverage Corp",
+      category: "STOCKS",
+      initialPrice: 12.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    const t0930 = Math.floor(Date.UTC(2026, 10, 24, 14, 30, 0) / 1000);
+    const parent5m: Candle = {
+      time: t0930,
+      open: 12.0,
+      high: 13.5,
+      low: 11.8,
+      close: 12.9,
+      volume: 50_000,
+    };
+
+    // 1. Sub-candles have 09:30 and 09:34, missing 09:31..09:33 AND missing 30,000 volume!
+    // Must NEVER be accepted just because first & last bar span [09:30, 09:35)!
+    const gappedWithDuplicate: Candle[] = [
+      { time: t0930 + 4 * 60, open: 12.4, high: 12.95, low: 12.3, close: 12.9, volume: 10_000 }, // out of order
+      { time: t0930, open: 12.0, high: 12.2, low: 11.8, close: 12.1, volume: 10_000 },
+      { time: t0930, open: 12.0, high: 12.2, low: 11.8, close: 12.1, volume: 10_000 }, // duplicate!
+    ];
+    expect(
+      validateSubIntervalCoverage(gappedWithDuplicate, 60, parent5m, 300, t0930, t0930 + 300),
+    ).toBe(false);
+
+    // aggregateCandlesWithIntegrity excludes incomplete bucket when requireCompleteBuckets=true
+    const aggCheck = aggregateCandlesWithIntegrity(gappedWithDuplicate, 300, {
+      sourceStepSec: 60,
+      requireCompleteBuckets: true,
+    });
+    expect(aggCheck.duplicateInputCount).toBe(1);
+    expect(aggCheck.outOfOrderInputCount).toBe(2);
+    expect(aggCheck.incompleteBucketTimes).toEqual([t0930]);
+    expect(aggCheck.candles).toEqual([]);
+
+    // In Replay partial window with missing 1m bars -> returns missing-data (NOT ok / NOT parent!)
+    setRealStockSeries("VOLCOV", "5m", [
+      parent5m,
+      { time: t0930 + 300, open: 12.9, high: 13.1, low: 12.7, close: 13.0, volume: 20_000 },
+    ]);
+    setRealStockSeries("VOLCOV", "1m", gappedWithDuplicate);
+    expect(resolvePartialCandleWindow("VOLCOV", parent5m, "5m", t0930, t0930 + 300)).toEqual({
+      status: "missing-data",
+    });
+    expect(buildPartialCandleRange("VOLCOV", parent5m, "5m", t0930, t0930 + 300)).toBeNull();
+
+    // 2. Provider omits quiet zero-trade minutes inside sparse session, where 100% of parent OHLCV is accounted for:
+    const sparseZeroTrade1m: Candle[] = [
+      { time: t0930, open: 12.0, high: 12.5, low: 11.8, close: 12.3, volume: 20_000 },
+      { time: t0930 + 4 * 60, open: 12.3, high: 13.5, low: 12.2, close: 12.9, volume: 30_000 },
+    ];
+    expect(
+      validateSubIntervalCoverage(sparseZeroTrade1m, 60, parent5m, 300, t0930, t0930 + 300),
+    ).toBe(true);
+
+    // 3. Volume MA20 excludes incomplete partial bar volume and recalculates cleanly on step/stepBack
+    const contBars1m: Candle[] = Array.from({ length: 130 }, (_, i) => ({
+      time: t0930 + i * 60,
+      open: 10,
+      high: 10.5,
+      low: 9.8,
+      close: 10.2,
+      volume: 1_000, // every 1m = 1,000 -> every full 5m = 5,000
+    }));
+    const fullBars5m = aggregateCandles(contBars1m, 300) as Candle[];
+    expect(fullBars5m[0]!.volume).toBe(5_000);
+    const fullBars15m = aggregateCandles(contBars1m, 900) as Candle[];
+    expect(fullBars15m[0]!.volume).toBe(15_000);
+
+    // Suppose we have 21 complete 5m bars (5,000 each) + 1 partial 5m bar at index 21 (2 minutes = 2,000 vol)
+    const simAtMidBar = t0930 + 21 * 300 + 120; // 2m into bar #21
+    const visWithPartial = [
+      ...fullBars5m.slice(0, 21),
+      { ...fullBars5m[21]!, volume: 2_000 },
+    ];
+    const maReplay = calculateReplayVolumeMa(
+      visWithPartial.map((c) => ({ time: c.time as Time, value: c.volume })),
+      300,
+      simAtMidBar,
+      20,
+    );
+    // Only bars 0..20 (21 complete bars of 5,000) are included -> 2 MA points, both strictly 5,000 (NOT dragged down to 4,850 by incomplete 2,000!)
+    expect(maReplay).toHaveLength(2);
+    expect(maReplay.at(-1)!.value).toBe(5_000);
+
+    invalidateStockSeries("VOLCOV");
+  });
+
+  it("M. EMA calentamiento, cambios 1m->5m->15m->1h->4h con retroceso y bloqueo sin fallback en TradingPage.resolveMainChartCandles", async () => {
+    registerDynamicSymbol({
+      name: "WARMUPCHK",
+      displayName: "Warmup & Replay Integrity",
+      category: "STOCKS",
+      initialPrice: 20.0,
+      tickSize: 0.01,
+      exchange: "NASDAQ",
+    });
+
+    // 1. TradingPage resolveMainChartCandles MUST NEVER return live candles when Replay phase === "active", even if replayVisible is null/empty
+    const liveToday: Candle[] = [
+      { time: 1_800_000_000, open: 999, high: 999, low: 999, close: 999, volume: 123_456 },
+    ];
+    expect(
+      resolveMainChartCandles({
+        phase: "active",
+        replayVisible: null,
+        replayTimeframe: "5m",
+        replaySimTimeSec: 0,
+        selectedSymbol: "WARMUPCHK",
+        timeframe: "5m",
+        liveCandles: liveToday,
+      }),
+    ).toEqual([]);
+    expect(
+      resolveMainChartCandles({
+        phase: "active",
+        replayVisible: [],
+        replayTimeframe: "5m",
+        replaySimTimeSec: 1_795_000_000,
+        selectedSymbol: "WARMUPCHK",
+        timeframe: "5m",
+        liveCandles: liveToday,
+      }),
+    ).toEqual([]);
+
+    // 2. EMA warm-up validation: 10 bars is insufficient for EMA(20) (`min = 60`), returns points=[] with isWarmedUp=false
+    const t0400 = Math.floor(Date.UTC(2026, 10, 24, 9, 0, 0) / 1000);
+    const short1m: Candle[] = Array.from({ length: 10 }, (_, i) => ({
+      time: t0400 + i * 60,
+      open: 20,
+      high: 20.2,
+      low: 19.8,
+      close: 20 + i * 0.1,
+      volume: 1_000,
+    }));
+    const replayShortEma = computeReplayEmaWithWarmup(short1m, 20);
+    expect(replayShortEma.isWarmedUp).toBe(false);
+    expect(replayShortEma.points).toEqual([]);
+    expect(assessEmaWarmup(10, [8, 20]).isSufficient).toBe(false);
+    expect(computeMinEmaWarmupBars(20)).toBe(60);
+
+    // Even if 1 bar exists in cache on targetDate, ensureReplayHistoricalDataLoaded forces fetch for deeper EMA warm-up
+    const deep1m: Candle[] = Array.from({ length: 280 }, (_, i) => ({
+      time: t0400 + i * 60,
+      open: 20 + i * 0.01,
+      high: 20.2 + i * 0.01,
+      low: 19.9 + i * 0.01,
+      close: 20.05 + i * 0.01,
+      volume: 2_000 + i * 5,
+    }));
+    const deep1mEarlyOnly = deep1m.slice(-10); // insufficient warmup initially cached!
+    setRealStockSeries("WARMUPCHK", "1m", deep1mEarlyOnly);
+
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ symbol: "WARMUPCHK", candles: deep1m }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const targetTime = deep1m.at(-20)!.time;
+    const ensureRes = await ensureReplayHistoricalDataLoaded({
+      symbol: "WARMUPCHK",
+      primaryTimeframe: "1m",
+      targetDate: "2026-11-24",
+      targetTimeSec: targetTime,
+      emaPeriods: [8, 50],
+    });
+    expect(fetchMock).toHaveBeenCalled();
+    expect(ensureRes.ok).toBe(true);
+    expect(ensureRes.emaWarmup?.isSufficient).toBe(true);
+
+    // 3. Test mid-candle switch 15m -> 4h (2026-11-24 09:00 UTC + 16*15m = 13:00 UTC -> mid 4h candle [12:00..16:00)) and stepBack()
+    const bars1h = aggregateCandles(deep1m, 3600) as Candle[];
+    const bars4h = aggregateCandles(deep1m, 14_400) as Candle[];
+    setRealStockSeries("WARMUPCHK", "1h", bars1h);
+    setRealStockSeries("WARMUPCHK", "4h", bars4h);
+
+    const t1200Utc = Math.floor(Date.UTC(2026, 10, 24, 12, 0, 0) / 1000);
+    const barAt1215 = deep1m.find((b) => b.time === t1200Utc + 15 * 60)!;
+    expect(barAt1215).toBeDefined();
+
+    // Start at 12:15 UTC on 1m -> simTimeSec = 12:16 UTC
+    expect(useReplayStore.getState().start("WARMUPCHK", "1m", barAt1215.time).ok).toBe(true);
+    const simBeforeSwitch = useReplayStore.getState().simTimeSec;
+    expect(useReplayStore.getState().changeTimeframe("1h")).toBe(true);
+    expect(useReplayStore.getState().simTimeSec).toBe(simBeforeSwitch);
+    expect(useReplayStore.getState().visible!.at(-1)!.close).toBe(barAt1215.close);
+
+    // Rewind after switching to 1h -> moves cleanly to the closed 11:00..12:00 UTC candle (`simTimeSec = 12:00 UTC`)
+    useReplayStore.getState().stepBack();
+    expect(useReplayStore.getState().simTimeSec).toBe(t1200Utc);
+    expect(useReplayStore.getState().visible!.at(-1)!.time).toBe(t1200Utc - 3600);
+
+    useReplayStore.getState().stop();
+    invalidateStockSeries("WARMUPCHK");
   });
 });

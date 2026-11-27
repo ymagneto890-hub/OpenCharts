@@ -114,6 +114,7 @@ import { useIndicators } from "./useIndicators.ts";
 import { useNewsOverlay } from "./useNewsOverlay.ts";
 import { useSlTpDrag } from "./useSlTpDrag.ts";
 import {
+  calculateReplayVolumeMa,
   calculateVolumeMa,
   getCandleBucketTime,
   getMinMove,
@@ -1670,7 +1671,13 @@ export function ChartPanel({
     });
   }, []);
 
-  const { chartData, volumeData, volumeMaData } = useChartData(visibleCandles, colors);
+  const { chartData, volumeData, volumeMaData } = useChartData(
+    visibleCandles,
+    colors,
+    isReplaying,
+    parseTimeframeSeconds(timeframe),
+    replaySimTimeSec,
+  );
   const confirmedChartData = useMemo(() => {
     if (chartData.length === 0) return chartData;
     if (isReplaying) {
@@ -2120,6 +2127,7 @@ export function ChartPanel({
     chartRawCoverageStartSec,
     fine1mVwapBundle.rawCoverageStartSec,
     isUsStockForVwap,
+    isReplaying,
   );
 
   // ── Real-time live stream (IBKR for stocks, Crypto SSE for crypto/perps; persists across TF switches) ──
@@ -4105,7 +4113,13 @@ function dedupeByTime(sorted: CandleRow[]): CandleRow[] {
   return out;
 }
 
-function useChartData(candles: Candle[], colors: { volumeUp: string; volumeDown: string }) {
+function useChartData(
+  candles: Candle[],
+  colors: { volumeUp: string; volumeDown: string },
+  isReplaying = false,
+  tfSec = 60,
+  replaySimTimeSec = 0,
+) {
   return useMemo(() => {
     const sorted = candles
       .map(toCandleRow)
@@ -4131,8 +4145,11 @@ function useChartData(candles: Candle[], colors: { volumeUp: string; volumeDown:
       value: c.volume,
       color: c.close >= c.open ? colors.volumeUp : colors.volumeDown,
     }));
-    const volumeMaData: LineData<Time>[] = calculateVolumeMa(volumeData, 20);
+    const volumeMaData: LineData<Time>[] =
+      isReplaying && replaySimTimeSec > 0
+        ? calculateReplayVolumeMa(volumeData, tfSec, replaySimTimeSec, 20)
+        : calculateVolumeMa(volumeData, 20);
 
     return { chartData, volumeData, volumeMaData };
-  }, [candles, colors.volumeUp, colors.volumeDown]);
+  }, [candles, colors.volumeUp, colors.volumeDown, isReplaying, tfSec, replaySimTimeSec]);
 }

@@ -5,6 +5,7 @@ import {
   balancedDivergenceOptions,
   sma,
   ema,
+  computeReplayEmaWithWarmup,
   rsi,
   macd,
   MACD_BALANCED_DEFAULTS,
@@ -14,6 +15,8 @@ import {
   computeFineGrainedSessionVwap,
   detectDivergences,
   computeMarketStructure,
+  getNyTradingDayKey,
+  getVwapAnchorBucket,
   INDICATOR_REGISTRY,
   type CandleData,
   type IndicatorType,
@@ -30,6 +33,7 @@ import { OscillatorPanePrimitive } from "../../lib/chart-plugins/oscillator-pane
 import { MarketStructurePrimitive } from "../../lib/chart-plugins/market-structure-primitive.ts";
 import { VolumeProfilePrimitive } from "../../lib/chart-plugins/volume-profile-primitive.ts";
 import { parseTimeframeSeconds } from "../../lib/timeframes.ts";
+import { useReplayStore } from "../../services/demo/replay.ts";
 import { getMinMove, toIndicatorCandles, type ChartCandle } from "./utils.ts";
 import { CHART_COLORS, type Timeframe } from "./constants.ts";
 
@@ -77,6 +81,7 @@ export function useIndicators(
   vwapRawCoverageStartSec?: number,
   vwapFineRawCoverageStartSec?: number,
   vwapRequireCompleteSession = false,
+  isReplaying = false,
 ): void {
   const indicatorSeriesRef = useRef<Map<string, ISeriesApi<"Line"> | ISeriesApi<"Histogram">>>(
     new Map(),
@@ -164,6 +169,7 @@ export function useIndicators(
       vwapSessionTimeZone,
       suppressRightAutoscale ? "1" : "0",
       vwapAnchorAtRegularOpen ? "rth930" : "sess",
+      isReplaying ? "replay" : "live",
     ].join("|");
     const canReuseOverlaySeries =
       belowIndicators.length === 0 && structureKeyRef.current === nextStructureKey;
@@ -303,7 +309,9 @@ export function useIndicators(
             indicatorSettings.ema?.lines ?? DEFAULT_INDICATOR_SETTINGS.ema.lines
           ).filter((l) => l.enabled && l.period >= 1);
           for (const line of emaLines) {
-            const data = ema(indCandles, line.period);
+            const data = isReplaying
+              ? computeReplayEmaWithWarmup(indCandles, line.period).points
+              : ema(indCandles, line.period);
             upsertOverlayLine(
               `EMA:${line.id}:${line.period}`,
               {
@@ -612,10 +620,11 @@ export function useIndicators(
             vwapCfg.anchor === "auto"
               ? defaultVwapAnchorForTimeframe(timeframe)
               : vwapCfg.anchor;
+          const tfSec = parseTimeframeSeconds(timeframe);
           const data = computeFineGrainedSessionVwap(
             indCandles,
             fine1mVwapCandles,
-            parseTimeframeSeconds(timeframe),
+            tfSec,
             {
               anchor,
               multipliers: [
@@ -629,9 +638,31 @@ export function useIndicators(
               anchorAtRegularOpen: vwapAnchorAtRegularOpen,
               rawCoverageStartSec: vwapRawCoverageStartSec,
               fineRawCoverageStartSec: vwapFineRawCoverageStartSec,
-              requireCompleteSession: vwapRequireCompleteSession,
+              requireCompleteSession: vwapRequireCompleteSession || isReplaying,
             },
           );
+          if (isReplaying && anchor === "session" && tfSec > 60 && indCandles.length > 0) {
+            const lastCandle = indCandles[indCandles.length - 1]!;
+            const lastDay =
+              vwapSessionTimeZone === "america-new-york"
+                ? getNyTradingDayKey(lastCandle.time)
+                : getVwapAnchorBucket(lastCandle.time, "session", vwapSessionTimeZone);
+            const hasCurrentDayVwap = data.vwap.some((pt) => {
+              const ptDay =
+                vwapSessionTimeZone === "america-new-york"
+                  ? getNyTradingDayKey(pt.time)
+                  : getVwapAnchorBucket(pt.time, "session", vwapSessionTimeZone);
+              return ptDay === lastDay;
+            });
+            if (!hasCurrentDayVwap) {
+              const msg =
+                `VWAP oculto en ${timeframe}: falta histórico real completo de 1m para esta sesión (no se sustituye con velas de ${timeframe}).`;
+              const st = useReplayStore.getState();
+              if (!st.dataWarning) {
+                st.setDataWarning(msg);
+              }
+            }
+          }
           upsertOverlayLine(
             "VWAP",
             {
@@ -767,5 +798,9 @@ export function useIndicators(
     priorVwapSeed,
     vwapAnchorAtRegularOpen,
     fine1mVwapCandles,
+    vwapRawCoverageStartSec,
+    vwapFineRawCoverageStartSec,
+    vwapRequireCompleteSession,
+    isReplaying,
   ]);
 }

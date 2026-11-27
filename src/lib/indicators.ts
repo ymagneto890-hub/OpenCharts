@@ -162,6 +162,78 @@ export function emaStep(prevEma: number, close: number, period: number): number 
   return prevEma + k * (close - prevEma);
 }
 
+/** Minimum historical bars required for reliable Replay EMA warm-up without displaying un-converged EMAs as complete. */
+export function computeMinEmaWarmupBars(period: number): number {
+  const p = Math.floor(period);
+  if (!Number.isFinite(period) || p <= 0) return 1;
+  return Math.max(1, p * 3);
+}
+
+/** Checks whether `availableBars` provides reliable warm-up for every enabled EMA period. */
+export function assessEmaWarmup(
+  availableBars: number,
+  activePeriods: ReadonlyArray<number>,
+): EmaWarmupAssessment {
+  const safeAvailable = Number.isFinite(availableBars) && availableBars > 0 ? Math.floor(availableBars) : 0;
+  const uniquePeriods = Array.from(
+    new Set(activePeriods.map((p) => Math.floor(p)).filter((p) => Number.isFinite(p) && p > 0)),
+  );
+  if (uniquePeriods.length === 0) {
+    return { isSufficient: true, minRequiredBars: 0, insufficientPeriods: [] };
+  }
+  let minRequiredBars = 0;
+  const insufficientPeriods: EmaPeriodWarmupStatus[] = [];
+  for (const period of uniquePeriods) {
+    const requiredMinBars = computeMinEmaWarmupBars(period);
+    if (requiredMinBars > minRequiredBars) minRequiredBars = requiredMinBars;
+    if (safeAvailable < requiredMinBars) {
+      insufficientPeriods.push({
+        period,
+        availableBars: safeAvailable,
+        requiredMinBars,
+        isSufficient: false,
+      });
+    }
+  }
+  return {
+    isSufficient: insufficientPeriods.length === 0,
+    minRequiredBars,
+    insufficientPeriods,
+  };
+}
+
+/**
+ * Computes Replay EMA while enforcing minimum warm-up convergence (`period * 3` bars).
+ * When insufficient historical warm-up exists, returns empty `points` with `isWarmedUp: false`.
+ */
+export function computeReplayEmaWithWarmup(
+  rawCandles: CandleData[],
+  period: number,
+): {
+  points: IndicatorPoint[];
+  isWarmedUp: boolean;
+  availableBars: number;
+  requiredBars: number;
+} {
+  const candles = normalizeCandles(rawCandles);
+  const requiredBars = computeMinEmaWarmupBars(period);
+  const availableBars = candles.length;
+  if (availableBars < requiredBars) {
+    return {
+      points: [],
+      isWarmedUp: false,
+      availableBars,
+      requiredBars,
+    };
+  }
+  return {
+    points: ema(candles, period),
+    isWarmedUp: true,
+    availableBars,
+    requiredBars,
+  };
+}
+
 export function ema(rawCandles: CandleData[], period: number): IndicatorPoint[] {
   const p = Math.floor(period);
   if (!Number.isFinite(period) || p <= 0) return [];
@@ -1329,6 +1401,15 @@ export interface VwapSessionSeed {
   cumVol: number;
   mean: number;
   sumSqWeightedDiff: number;
+  /** Exclusive timestamp (seconds) up to which this seed accumulated bars (must be <= first visible bar). */
+  coveredUntilSec?: number;
+  /** Price source used to build the seed; must match `VwapBandsOptions.source` when specified. */
+  source?: VwapPriceSource;
+}
+
+export interface VwapDayCoverageWindow {
+  startSec: number;
+  endSec?: number;
 }
 
 export interface VwapBandsOptions {
@@ -1340,18 +1421,30 @@ export interface VwapBandsOptions {
   /** When true on NY sessions, anchors VWAP strictly at 09:30 ET (excluding pre-market bars from VWAP math). */
   anchorAtRegularOpen?: boolean;
   /**
-   * Earliest unix timestamp (seconds) covered by the underlying historical dataset before UI session filtering.
-   * Used to distinguish genuine zero-trade opening minutes from truncated history that begins mid-session.
+   * Earliest unix timestamp (seconds) covered by the underlying historical dataset for its session day
+   * before UI session filtering. Never applies to subsequent session days.
    */
   rawCoverageStartSec?: number;
-  /** Earliest unix timestamp (seconds) covered by `fine1mCandles` before UI session filtering. */
+  /** Earliest unix timestamp (seconds) covered by `fine1mCandles` for its session day before UI filtering. */
   fineRawCoverageStartSec?: number;
+  /** Per-day verified coverage intervals (`dayKey -> { startSec, endSec }`) evaluated independently per session. */
+  sessionCoverageByDay?:
+    | ReadonlyMap<number, VwapDayCoverageWindow>
+    | Record<number, VwapDayCoverageWindow>;
   /**
-   * When true, omits any initial truncated session whose historical coverage starts strictly after
-   * the session anchor (`09:30 ET` for regular, `04:00 ET` for NY extended, `00:00 UTC` for UTC)
-   * unless `priorSessionSeed` supplies the missing pre-window volume.
+   * When true, omits any session whose historical coverage starts strictly after the session anchor
+   * (`09:30 ET` for regular, `04:00 ET` for NY extended, `00:00 UTC` for UTC) unless a valid
+   * `priorSessionSeed` supplies the missing pre-window volume for that specific session day.
    */
   requireCompleteSession?: boolean;
+}
+
+export interface VwapDayCoverageStatus {
+  isComplete: boolean;
+  sessionAnchorSec: number;
+  earliestBarSec: number;
+  coverageStartSec: number;
+  seeded: boolean;
 }
 
 export interface VwapSessionCoverageAssessment {
@@ -1361,6 +1454,20 @@ export interface VwapSessionCoverageAssessment {
   earliestBarSec: number | null;
   coverageStartSec: number | null;
   seeded: boolean;
+  days?: Record<number, VwapDayCoverageStatus>;
+}
+
+export interface EmaPeriodWarmupStatus {
+  period: number;
+  availableBars: number;
+  requiredMinBars: number;
+  isSufficient: boolean;
+}
+
+export interface EmaWarmupAssessment {
+  isSufficient: boolean;
+  minRequiredBars: number;
+  insufficientPeriods: EmaPeriodWarmupStatus[];
 }
 
 export interface VwapBandsResult {
@@ -1577,10 +1684,70 @@ export function getSessionAnchorStartSec(
   return Math.floor(sampleBarTimeSec / 86400) * 86400;
 }
 
+function lookupDayCoverage(
+  coverageByDay: VwapBandsOptions["sessionCoverageByDay"],
+  day: number,
+): VwapDayCoverageWindow | null {
+  if (!coverageByDay) return null;
+  if (coverageByDay instanceof Map) {
+    return coverageByDay.get(day) ?? null;
+  }
+  const record = coverageByDay as Record<number, VwapDayCoverageWindow>;
+  return record[day] ?? null;
+}
+
+export function isValidVwapSeedForDay(
+  priorSeed: VwapSessionSeed | null | undefined,
+  day: number,
+  firstDayBarSec: number,
+  source: VwapPriceSource,
+): priorSeed is VwapSessionSeed {
+  if (!priorSeed) return false;
+  if (priorSeed.anchorBucket !== day) return false;
+  if (!Number.isFinite(priorSeed.cumVol) || !(priorSeed.cumVol > 0)) return false;
+  if (!Number.isFinite(priorSeed.mean) || !(priorSeed.mean > 0)) return false;
+  if (!Number.isFinite(priorSeed.sumSqWeightedDiff) || priorSeed.sumSqWeightedDiff < 0) return false;
+  if (priorSeed.source && priorSeed.source !== source) return false;
+  if (priorSeed.coveredUntilSec !== undefined) {
+    if (!Number.isFinite(priorSeed.coveredUntilSec) || priorSeed.coveredUntilSec > firstDayBarSec) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resolveDayCoverageStartSec(
+  day: number,
+  firstEligibleDayBarSec: number,
+  sameDayRawEarliestSec: number | undefined,
+  rawCoverageStartSec: number | undefined,
+  sessionTimeZone: VwapSessionTimeZone,
+  coverageByDay: VwapBandsOptions["sessionCoverageByDay"],
+): number {
+  const explicitDayCov = lookupDayCoverage(coverageByDay, day);
+  if (explicitDayCov && Number.isFinite(explicitDayCov.startSec)) {
+    return Math.min(explicitDayCov.startSec, firstEligibleDayBarSec);
+  }
+  let startSec = firstEligibleDayBarSec;
+  if (typeof sameDayRawEarliestSec === "number" && Number.isFinite(sameDayRawEarliestSec)) {
+    startSec = Math.min(startSec, sameDayRawEarliestSec);
+  }
+  // Never let a prior day's `rawCoverageStartSec` mark a later session day as complete:
+  // only apply `rawCoverageStartSec` to the specific session day it belongs to.
+  if (typeof rawCoverageStartSec === "number" && Number.isFinite(rawCoverageStartSec)) {
+    const rawBucket = getVwapAnchorBucket(rawCoverageStartSec, "session", sessionTimeZone);
+    if (rawBucket === day) {
+      startSec = Math.min(startSec, rawCoverageStartSec);
+    }
+  }
+  return startSec;
+}
+
 /**
- * Evaluates whether `rawCandles` (plus optional `priorSessionSeed` and `rawCoverageStartSec`)
- * completely covers the latest session in `rawCandles` from its true session anchor
- * (`09:30 ET` for NY Regular Session, `04:00 ET` for NY Extended Session, `00:00 UTC` for UTC).
+ * Evaluates whether `rawCandles` (plus optional `priorSessionSeed` and per-day coverage)
+ * completely covers each session independently — and specifically the latest session —
+ * from its true session anchor (`09:30 ET` for NY Regular Session, `04:00 ET` for NY Extended,
+ * `00:00 UTC` for UTC). A complete earlier session never counts as proof for a later session.
  */
 export function assessVwapSessionCoverage(
   rawCandles: CandleData[],
@@ -1588,6 +1755,7 @@ export function assessVwapSessionCoverage(
 ): VwapSessionCoverageAssessment {
   const anchor: VwapAnchorPeriod = options.anchor ?? "session";
   const sessionTimeZone: VwapSessionTimeZone = options.sessionTimeZone ?? "utc";
+  const source: VwapPriceSource = options.source ?? "hlc3";
   const anchorAtRegularOpen =
     Boolean(options.anchorAtRegularOpen) &&
     anchor === "session" &&
@@ -1601,6 +1769,7 @@ export function assessVwapSessionCoverage(
       earliestBarSec: null,
       coverageStartSec: null,
       seeded: false,
+      days: {},
     };
   }
   if (anchor !== "session") {
@@ -1614,13 +1783,25 @@ export function assessVwapSessionCoverage(
     };
   }
 
-  const eligible = anchorAtRegularOpen
-    ? candles.filter((c) => {
-        const ny = getNySessionMinutes(c.time);
-        return ny.minutes >= 570 && ny.minutes < 960;
-      })
-    : candles;
-  if (eligible.length === 0) {
+  const sameDayRawEarliest = new Map<number, number>();
+  for (const c of candles) {
+    const d = getVwapAnchorBucket(c.time, "session", sessionTimeZone);
+    if (!sameDayRawEarliest.has(d)) sameDayRawEarliest.set(d, c.time);
+  }
+
+  const earliestEligibleByDay = new Map<number, number>();
+  for (const c of candles) {
+    if (anchorAtRegularOpen) {
+      const ny = getNySessionMinutes(c.time);
+      if (ny.minutes < 570 || ny.minutes >= 960) continue;
+      if (!earliestEligibleByDay.has(ny.dayKey)) earliestEligibleByDay.set(ny.dayKey, c.time);
+    } else {
+      const d = getVwapAnchorBucket(c.time, "session", sessionTimeZone);
+      if (!earliestEligibleByDay.has(d)) earliestEligibleByDay.set(d, c.time);
+    }
+  }
+
+  if (earliestEligibleByDay.size === 0) {
     return {
       isComplete: false,
       anchorBucket: null,
@@ -1628,39 +1809,50 @@ export function assessVwapSessionCoverage(
       earliestBarSec: null,
       coverageStartSec: null,
       seeded: false,
+      days: {},
     };
   }
 
-  const lastBar = eligible[eligible.length - 1]!;
-  const targetDay = getVwapAnchorBucket(lastBar.time, "session", sessionTimeZone);
-  const sessionAnchorSec = getSessionAnchorStartSec(
-    lastBar.time,
-    sessionTimeZone,
-    anchorAtRegularOpen,
-  );
-  let earliestDayBarSec = lastBar.time;
-  for (const c of eligible) {
-    if (getVwapAnchorBucket(c.time, "session", sessionTimeZone) === targetDay) {
-      earliestDayBarSec = c.time;
-      break;
-    }
+  const days: Record<number, VwapDayCoverageStatus> = {};
+  let firstDayInSeries = true;
+  let lastDay = -1;
+  for (const [day, earliestDayBarSec] of earliestEligibleByDay.entries()) {
+    const sessionAnchorSec = getSessionAnchorStartSec(
+      earliestDayBarSec,
+      sessionTimeZone,
+      anchorAtRegularOpen,
+    );
+    const dayCovStart = resolveDayCoverageStartSec(
+      day,
+      earliestDayBarSec,
+      sameDayRawEarliest.get(day),
+      options.rawCoverageStartSec,
+      sessionTimeZone,
+      options.sessionCoverageByDay,
+    );
+    const seeded =
+      firstDayInSeries &&
+      isValidVwapSeedForDay(options.priorSessionSeed, day, earliestDayBarSec, source);
+    days[day] = {
+      isComplete: seeded || dayCovStart <= sessionAnchorSec,
+      sessionAnchorSec,
+      earliestBarSec: earliestDayBarSec,
+      coverageStartSec: dayCovStart,
+      seeded,
+    };
+    firstDayInSeries = false;
+    lastDay = day;
   }
-  const coverageStartSec =
-    typeof options.rawCoverageStartSec === "number" && Number.isFinite(options.rawCoverageStartSec)
-      ? Math.min(options.rawCoverageStartSec, candles[0]!.time)
-      : candles[0]!.time;
-  const priorSeed = options.priorSessionSeed ?? null;
-  const seeded =
-    priorSeed != null && priorSeed.anchorBucket === targetDay && priorSeed.cumVol > 0;
-  const isComplete = seeded || coverageStartSec <= sessionAnchorSec;
 
+  const latestStatus = days[lastDay]!;
   return {
-    isComplete,
-    anchorBucket: targetDay,
-    sessionAnchorSec,
-    earliestBarSec: earliestDayBarSec,
-    coverageStartSec,
-    seeded,
+    isComplete: latestStatus.isComplete,
+    anchorBucket: lastDay,
+    sessionAnchorSec: latestStatus.sessionAnchorSec,
+    earliestBarSec: latestStatus.earliestBarSec,
+    coverageStartSec: latestStatus.coverageStartSec,
+    seeded: latestStatus.seeded,
+    days,
   };
 }
 
@@ -1693,13 +1885,14 @@ export function vwapBands(
   const enforceCompleteSession =
     anchor === "session" && (Boolean(options.requireCompleteSession) || anchorAtRegularOpen);
   const candles = normalizeCandles(rawCandles);
-  const coverageStartSec =
-    candles.length > 0
-      ? typeof options.rawCoverageStartSec === "number" &&
-        Number.isFinite(options.rawCoverageStartSec)
-        ? Math.min(options.rawCoverageStartSec, candles[0]!.time)
-        : candles[0]!.time
-      : Infinity;
+
+  const sameDayRawEarliest = new Map<number, number>();
+  if (enforceCompleteSession) {
+    for (const c of candles) {
+      const d = getVwapAnchorBucket(c.time, "session", sessionTimeZone);
+      if (!sameDayRawEarliest.has(d)) sameDayRawEarliest.set(d, c.time);
+    }
+  }
 
   const vwapLine: IndicatorPoint[] = [];
   const upper1: IndicatorPoint[] = [];
@@ -1729,14 +1922,11 @@ export function vwapBands(
     }
     if (anchor !== "none" && bucket !== lastBucket) {
       const hasMatchingSeed =
-        lastBucket === null &&
-        priorSeed != null &&
-        priorSeed.anchorBucket === bucket &&
-        priorSeed.cumVol > 0;
+        lastBucket === null && isValidVwapSeedForDay(priorSeed, bucket, c.time, source);
       if (hasMatchingSeed) {
-        cumVol = priorSeed.cumVol;
-        mean = priorSeed.mean;
-        sumSqWeightedDiff = Math.max(0, priorSeed.sumSqWeightedDiff);
+        cumVol = priorSeed!.cumVol;
+        mean = priorSeed!.mean;
+        sumSqWeightedDiff = Math.max(0, priorSeed!.sumSqWeightedDiff);
         bucketIncomplete = false;
       } else {
         cumVol = 0;
@@ -1748,7 +1938,15 @@ export function vwapBands(
             sessionTimeZone,
             anchorAtRegularOpen,
           );
-          bucketIncomplete = coverageStartSec > anchorSec;
+          const dayCovStart = resolveDayCoverageStartSec(
+            bucket,
+            c.time,
+            sameDayRawEarliest.get(bucket),
+            options.rawCoverageStartSec,
+            sessionTimeZone,
+            options.sessionCoverageByDay,
+          );
+          bucketIncomplete = dayCovStart > anchorSec;
         } else {
           bucketIncomplete = false;
         }
@@ -1810,10 +2008,26 @@ export function vwapBands(
   return { vwap: vwapLine, upper1, lower1, upper2, lower2, upper3, lower3 };
 }
 
+function emptyVwapBandsResult(): VwapBandsResult {
+  return {
+    vwap: [],
+    upper1: [],
+    lower1: [],
+    upper2: [],
+    lower2: [],
+    upper3: [],
+    lower3: [],
+  };
+}
+
 /**
  * Computes institutional session VWAP + ±1σ/2σ/3σ bands on higher intraday timeframes
- * (e.g. 3m, 5m, 15m) anchored to 1-minute trade-volume resolution whenever 1m session bars
- * are available, guaranteeing 0.00 discrepancy between 1m (left) and 5m/3m (right) charts.
+ * (e.g. 3m, 5m, 15m, 1h) anchored STRICTLY to authentic 1-minute trade-volume resolution.
+ *
+ * When `anchor === "session"` and `targetTfSec > 60`:
+ * - NEVER silently substitutes coarse timeframe bars when 1m history is missing or incomplete.
+ * - Validates each session day independently; sessions without valid 1m coverage are omitted.
+ * - Preserves weekly, monthly, yearly, and "none" anchors via `vwapBands()`.
  */
 export function computeFineGrainedSessionVwap(
   targetCandles: CandleData[],
@@ -1822,81 +2036,62 @@ export function computeFineGrainedSessionVwap(
   options: VwapBandsOptions = {},
 ): VwapBandsResult {
   const anchor: VwapAnchorPeriod = options.anchor ?? "session";
-  if (
-    !fine1mCandles ||
-    fine1mCandles.length === 0 ||
-    !Number.isFinite(targetTfSec) ||
-    targetTfSec <= 60 ||
-    anchor !== "session"
-  ) {
+  if (anchor !== "session" || !Number.isFinite(targetTfSec) || targetTfSec <= 60) {
     return vwapBands(targetCandles, options);
   }
 
+  if (!fine1mCandles || fine1mCandles.length === 0) {
+    return emptyVwapBandsResult();
+  }
+
+  const normalizedTarget = normalizeCandles(targetCandles);
   const normalizedFine = normalizeCandles(fine1mCandles);
-  if (normalizedFine.length === 0) {
-    return vwapBands(targetCandles, options);
-  }
-
-  const fineCoverageStartSec =
-    typeof options.fineRawCoverageStartSec === "number" &&
-    Number.isFinite(options.fineRawCoverageStartSec)
-      ? Math.min(options.fineRawCoverageStartSec, normalizedFine[0]!.time)
-      : normalizedFine[0]!.time;
-
-  const base = vwapBands(targetCandles, options);
-  if (base.vwap.length === 0) return base;
-
-  const fineRes = vwapBands(normalizedFine, {
-    ...options,
-    rawCoverageStartSec: fineCoverageStartSec,
-  });
-  if (fineRes.vwap.length === 0) {
-    // If 1m history is present for the same session day(s) as `base`, do NOT silently pretend
-    // a truncated 1m session is covered by falling back to coarse bars when complete session coverage is required.
-    const sessionTzCheck: VwapSessionTimeZone = options.sessionTimeZone ?? "utc";
-    const anchorReg =
-      Boolean(options.anchorAtRegularOpen) && sessionTzCheck === "america-new-york";
-    if (options.requireCompleteSession || anchorReg) {
-      const incompleteFineDays = new Set<number>();
-      for (const c of normalizedFine) {
-        const d = getVwapAnchorBucket(c.time, "session", sessionTzCheck);
-        const anchorSec = getSessionAnchorStartSec(c.time, sessionTzCheck, anchorReg);
-        const seeded =
-          options.priorSessionSeed != null &&
-          options.priorSessionSeed.anchorBucket === d &&
-          options.priorSessionSeed.cumVol > 0;
-        if (!seeded && fineCoverageStartSec > anchorSec) {
-          incompleteFineDays.add(d);
-        }
-      }
-      if (incompleteFineDays.size > 0) {
-        const keepIdx: number[] = [];
-        for (let i = 0; i < base.vwap.length; i++) {
-          const d = getVwapAnchorBucket(base.vwap[i]!.time, "session", sessionTzCheck);
-          if (!incompleteFineDays.has(d)) keepIdx.push(i);
-        }
-        return {
-          vwap: keepIdx.map((i) => base.vwap[i]!),
-          upper1: keepIdx.map((i) => base.upper1[i]!),
-          lower1: keepIdx.map((i) => base.lower1[i]!),
-          upper2: keepIdx.map((i) => base.upper2[i]!),
-          lower2: keepIdx.map((i) => base.lower2[i]!),
-          upper3: keepIdx.map((i) => base.upper3[i]!),
-          lower3: keepIdx.map((i) => base.lower3[i]!),
-        };
-      }
-    }
-    return base;
+  if (normalizedTarget.length === 0 || normalizedFine.length === 0) {
+    return emptyVwapBandsResult();
   }
 
   const sessionTz: VwapSessionTimeZone = options.sessionTimeZone ?? "utc";
+  const source: VwapPriceSource = options.source ?? "hlc3";
   const anchorAtRegularOpen =
     Boolean(options.anchorAtRegularOpen) && sessionTz === "america-new-york";
+
+  const fineRes = vwapBands(normalizedFine, {
+    ...options,
+    rawCoverageStartSec: options.fineRawCoverageStartSec,
+  });
+  if (fineRes.vwap.length === 0) {
+    return emptyVwapBandsResult();
+  }
+
+  const eligibleTarget = anchorAtRegularOpen
+    ? normalizedTarget.filter((c) => {
+        const ny = getNySessionMinutes(c.time);
+        return ny.minutes >= 570 && ny.minutes < 960;
+      })
+    : normalizedTarget;
+  if (eligibleTarget.length === 0) {
+    return emptyVwapBandsResult();
+  }
+
+  const targetByDay = new Map<number, CandleData[]>();
   const earliestTargetByDay = new Map<number, number>();
-  for (const pt of base.vwap) {
-    const day = getVwapAnchorBucket(pt.time, "session", sessionTz);
+  for (const c of eligibleTarget) {
+    const day = getVwapAnchorBucket(c.time, "session", sessionTz);
+    const list = targetByDay.get(day);
+    if (list) list.push(c);
+    else targetByDay.set(day, [c]);
     const prev = earliestTargetByDay.get(day);
-    if (prev === undefined || pt.time < prev) earliestTargetByDay.set(day, pt.time);
+    if (prev === undefined || c.time < prev) earliestTargetByDay.set(day, c.time);
+  }
+
+  const sameDayFineRawEarliest = new Map<number, number>();
+  const fineCandlesByDay = new Map<number, CandleData[]>();
+  for (const c of normalizedFine) {
+    const day = getVwapAnchorBucket(c.time, "session", sessionTz);
+    if (!sameDayFineRawEarliest.has(day)) sameDayFineRawEarliest.set(day, c.time);
+    const list = fineCandlesByDay.get(day);
+    if (list) list.push(c);
+    else fineCandlesByDay.set(day, [c]);
   }
 
   const earliestFineByDay = new Map<number, number>();
@@ -1913,39 +2108,72 @@ export function computeFineGrainedSessionVwap(
   for (const [day, targetStart] of earliestTargetByDay.entries()) {
     const fineStart = earliestFineByDay.get(day);
     if (fineStart === undefined) continue;
-    // Strict session coverage: never accept a lone mid-bucket 1m bar (e.g. 09:34 inside 09:30..09:35)
-    // unless `fine1mCandles` was already recording at or before `targetStart` (proving 09:30..09:33 had 0 trades).
+
+    const sameDayCovStart = resolveDayCoverageStartSec(
+      day,
+      fineStart,
+      sameDayFineRawEarliest.get(day),
+      options.fineRawCoverageStartSec,
+      sessionTz,
+      options.sessionCoverageByDay,
+    );
     const coversTargetStart =
       fineStart <= targetStart ||
-      (fineCoverageStartSec <= targetStart && fineStart < targetStart + targetTfSec);
+      (sameDayCovStart <= targetStart && fineStart < targetStart + targetTfSec);
     if (!coversTargetStart) continue;
+
     if (options.requireCompleteSession || anchorAtRegularOpen) {
       const anchorSec = getSessionAnchorStartSec(
         targetStart,
         sessionTz,
         anchorAtRegularOpen,
       );
-      const seeded =
-        options.priorSessionSeed != null &&
-        options.priorSessionSeed.anchorBucket === day &&
-        options.priorSessionSeed.cumVol > 0;
-      if (!seeded && fineCoverageStartSec > anchorSec) continue;
+      const seeded = isValidVwapSeedForDay(
+        options.priorSessionSeed,
+        day,
+        fineStart,
+        source,
+      );
+      if (!seeded && sameDayCovStart > anchorSec) continue;
     }
+
+    // Verify internal alignment on `day`: every higher-TF candle with real volume must have at least one 1m bar inside [T.time, T.time + targetTfSec)
+    const dayTargetBars = targetByDay.get(day) ?? [];
+    const dayFineBars = fineCandlesByDay.get(day) ?? [];
+    let fi = 0;
+    let hasMissingFineBucket = false;
+    for (const tBar of dayTargetBars) {
+      if (!(tBar.volume != null && tBar.volume > 0)) continue;
+      const bStart = tBar.time;
+      const bEnd = tBar.time + targetTfSec;
+      while (fi < dayFineBars.length && dayFineBars[fi]!.time < bStart) {
+        fi++;
+      }
+      if (fi >= dayFineBars.length || dayFineBars[fi]!.time >= bEnd) {
+        hasMissingFineBucket = true;
+        break;
+      }
+    }
+    if (hasMissingFineBucket) continue;
+
     coveredDays.add(day);
   }
-  if (coveredDays.size === 0) return base;
 
-  const outVwap = base.vwap.slice();
-  const outU1 = base.upper1.slice();
-  const outL1 = base.lower1.slice();
-  const outU2 = base.upper2.slice();
-  const outL2 = base.lower2.slice();
-  const outU3 = base.upper3.slice();
-  const outL3 = base.lower3.slice();
+  if (coveredDays.size === 0) {
+    return emptyVwapBandsResult();
+  }
+
+  const outVwap: IndicatorPoint[] = [];
+  const outU1: IndicatorPoint[] = [];
+  const outL1: IndicatorPoint[] = [];
+  const outU2: IndicatorPoint[] = [];
+  const outL2: IndicatorPoint[] = [];
+  const outU3: IndicatorPoint[] = [];
+  const outL3: IndicatorPoint[] = [];
 
   let j = 0;
-  for (let i = 0; i < outVwap.length; i++) {
-    const t = outVwap[i]!.time;
+  for (const targetBar of eligibleTarget) {
+    const t = targetBar.time;
     const day = getVwapAnchorBucket(t, "session", sessionTz);
     if (!coveredDays.has(day)) continue;
 
@@ -1954,13 +2182,13 @@ export function computeFineGrainedSessionVwap(
       j++;
     }
     if (fineRes.vwap[j]!.time < endExclusive && fineDayKeys[j] === day) {
-      outVwap[i] = { time: t, value: fineRes.vwap[j]!.value };
-      outU1[i] = { time: t, value: fineRes.upper1[j]!.value };
-      outL1[i] = { time: t, value: fineRes.lower1[j]!.value };
-      outU2[i] = { time: t, value: fineRes.upper2[j]!.value };
-      outL2[i] = { time: t, value: fineRes.lower2[j]!.value };
-      outU3[i] = { time: t, value: fineRes.upper3[j]!.value };
-      outL3[i] = { time: t, value: fineRes.lower3[j]!.value };
+      outVwap.push({ time: t, value: fineRes.vwap[j]!.value });
+      outU1.push({ time: t, value: fineRes.upper1[j]!.value });
+      outL1.push({ time: t, value: fineRes.lower1[j]!.value });
+      outU2.push({ time: t, value: fineRes.upper2[j]!.value });
+      outL2.push({ time: t, value: fineRes.lower2[j]!.value });
+      outU3.push({ time: t, value: fineRes.upper3[j]!.value });
+      outL3.push({ time: t, value: fineRes.lower3[j]!.value });
     }
   }
 

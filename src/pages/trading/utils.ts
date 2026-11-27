@@ -160,4 +160,21 @@ export function calculateVolumeMa(
   return out;
 }
 
+/**
+ * Computes Volume MA during Replay strictly over closed visible bars (`bar.time + tfSec <= simTimeSec`),
+ * so incomplete in-progress partial candle volume is never treated as definitive in MA20.
+ */
+export function calculateReplayVolumeMa(
+  volumeData: HistogramData<Time>[],
+  tfSec: number,
+  simTimeSec: number,
+  period = 20,
+): LineData<Time>[] {
+  if (!(simTimeSec > 0) || !(tfSec > 0)) {
+    return calculateVolumeMa(volumeData, period);
+  }
+  const closedOnly = volumeData.filter((d) => Number(d.time) + tfSec <= simTimeSec);
+  return calculateVolumeMa(closedOnly, period);
+}
+
 

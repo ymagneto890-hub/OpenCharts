@@ -37,8 +37,10 @@ import { getDemoSymbol, registerDynamicSymbol } from "../services/demo/instrumen
 import {
   getReplaySliceForTimeframe,
   pickFinestTimeframe,
+  type ReplayPhase,
   useReplayStore,
 } from "../services/demo/replay.ts";
+import type { Candle } from "../services/schemas.ts";
 import type { ScreenerStock } from "../services/stockScreener.ts";
 import { Zap } from "lucide-react";
 import {
@@ -85,6 +87,45 @@ import {
 } from "../lib/chart-plugins/trade-screenshot.ts";
 
 type ErrorWithMessage = { message?: string };
+
+/**
+ * Resolves the candle array displayed on the main chart.
+ * When Replay is active (`phase === "active"`, or `phase === "picking"` with a replay slice loaded),
+ * NEVER falls back to live/current candles even if `replayVisible` is temporarily null or empty.
+ */
+export function resolveMainChartCandles(params: {
+  phase: ReplayPhase;
+  replayVisible: Candle[] | null;
+  replayTimeframe: string | null;
+  replaySimTimeSec: number;
+  selectedSymbol: string;
+  timeframe: string;
+  liveCandles: Candle[];
+}): Candle[] {
+  const {
+    phase,
+    replayVisible,
+    replayTimeframe,
+    replaySimTimeSec,
+    selectedSymbol,
+    timeframe,
+    liveCandles,
+  } = params;
+
+  const replayActive =
+    phase === "active" || (phase === "picking" && replayVisible != null);
+  if (!replayActive) {
+    return liveCandles;
+  }
+
+  if (replayTimeframe === timeframe && replayVisible != null) {
+    return replayVisible;
+  }
+  if (!(replaySimTimeSec > 0)) {
+    return [];
+  }
+  return getReplaySliceForTimeframe(selectedSymbol, timeframe, replaySimTimeSec);
+}
 
 type ConfirmOrderState = {
   symbol: string;
@@ -159,7 +200,8 @@ export function TradingPage() {
 
   // Historical bar replay store
   const replay = useReplayStore();
-  const isReplayActive = (replay.phase === "active" || replay.phase === "picking") && replay.visible != null;
+  const isReplayActive =
+    replay.phase === "active" || (replay.phase === "picking" && replay.visible != null);
   const isReplayPicking = replay.phase === "picking";
 
   // Chart timeframe persistence (#8)
@@ -1263,24 +1305,27 @@ export function TradingPage() {
     deepCandleLimit,
     replayVersion,
   );
-  const mainChartCandles = useMemo(() => {
-    if (!isReplayActive || !replay.visible) return candles;
-    if (replay.timeframe === timeframe) {
-      return replay.visible;
-    }
-    if (!(replay.simTimeSec > 0)) {
-      return [];
-    }
-    return getReplaySliceForTimeframe(selectedSymbol, timeframe, replay.simTimeSec);
-  }, [
-    isReplayActive,
-    replay.visible,
-    replay.timeframe,
-    replay.simTimeSec,
-    selectedSymbol,
-    timeframe,
-    candles,
-  ]);
+  const mainChartCandles = useMemo(
+    () =>
+      resolveMainChartCandles({
+        phase: replay.phase,
+        replayVisible: replay.visible,
+        replayTimeframe: replay.timeframe,
+        replaySimTimeSec: replay.simTimeSec,
+        selectedSymbol,
+        timeframe,
+        liveCandles: candles,
+      }),
+    [
+      replay.phase,
+      replay.visible,
+      replay.timeframe,
+      replay.simTimeSec,
+      selectedSymbol,
+      timeframe,
+      candles,
+    ],
+  );
   const chartPrefs = useChartPreferences();
   const cycleMagnetMode = useCallback(() => {
     const order: MagnetMode[] = ["none", "weak", "strong"];
@@ -1298,7 +1343,8 @@ export function TradingPage() {
       ? replay.visible[replay.visible.length - 1]
       : null;
   const effectiveTick = useMemo(() => {
-    if (isReplayActive && replayLastBar) {
+    if (isReplayActive) {
+      if (!replayLastBar) return undefined;
       return {
         bid: replayLastBar.close,
         ask: replayLastBar.close,

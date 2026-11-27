@@ -31,8 +31,11 @@ import {
   bollingerBands,
   computeFineGrainedSessionVwap,
   computeMarketStructure,
+  computeReplayEmaWithWarmup,
   defaultVwapAnchorForTimeframe,
   ema,
+  getNyTradingDayKey,
+  getVwapAnchorBucket,
   type IndicatorType,
   sma,
 } from "../../lib/indicators.ts";
@@ -64,7 +67,7 @@ import {
   DEMO_SYMBOLS,
   getDemoSymbol,
 } from "../../services/demo/instruments.ts";
-import { getReplaySliceForTimeframe } from "../../services/demo/replay.ts";
+import { getReplaySliceForTimeframe, useReplayStore } from "../../services/demo/replay.ts";
 import { useTradingStore } from "../../services/store.tsx";
 import {
   CHART_COLORS,
@@ -82,6 +85,7 @@ import { DrawingToolRail } from "./DrawingToolRail.tsx";
 import type { PriceSyncController } from "./priceSyncBus.ts";
 import { vwapBandLineStyleToChart } from "./useIndicators.ts";
 import {
+  calculateReplayVolumeMa,
   calculateVolumeMa,
   getCandleBucketTime,
   getMinMove,
@@ -992,7 +996,11 @@ export function MultiChartPane({
       value: c.volume ?? 0,
       color: c.close >= c.open ? colors.volumeUp : colors.volumeDown,
     }));
-    const volMaData: LineData<Time>[] = calculateVolumeMa(volData, 20);
+    const tfSecForVol = TF_SECONDS[paneTf] ?? parseTimeframeSeconds(paneTf);
+    const volMaData: LineData<Time>[] =
+      isReplaying && replaySimTimeSec > 0
+        ? calculateReplayVolumeMa(volData, tfSecForVol, replaySimTimeSec, 20)
+        : calculateVolumeMa(volData, 20);
     if (volData.length >= 20) {
       const prev19: number[] = [];
       let s19 = 0;
@@ -1138,6 +1146,7 @@ export function MultiChartPane({
     colors.volumeUp,
     isDark,
     isReplaying,
+    replaySimTimeSec,
     paneSymbol,
     paneTf,
     sessionCtx,
@@ -1308,7 +1317,9 @@ export function MultiChartPane({
         indicatorSettings.ema?.lines ?? DEFAULT_INDICATOR_SETTINGS.ema.lines
       ).filter((l) => l.enabled && l.period >= 1);
       for (const line of emaLines) {
-        const emaPts = ema(indCandles, line.period);
+        const emaPts = isReplaying
+          ? computeReplayEmaWithWarmup(indCandles, line.period).points
+          : ema(indCandles, line.period);
         upsertOverlayLine(
           `EMA:${line.id}:${line.period}`,
           {
@@ -1330,10 +1341,12 @@ export function MultiChartPane({
         vwapCfg.anchor === "auto"
           ? defaultVwapAnchorForTimeframe(paneTf)
           : vwapCfg.anchor;
+      const paneTfSec = parseTimeframeSeconds(paneTf);
+      const paneVwapTz = sessionCtx.isUsStock ? "america-new-york" : "utc";
       const vwapData = computeFineGrainedSessionVwap(
         indCandles,
         paneFine1mVwapCandles,
-        parseTimeframeSeconds(paneTf),
+        paneTfSec,
         {
           anchor,
           multipliers: [
@@ -1341,15 +1354,37 @@ export function MultiChartPane({
             vwapCfg.band2.multiplier,
             vwapCfg.band3.multiplier,
           ],
-          sessionTimeZone: sessionCtx.isUsStock ? "america-new-york" : "utc",
+          sessionTimeZone: paneVwapTz,
           source: vwapCfg.source,
           priorSessionSeed: anchor === "session" ? (paneVwapSeed ?? undefined) : undefined,
           anchorAtRegularOpen: paneAnchorAtRegularOpen,
           rawCoverageStartSec: paneRawCoverageStartSec,
           fineRawCoverageStartSec: paneFine1mVwapBundle.rawCoverageStartSec,
-          requireCompleteSession: sessionCtx.isUsStock,
+          requireCompleteSession: sessionCtx.isUsStock || isReplaying,
         },
       );
+      if (isReplaying && anchor === "session" && paneTfSec > 60 && indCandles.length > 0) {
+        const lastBar = indCandles[indCandles.length - 1]!;
+        const lastDay =
+          paneVwapTz === "america-new-york"
+            ? getNyTradingDayKey(lastBar.time)
+            : getVwapAnchorBucket(lastBar.time, "session", paneVwapTz);
+        const hasCurrentDayVwap = vwapData.vwap.some((pt) => {
+          const ptDay =
+            paneVwapTz === "america-new-york"
+              ? getNyTradingDayKey(pt.time)
+              : getVwapAnchorBucket(pt.time, "session", paneVwapTz);
+          return ptDay === lastDay;
+        });
+        if (!hasCurrentDayVwap) {
+          const st = useReplayStore.getState();
+          if (!st.dataWarning) {
+            st.setDataWarning(
+              `VWAP oculto en ${paneTf}: falta histórico real completo de 1m para esta sesión.`,
+            );
+          }
+        }
+      }
       upsertOverlayLine(
         "VWAP",
         {

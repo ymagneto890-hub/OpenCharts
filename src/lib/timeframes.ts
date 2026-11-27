@@ -138,19 +138,51 @@ export function getBucketStartSec(timestampSecOrMs: number, tfOrSec: string | nu
   return Math.floor(sec / stepSec) * stepSec;
 }
 
+export interface AggregateCandlesOptions {
+  /** Base resolution in seconds (e.g. 60 for 1m) used to detect missing intermediate sub-candles per bucket. */
+  sourceStepSec?: number;
+  /** When true (and `sourceStepSec` is set), excludes buckets missing intermediate sub-candles unless verified sparse. */
+  requireCompleteBuckets?: boolean;
+  /** When true, allows missing zero-trade minutes inside buckets covered by `[verifiedCoverageStartSec, verifiedCoverageEndSec]`. */
+  allowSparseZeroTradeGaps?: boolean;
+  verifiedCoverageStartSec?: number;
+  verifiedCoverageEndSec?: number;
+}
+
+export interface AggregatedCandleIntegrityResult {
+  candles: OhlcvBar[];
+  incompleteBucketTimes: number[];
+  completeBucketTimes: number[];
+  duplicateInputCount: number;
+  outOfOrderInputCount: number;
+}
+
 /**
- * Deterministically aggregates finer OHLCV bars (e.g. 1s or 1m) into any target timeframe or step in seconds.
+ * Deterministically aggregates finer OHLCV bars while tracking duplicates, out-of-order inputs,
+ * and incomplete target buckets (e.g., intermediate missing sub-candles).
  */
-export function aggregateCandles<T extends OhlcvBar>(
+export function aggregateCandlesWithIntegrity<T extends OhlcvBar>(
   bars: ReadonlyArray<T>,
   targetTfOrSec: string | number,
-): OhlcvBar[] {
-  if (!Array.isArray(bars) || bars.length === 0) return [];
+  options?: AggregateCandlesOptions,
+): AggregatedCandleIntegrityResult {
+  if (!Array.isArray(bars) || bars.length === 0) {
+    return {
+      candles: [],
+      incompleteBucketTimes: [],
+      completeBucketTimes: [],
+      duplicateInputCount: 0,
+      outOfOrderInputCount: 0,
+    };
+  }
   const stepSec =
     typeof targetTfOrSec === "number"
       ? Math.max(1, Math.floor(targetTfOrSec))
       : parseTimeframeSeconds(targetTfOrSec);
 
+  let duplicateInputCount = 0;
+  let outOfOrderInputCount = 0;
+  let prevRawTime = -Infinity;
   const dedupedByTime = new Map<number, T>();
   for (const bar of bars) {
     if (
@@ -164,14 +196,20 @@ export function aggregateCandles<T extends OhlcvBar>(
     ) {
       continue;
     }
-    dedupedByTime.set(Math.floor(bar.time), bar);
+    const t = Math.floor(bar.time);
+    if (t < prevRawTime) outOfOrderInputCount += 1;
+    else prevRawTime = t;
+    if (dedupedByTime.has(t)) duplicateInputCount += 1;
+    dedupedByTime.set(t, bar);
   }
 
   const sorted = Array.from(dedupedByTime.values()).sort((a, b) => a.time - b.time);
   const buckets = new Map<number, OhlcvBar>();
+  const bucketSlotCount = new Map<number, number>();
 
   for (const bar of sorted) {
-    const bTime = getBucketStartSec(Math.floor(bar.time), stepSec);
+    const barTime = Math.floor(bar.time);
+    const bTime = getBucketStartSec(barTime, stepSec);
     const barHigh = Math.max(bar.high, bar.open, bar.close);
     const barLow = Math.min(bar.low, bar.open, bar.close);
     const barVol = Number.isFinite(bar.volume) && bar.volume >= 0 ? bar.volume : 0;
@@ -185,15 +223,79 @@ export function aggregateCandles<T extends OhlcvBar>(
         close: bar.close,
         volume: barVol,
       });
+      bucketSlotCount.set(bTime, 1);
     } else {
       existing.high = Math.max(existing.high, barHigh);
       existing.low = Math.min(existing.low, barLow);
       existing.close = bar.close;
       existing.volume += barVol;
+      bucketSlotCount.set(bTime, (bucketSlotCount.get(bTime) ?? 0) + 1);
     }
   }
 
-  return Array.from(buckets.values()).sort((a, b) => a.time - b.time);
+  const allSorted = Array.from(buckets.values()).sort((a, b) => a.time - b.time);
+  const sourceSec = options?.sourceStepSec;
+  const checkCompleteness =
+    typeof sourceSec === "number" &&
+    Number.isFinite(sourceSec) &&
+    sourceSec > 0 &&
+    stepSec > sourceSec &&
+    stepSec % sourceSec === 0;
+
+  if (!checkCompleteness) {
+    return {
+      candles: allSorted,
+      incompleteBucketTimes: [],
+      completeBucketTimes: allSorted.map((c) => c.time),
+      duplicateInputCount,
+      outOfOrderInputCount,
+    };
+  }
+
+  const expectedSlots = Math.round(stepSec / sourceSec!);
+  const completeBucketTimes: number[] = [];
+  const incompleteBucketTimes: number[] = [];
+  const completeSet = new Set<number>();
+  const allowSparse = Boolean(options?.allowSparseZeroTradeGaps);
+  const covStart = options?.verifiedCoverageStartSec;
+  const covEnd = options?.verifiedCoverageEndSec;
+
+  for (const candle of allSorted) {
+    const count = bucketSlotCount.get(candle.time) ?? 0;
+    const hasVerifiedSparseCov =
+      allowSparse &&
+      typeof covStart === "number" &&
+      typeof covEnd === "number" &&
+      covStart <= candle.time &&
+      covEnd >= candle.time + stepSec;
+    if (count >= expectedSlots || hasVerifiedSparseCov) {
+      completeBucketTimes.push(candle.time);
+      completeSet.add(candle.time);
+    } else {
+      incompleteBucketTimes.push(candle.time);
+    }
+  }
+
+  return {
+    candles: options?.requireCompleteBuckets
+      ? allSorted.filter((c) => completeSet.has(c.time))
+      : allSorted,
+    incompleteBucketTimes,
+    completeBucketTimes,
+    duplicateInputCount,
+    outOfOrderInputCount,
+  };
+}
+
+/**
+ * Deterministically aggregates finer OHLCV bars (e.g. 1s or 1m) into any target timeframe or step in seconds.
+ */
+export function aggregateCandles<T extends OhlcvBar>(
+  bars: ReadonlyArray<T>,
+  targetTfOrSec: string | number,
+  options?: AggregateCandlesOptions,
+): OhlcvBar[] {
+  return aggregateCandlesWithIntegrity(bars, targetTfOrSec, options).candles;
 }
 
 /**

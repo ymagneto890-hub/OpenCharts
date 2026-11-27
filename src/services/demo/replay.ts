@@ -499,6 +499,54 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         }
       }
 
+      // If `fullCurrent` is the last bar and is partially revealed (`simTimeSec < bar.time + tfSec`),
+      // finish only the remaining `[simTimeSec, bar.time + tfSec)` window cleanly when finer data exists.
+      const fullCurrentAtCursor = series[cursor];
+      if (
+        cursor >= series.length - 1 &&
+        fullCurrentAtCursor &&
+        s.simTimeSec > 0 &&
+        fullCurrentAtCursor.time < s.simTimeSec &&
+        fullCurrentAtCursor.time + tfSec > s.simTimeSec
+      ) {
+        const remEnd = fullCurrentAtCursor.time + tfSec;
+        const remRes = resolvePartialCandleWindow(
+          s.symbol,
+          fullCurrentAtCursor,
+          tf,
+          s.simTimeSec,
+          remEnd,
+        );
+        if (remRes.status === "missing-data") {
+          clearTimer();
+          set({
+            playing: false,
+            dataWarning:
+              "Avance detenido: faltan velas inferiores reales para completar el tramo restante de la vela parcial sin sesgo futuro.",
+          });
+          return;
+        }
+        if (remRes.status === "ok") {
+          engine.replayAdvance(s.symbol, {
+            open: remRes.candle.open,
+            high: remRes.candle.high,
+            low: remRes.candle.low,
+            close: remRes.candle.close,
+            timeSec: fullCurrentAtCursor.time,
+          });
+        }
+        replaySliceCache.clear();
+        clearTimer();
+        set({
+          simTimeSec: remEnd,
+          visible: series.slice(0, cursor + 1),
+          finished: true,
+          playing: false,
+          dataWarning: null,
+        });
+        return;
+      }
+
       let next = cursor + 1;
       if (shouldSkipHiddenExtendedBar(s.symbol, tf)) {
         let probe = next;
@@ -627,8 +675,13 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         if (anchorSec > 0) {
           const refreshed = getReplayHistory(s.symbol, tf, anchorSec);
           if (refreshed.length > 0) {
-            const newIdx = indexAtOrBefore(refreshed, anchorSec - 1);
+            let newIdx = indexAtOrBefore(refreshed, anchorSec - 1);
             if (newIdx >= 0) {
+              const lastVis = s.visible && s.visible.length > 0 ? s.visible[s.visible.length - 1] : null;
+              if (lastVis && refreshed[newIdx]!.time > lastVis.time) {
+                const matchVis = indexAtOrBefore(refreshed, lastVis.time);
+                if (matchVis >= 0) newIdx = matchVis;
+              }
               series = refreshed;
               cursor = newIdx;
             }
@@ -637,6 +690,13 @@ export const useReplayStore = create<ReplayState>((set, get) => {
       }
 
       if (cursor <= 0) return;
+
+      const currentBar = series[cursor];
+      const isMidPartial =
+        Boolean(currentBar) &&
+        s.simTimeSec > 0 &&
+        currentBar!.time < s.simTimeSec &&
+        currentBar!.time + tfSec > s.simTimeSec;
 
       let prev = cursor - 1;
       if (shouldSkipHiddenExtendedBar(s.symbol, tf)) {
@@ -649,7 +709,8 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         }
       }
       const bar = series[prev]!;
-      const prevSimTimeSec = bar.time + tfSec;
+      const prevSimTimeSec = isMidPartial ? currentBar!.time : bar.time + tfSec;
+      const rewoundVisible = series.slice(0, prev + 1);
       engine.replayRewind(s.symbol, {
         open: bar.open,
         high: bar.high,
@@ -666,7 +727,7 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         cursor: prev,
         simTimeSec: prevSimTimeSec,
         total: series.length,
-        visible: series.slice(0, prev + 1),
+        visible: rewoundVisible,
         finished: false,
         playing: false,
         dataWarning: null,
