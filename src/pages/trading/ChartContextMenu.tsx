@@ -77,6 +77,14 @@ function sellOrderType(price: number, bid: number): "LIMIT" | "STOP" {
   return price >= bid ? "LIMIT" : "STOP";
 }
 
+/** Default quick-order quantity matching TradingPage.handleQuickOrder. */
+function quickOrderQty(symbol: string): number {
+  const upper = symbol.toUpperCase();
+  if (upper.startsWith("BTC")) return 0.005;
+  if (upper.startsWith("ETH")) return 0.05;
+  return 0.1;
+}
+
 function TradeSection({
   price,
   pipDigits,
@@ -90,6 +98,7 @@ function TradeSection({
   "pipDigits" | "symbol" | "tick" | "onQuickOrder" | "onAddAlert" | "onClose"
 > & { price: number }) {
   const p = price.toFixed(pipDigits);
+  const qty = quickOrderQty(symbol);
   return (
     <>
       {onAddAlert && (
@@ -106,7 +115,7 @@ function TradeSection({
         <>
           <MenuItem
             icon={<ArrowUpFromLine className="h-3.5 w-3.5" />}
-            label={`Buy 1 ${symbol} @ ${p} ${buyOrderType(price, tick.ask).toLowerCase()}`}
+            label={`Buy ${qty} ${symbol} @ ${p} ${buyOrderType(price, tick.ask).toLowerCase()}`}
             onClick={() => {
               onQuickOrder("BUY", buyOrderType(price, tick.ask), price);
               onClose();
@@ -114,7 +123,7 @@ function TradeSection({
           />
           <MenuItem
             icon={<ArrowDownToLine className="h-3.5 w-3.5" />}
-            label={`Sell 1 ${symbol} @ ${p} ${sellOrderType(price, tick.bid).toLowerCase()}`}
+            label={`Sell ${qty} ${symbol} @ ${p} ${sellOrderType(price, tick.bid).toLowerCase()}`}
             onClick={() => {
               onQuickOrder("SELL", sellOrderType(price, tick.bid), price);
               onClose();
@@ -152,8 +161,8 @@ export function ChartContextMenu(props: ChartContextMenuProps) {
     if (!el) return;
     const rect = el.getBoundingClientRect();
     setPos({
-      x: Math.min(x, window.innerWidth - rect.width - 8),
-      y: Math.min(y, window.innerHeight - rect.height - 8),
+      x: Math.max(8, Math.min(x, window.innerWidth - rect.width - 8)),
+      y: Math.max(8, Math.min(y, window.innerHeight - rect.height - 8)),
     });
   }, [x, y]);
 

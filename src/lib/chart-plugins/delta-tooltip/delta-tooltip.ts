@@ -251,7 +251,7 @@ export class DeltaTooltipPrimitive implements ISeriesPrimitive<Time> {
       const firstPrice = correctOrder ? priceValues[0]![0]! : priceValues[1]![0]!;
       const secondPrice = correctOrder ? priceValues[1]![0]! : priceValues[0]![0]!;
       const priceChange = secondPrice - firstPrice;
-      const pctChange = (100 * priceChange) / firstPrice;
+      const pctChange = firstPrice !== 0 ? (100 * priceChange) / firstPrice : 0;
       const positive = priceChange >= 0;
       deltaContent.deltaTopLine = (positive ? "+" : "") + priceChange.toFixed(2);
       deltaContent.deltaBottomLine = (positive ? "+" : "") + pctChange.toFixed(2) + "%";

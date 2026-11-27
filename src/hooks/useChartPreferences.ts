@@ -10,6 +10,7 @@ export interface ChartPreferences {
   showBidLine: boolean;
   showAskLine: boolean;
   overlayPositionsOnChart: boolean;
+  separateOscillators: boolean;
   /** Snap drawing anchors to nearby candle O/H/L/C values. */
   drawingMagnet: boolean;
   /** Magnet mode: off / weak (snap near) / strong (always snap to OHLC). */
@@ -43,10 +44,13 @@ export interface ChartPreferences {
   showWicks: boolean;
   showCandleBorders: boolean;
   showVolume: boolean;
+  showVolumeMa: boolean;
   showGrid: boolean;
   showWatermark: boolean;
   showCountdown: boolean;
   showOhlcLegend: boolean;
+  /** Show Pre-Market and After-Hours candles & shading on intraday stock charts. */
+  showExtendedHours: boolean;
   // ── Challenge-aware overlays ──
   /** Master switch for rule-derived price lines (daily loss / max DD / target). */
   challengeOverlay: boolean;
@@ -60,9 +64,10 @@ type TraderPrefs = Record<string, string>;
 const CHART_PREFS_UPDATED_EVENT = "chart-preferences-updated";
 
 const DEFAULT_CHART_PREFS: ChartPreferences = {
-  showBidLine: true,
-  showAskLine: true,
+  showBidLine: false,
+  showAskLine: false,
   overlayPositionsOnChart: true,
+  separateOscillators: true,
   drawingMagnet: false,
   magnetMode: "none",
   stayInDrawingMode: false,
@@ -85,10 +90,12 @@ const DEFAULT_CHART_PREFS: ChartPreferences = {
   showWicks: true,
   showCandleBorders: true,
   showVolume: true,
+  showVolumeMa: true,
   showGrid: true,
-  showWatermark: true,
+  showWatermark: false,
   showCountdown: true,
   showOhlcLegend: true,
+  showExtendedHours: true,
   challengeOverlay: false,
   challengeDailyLossLine: false,
   challengeMaxDrawdownLine: false,
@@ -100,15 +107,18 @@ const BOOL_PREF_KEYS = [
   "showBidLine",
   "showAskLine",
   "overlayPositionsOnChart",
+  "separateOscillators",
   "drawingMagnet",
   "stayInDrawingMode",
   "showWicks",
   "showCandleBorders",
   "showVolume",
+  "showVolumeMa",
   "showGrid",
   "showWatermark",
   "showCountdown",
   "showOhlcLegend",
+  "showExtendedHours",
   "challengeOverlay",
   "challengeDailyLossLine",
   "challengeMaxDrawdownLine",
@@ -143,13 +153,16 @@ export const TEMPLATE_PREF_KEYS = [
   "showBidLine",
   "showAskLine",
   "overlayPositionsOnChart",
+  "separateOscillators",
   "showWicks",
   "showCandleBorders",
   "showVolume",
+  "showVolumeMa",
   "showGrid",
   "showWatermark",
   "showCountdown",
   "showOhlcLegend",
+  "showExtendedHours",
   "challengeOverlay",
   "challengeDailyLossLine",
   "challengeMaxDrawdownLine",
@@ -208,6 +221,7 @@ export function getChartPreferencesFromStorage(): ChartPreferences {
   for (const key of BOOL_PREF_KEYS) {
     result[key] = toBool(prefs[key], DEFAULT_CHART_PREFS[key]);
   }
+  result.showWatermark = false;
   for (const key of STRING_PREF_KEYS) {
     result[key] = prefs[key] ?? DEFAULT_CHART_PREFS[key];
   }
@@ -243,6 +257,7 @@ export function useChartPreferences(): ChartPreferences {
 
   useEffect(() => {
     const refresh = () => setPrefs(getChartPreferencesFromStorage());
+    refresh();
     window.addEventListener("storage", refresh);
     window.addEventListener(CHART_PREFS_UPDATED_EVENT, refresh);
     return () => {

@@ -48,6 +48,13 @@ export default {
         sans: ["Inter", "system-ui", "-apple-system", "sans-serif"],
         mono: ["JetBrains Mono", "Fira Code", "SF Mono", "monospace"],
       },
+      fontSize: {
+        xs: ["1rem", { lineHeight: "1.45rem" }],        // 16px
+        sm: ["1.125rem", { lineHeight: "1.6rem" }],     // 18px
+        base: ["1.25rem", { lineHeight: "1.75rem" }],   // 20px
+        lg: ["1.375rem", { lineHeight: "1.9rem" }],     // 22px
+        xl: ["1.5625rem", { lineHeight: "2.1rem" }],    // 25px
+      },
       keyframes: {
         "skeleton-pulse": {
           "0%, 100%": { opacity: "0.4" },

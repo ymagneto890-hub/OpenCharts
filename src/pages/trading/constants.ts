@@ -1,37 +1,51 @@
 // ── Trading Page Constants ────────────────────────────────────────────────────
 
-export const TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"] as const;
-export type Timeframe = (typeof TIMEFRAMES)[number];
+import { getTimeframeMs, isValidTimeframe } from "../../lib/timeframes.ts";
 
-/**
- * Master switch for session replay (HUD + scrubber). Disabled on the live
- * terminal until the feature is fully QA'd — flip to `true` to re-enable the
- * replay controls everywhere they mount.
- */
-export const REPLAY_ENABLED = false;
+export const TIMEFRAMES = [
+  "1s",
+  "5s",
+  "15s",
+  "30s",
+  "1m",
+  "2m",
+  "3m",
+  "5m",
+  "10m",
+  "15m",
+  "30m",
+  "1h",
+  "2h",
+  "4h",
+  "1d",
+  "1w",
+] as const;
+export type Timeframe = (typeof TIMEFRAMES)[number] | (string & {});
+
+export const REPLAY_ENABLED = true;
 
 export const CHART_COLORS = {
   dark: {
     background: "#0b0e14",
-    text: "#9298a5",
+    text: "#cbd5e1",
     grid: "#151923",
-    crosshair: "#555c68",
-    up: "#0ecb81",
-    down: "#f6465d",
-    volumeUp: "rgba(14, 203, 129, 0.18)",
-    volumeDown: "rgba(246, 70, 93, 0.18)",
-    bidLine: "#0ecb81",
-    askLine: "#f6465d",
-    bidLabelBg: "#0ecb81",
-    askLabelBg: "#f6465d",
+    crosshair: "#64748b",
+    up: "#00E676",
+    down: "#FF3B56",
+    volumeUp: "rgba(0, 230, 118, 0.28)",
+    volumeDown: "rgba(255, 59, 86, 0.28)",
+    bidLine: "#00E676",
+    askLine: "#FF3B56",
+    bidLabelBg: "#00E676",
+    askLabelBg: "#FF3B56",
     watermark: "rgba(255, 255, 255, 0.03)",
-    lastPriceUp: "#0ecb81",
-    lastPriceDown: "#f6465d",
+    lastPriceUp: "#00E676",
+    lastPriceDown: "#FF3B56",
     orderLine: "#f0b90b",
-    positionLong: "#0ecb81",
-    positionShort: "#f6465d",
-    tpLine: "#0ecb81",
-    slLine: "#f6465d",
+    positionLong: "#00E676",
+    positionShort: "#FF3B56",
+    tpLine: "#00E676",
+    slLine: "#FF3B56",
   },
   light: {
     background: "#ffffff",
@@ -221,19 +235,39 @@ export const DRAWING_COLORS = [
 
 export const DRAWING_WIDTHS = [1, 2, 3, 4] as const;
 
-/** Timeframe interval in milliseconds */
-export const TF_INTERVAL_MS: Record<Timeframe, number> = {
-  "1m": 60_000,
-  "5m": 5 * 60_000,
-  "15m": 15 * 60_000,
-  "30m": 30 * 60_000,
-  "1h": 60 * 60_000,
-  "4h": 4 * 60 * 60_000,
-  "1d": 24 * 60 * 60_000,
-  "1w": 7 * 24 * 60 * 60_000,
-};
+/** Timeframe interval in milliseconds (supports 1s, 3m, 5m, and any dynamic timeframe). */
+export const TF_INTERVAL_MS: Record<string, number> = new Proxy(
+  {
+    "1s": 1_000,
+    "5s": 5_000,
+    "15s": 15_000,
+    "30s": 30_000,
+    "1m": 60_000,
+    "2m": 120_000,
+    "3m": 3 * 60_000,
+    "5m": 5 * 60_000,
+    "10m": 10 * 60_000,
+    "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
+    "1h": 60 * 60_000,
+    "2h": 2 * 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+    "1w": 7 * 24 * 60 * 60_000,
+  } as Record<string, number>,
+  {
+    get(target, prop) {
+      if (typeof prop === "string") {
+        if (prop in target) return target[prop];
+        if (isValidTimeframe(prop)) return getTimeframeMs(prop);
+      }
+      return Reflect.get(target, prop);
+    },
+  },
+);
 
 export const KNOWN_CURRENCIES = [
+  "BTC",
   "EUR",
   "USD",
   "GBP",
@@ -281,7 +315,7 @@ export const MOCK_EVENTS: EconomicEvent[] = [
     time: "08:30",
     currency: "USD",
     impact: "high",
-    event: "Non-Farm Payrolls",
+    event: "Nóminas no agrícolas (NFP)",
     forecast: "180K",
     previous: "175K",
   },
@@ -289,7 +323,7 @@ export const MOCK_EVENTS: EconomicEvent[] = [
     time: "10:00",
     currency: "USD",
     impact: "medium",
-    event: "ISM Manufacturing PMI",
+    event: "PMI manufacturero del ISM",
     forecast: "49.8",
     previous: "49.2",
   },
@@ -297,7 +331,7 @@ export const MOCK_EVENTS: EconomicEvent[] = [
     time: "14:00",
     currency: "EUR",
     impact: "high",
-    event: "ECB Interest Rate Decision",
+    event: "Decisión de tipos de interés del BCE",
     forecast: "4.50%",
     previous: "4.50%",
   },
@@ -305,7 +339,7 @@ export const MOCK_EVENTS: EconomicEvent[] = [
     time: "08:00",
     currency: "GBP",
     impact: "medium",
-    event: "GDP m/m",
+    event: "PIB mensual (m/m)",
     forecast: "0.2%",
     previous: "0.1%",
   },
@@ -313,16 +347,16 @@ export const MOCK_EVENTS: EconomicEvent[] = [
     time: "21:30",
     currency: "JPY",
     impact: "low",
-    event: "Unemployment Rate",
+    event: "Tasa de desempleo",
     forecast: "2.5%",
     previous: "2.5%",
   },
-  { time: "15:30", currency: "USD", impact: "high", event: "FOMC Statement" },
+  { time: "15:30", currency: "USD", impact: "high", event: "Declaración del FOMC" },
   {
     time: "02:00",
     currency: "CNY",
     impact: "medium",
-    event: "CPI y/y",
+    event: "IPC interanual (CPI y/y)",
     forecast: "0.3%",
     previous: "0.2%",
   },
@@ -337,38 +371,38 @@ export interface NewsItem {
 
 export const MOCK_NEWS: NewsItem[] = [
   {
-    time: "2m ago",
-    title: "Fed signals potential rate cut in September meeting",
+    time: "Hace 2m",
+    title: "La Fed señala un posible recorte de tipos de interés en la reunión de septiembre",
     source: "Reuters",
     impact: "bullish",
   },
   {
-    time: "15m ago",
-    title: "EUR/USD breaks above key resistance at 1.0950",
+    time: "Hace 15m",
+    title: "El EUR/USD rompe al alza la resistencia clave situada en 1,0950",
     source: "FXStreet",
     impact: "bullish",
   },
   {
-    time: "32m ago",
-    title: "Oil prices surge on OPEC+ production cut extension",
+    time: "Hace 32m",
+    title: "Los precios del petróleo suben con fuerza tras la extensión de recortes de la OPEP+",
     source: "Bloomberg",
     impact: "neutral",
   },
   {
-    time: "1h ago",
-    title: "Bank of Japan maintains ultra-loose monetary policy",
+    time: "Hace 1h",
+    title: "El Banco de Japón mantiene inalterada su política monetaria ultralaxa",
     source: "Nikkei",
     impact: "bearish",
   },
   {
-    time: "2h ago",
-    title: "US Treasury yields climb ahead of jobs data",
+    time: "Hace 2h",
+    title: "Los rendimientos de los bonos del Tesoro de EE. UU. suben antes de los datos de empleo",
     source: "CNBC",
     impact: "bearish",
   },
   {
-    time: "3h ago",
-    title: "Gold hits record high amid geopolitical tensions",
+    time: "Hace 3h",
+    title: "El oro alcanza nuevos máximos históricos ante el aumento de la incertidumbre global",
     source: "Reuters",
     impact: "bullish",
   },

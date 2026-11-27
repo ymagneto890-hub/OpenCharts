@@ -130,7 +130,19 @@ export class TooltipElement {
   }
 
   public destroy() {
-    if (this._chart && this._element) this._chart.chartElement().removeChild(this._element);
+    try {
+      if (this._element) {
+        if (this._element.parentNode) {
+          this._element.parentNode.removeChild(this._element);
+        } else if (typeof this._element.remove === "function") {
+          this._element.remove();
+        }
+      }
+    } catch {
+      // Safe against already detached or reparented nodes
+    } finally {
+      this._element = undefined as unknown as HTMLDivElement;
+    }
   }
 
   public applyOptions(options: Partial<TooltipOptions>) {
@@ -172,9 +184,19 @@ export class TooltipElement {
     const deadzoneWidth = this._lastTooltipWidth
       ? Math.ceil(this._lastTooltipWidth / 2)
       : this._options.horizontalDeadzoneWidth;
+    let paneWidth = chart.timeScale().width();
+    if (paneWidth <= 0) {
+      let rightW = 0;
+      try {
+        rightW = chart.priceScale("right").width();
+      } catch {
+        rightW = 0;
+      }
+      paneWidth = Math.max(deadzoneWidth * 2, chart.chartElement().clientWidth - rightW);
+    }
     const xAdjusted = Math.min(
       Math.max(deadzoneWidth, x),
-      chart.timeScale().width() - deadzoneWidth,
+      Math.max(deadzoneWidth, paneWidth - deadzoneWidth),
     );
     return `calc(${xAdjusted}px - 50%)`;
   }

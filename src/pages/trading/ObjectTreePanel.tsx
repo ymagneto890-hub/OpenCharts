@@ -98,7 +98,7 @@ function ObjectTreeRow({
         <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: d.color }} />
         <Icon className="h-3 w-3 shrink-0 text-muted-foreground" />
         <span className="flex-1 truncate">
-          {meta.label} {d.price.toFixed(pipDigits)}
+          {meta.label} {Number.isFinite(d.price) ? d.price.toFixed(pipDigits) : ""}
           {tfOnly && <span className="ml-1 text-[9px] text-muted-foreground">({d.createdTf})</span>}
         </span>
       </button>

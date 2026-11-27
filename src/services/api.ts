@@ -24,7 +24,8 @@ export class ApiError extends Error {
 const benign = () => Promise.resolve(null);
 
 export const api = new Proxy(demoApi as Record<string, unknown>, {
-  get(target, prop: string) {
+  get(target, prop: string | symbol) {
+    if (typeof prop === "symbol" || prop === "then") return undefined;
     if (prop in target) return target[prop];
     return benign;
   },

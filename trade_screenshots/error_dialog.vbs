@@ -1,0 +1,1 @@
+MsgBox "El servidor local de OpenCharts no pudo iniciarse en http://127.0.0.1:5173/." & vbCrLf & "" & vbCrLf & "Detalle:" & vbCrLf & "[32m[1mVITE[22m v6.4.5[39m  [2mready in [0m[1m2217[22m[2m[0m ms[22m" & vbCrLf & "" & vbCrLf & "  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5173[22m/[39m", 16, "OpenCharts — Error al iniciar el servidor"

@@ -1,7 +1,35 @@
 import { create } from "zustand";
 import { api } from "./api.ts";
 import { wsClient } from "./ws.ts";
+import { getDemoSymbol, registerDynamicSymbol, subscribeSymbolsChanged } from "./demo/instruments.ts";
 import type { Account, Order, Position, Symbol, User } from "./schemas.ts";
+
+function readStoredUser(): User | null {
+  try {
+    const raw = localStorage.getItem("user");
+    if (!raw || raw === "null") return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as User) : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeStorageSet(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function safeStorageRemove(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // ignore storage errors
+  }
+}
 
 type LoginMfaResponse = {
   mfaRequired: true;
@@ -28,7 +56,7 @@ interface AuthState {
 export const useAuthStore = create<AuthState>((set, get) => ({
   accessToken: localStorage.getItem("access_token"),
   refreshToken: localStorage.getItem("refresh_token"),
-  user: JSON.parse(localStorage.getItem("user") || "null"),
+  user: readStoredUser(),
   isDemo: localStorage.getItem("is_demo") === "true",
   mfaPending: null,
 
@@ -45,10 +73,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       });
       return;
     }
-    localStorage.setItem("access_token", data.accessToken);
-    localStorage.setItem("refresh_token", data.refreshToken);
-    localStorage.setItem("user", JSON.stringify(data.user));
-    localStorage.removeItem("is_demo");
+    safeStorageSet("access_token", data.accessToken);
+    safeStorageSet("refresh_token", data.refreshToken);
+    safeStorageSet("user", JSON.stringify(data.user));
+    safeStorageRemove("is_demo");
     set({
       accessToken: data.accessToken,
       refreshToken: data.refreshToken,
@@ -69,10 +97,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     const json = await res.json().catch(() => null);
     if (!res.ok) throw new Error(json?.error?.message || "Google login failed");
     const data = json?.data ?? json;
-    localStorage.setItem("access_token", data.accessToken);
-    localStorage.setItem("refresh_token", data.refreshToken);
-    localStorage.setItem("user", JSON.stringify(data.user));
-    localStorage.removeItem("is_demo");
+    safeStorageSet("access_token", data.accessToken);
+    safeStorageSet("refresh_token", data.refreshToken);
+    safeStorageSet("user", JSON.stringify(data.user));
+    safeStorageRemove("is_demo");
     set({
       accessToken: data.accessToken,
       refreshToken: data.refreshToken,
@@ -85,14 +113,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   demoLogin: async () => {
     // Clear any stale account selection from a previous session
-    localStorage.removeItem("active_account");
+    safeStorageRemove("active_account");
     // Force dark mode for demo
-    localStorage.setItem("theme", "dark");
+    safeStorageSet("theme", "dark");
     const data = await api.demoLogin();
-    localStorage.setItem("access_token", data.accessToken);
-    localStorage.setItem("refresh_token", data.refreshToken);
-    localStorage.setItem("user", JSON.stringify(data.user));
-    localStorage.setItem("is_demo", "true");
+    safeStorageSet("access_token", data.accessToken);
+    safeStorageSet("refresh_token", data.refreshToken);
+    safeStorageSet("user", JSON.stringify(data.user));
+    safeStorageSet("is_demo", "true");
     set({
       accessToken: data.accessToken,
       refreshToken: data.refreshToken,
@@ -107,9 +135,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     const pending = get().mfaPending;
     if (!pending) throw new Error("No MFA pending");
     const data = await api.completeMfaLogin(pending.mfaToken, code);
-    localStorage.setItem("access_token", data.accessToken);
-    localStorage.setItem("refresh_token", data.refreshToken);
-    localStorage.setItem("user", JSON.stringify(data.user));
+    safeStorageSet("access_token", data.accessToken);
+    safeStorageSet("refresh_token", data.refreshToken);
+    safeStorageSet("user", JSON.stringify(data.user));
     set({
       accessToken: data.accessToken,
       refreshToken: data.refreshToken,
@@ -124,14 +152,15 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: () => {
+    stopTokenRefresh();
     // AUTH-VULN-06/07: Send refresh token to server for proper revocation
     const rt = localStorage.getItem("refresh_token");
     api.logout(rt || undefined).catch(() => {});
-    localStorage.removeItem("access_token");
-    localStorage.removeItem("refresh_token");
-    localStorage.removeItem("user");
-    localStorage.removeItem("is_demo");
-    localStorage.removeItem("active_account");
+    safeStorageRemove("access_token");
+    safeStorageRemove("refresh_token");
+    safeStorageRemove("user");
+    safeStorageRemove("is_demo");
+    safeStorageRemove("active_account");
     set({ accessToken: null, refreshToken: null, user: null, isDemo: false });
     wsClient.disconnect();
   },
@@ -268,11 +297,40 @@ let _liveTickRafId: number | null = null;
 /** Per-symbol decimal precision cache — populated on first tick, avoids O(n) symbol lookup per tick */
 const _symbolDecimals = new Map<string, number>();
 function _pipDecimals(tickSize?: number | null): number {
-  if (!tickSize) return 5;
+  if (!tickSize || !Number.isFinite(tickSize) || tickSize <= 0) return 5;
+  if (tickSize >= 1) return 2;
+  const expStr = tickSize.toExponential();
+  if (expStr.includes("e-")) {
+    const [mantissa = "1", expPart = "0"] = expStr.split("e-");
+    const exp = parseInt(expPart, 10);
+    const frac = mantissa.includes(".") ? mantissa.split(".")[1]!.length : 0;
+    return Math.min(8, Math.max(2, exp + frac));
+  }
   const s = String(tickSize);
   const dot = s.indexOf(".");
-  return dot >= 0 ? s.length - dot - 1 : 2;
+  return dot >= 0 ? Math.min(8, Math.max(2, s.length - dot - 1)) : 2;
 }
+function _resolveDecimals(symbolName: string, storeSymbols: Symbol[]): number {
+  const cached = _symbolDecimals.get(symbolName);
+  if (cached !== undefined) return cached;
+  const sym = storeSymbols.find((s) => s.name === symbolName);
+  if (sym) {
+    const d = _pipDecimals(sym.tickSize);
+    _symbolDecimals.set(symbolName, d);
+    return d;
+  }
+  const demo = getDemoSymbol(symbolName);
+  if (demo) {
+    const d = typeof demo.precision === "number" ? demo.precision : _pipDecimals(demo.tickSize);
+    _symbolDecimals.set(symbolName, d);
+    return d;
+  }
+  return 5;
+}
+subscribeSymbolsChanged(() => {
+  _symbolDecimals.clear();
+  void useTradingStore.getState().loadSymbols();
+});
 
 interface TradingState {
   activeAccountId: string | null;
@@ -323,13 +381,38 @@ interface TradingState {
   ) => void;
 }
 
+function ensureDynamicSymbolRegistered(symbolName: string): string {
+  const clean = (symbolName || "").trim().toUpperCase();
+  if (!clean) return "NVDA";
+  if (!getDemoSymbol(clean)) {
+    const isPerp = clean.endsWith(".P");
+    const isCryptoLike =
+      isPerp ||
+      clean === "BTC.D" ||
+      (/^[A-Z0-9]{2,10}(USDT|USDC|USD|EUR)$/.test(clean) &&
+        !["EURUSD", "GBPUSD", "USDJPY", "EURCHF", "XAUUSD", "XAUEUR", "XAGUSD", "XAGEUR"].includes(clean));
+    registerDynamicSymbol({
+      name: clean,
+      displayName: clean,
+      category: isPerp ? "FUTURES" : isCryptoLike ? "CRYPTO" : "STOCKS",
+      isPerpetual: isPerp,
+      tickSize: 0.01,
+    });
+  }
+  return clean;
+}
+
+const INITIAL_SELECTED_SYMBOL = ensureDynamicSymbolRegistered(
+  localStorage.getItem("oc_selected_symbol") || "NVDA",
+);
+
 export const useTradingStore = create<TradingState>((set, get) => ({
   activeAccountId: localStorage.getItem("active_account"),
   accounts: [],
   positions: [],
   orders: [],
   symbols: [],
-  selectedSymbol: "BTCUSD",
+  selectedSymbol: INITIAL_SELECTED_SYMBOL,
   ticks: {},
   liveTicks: {},
   liveCandleUpdates: {},
@@ -341,7 +424,7 @@ export const useTradingStore = create<TradingState>((set, get) => ({
   replaySessionDate: null,
 
   setActiveAccount: (id) => {
-    localStorage.setItem("active_account", id);
+    safeStorageSet("active_account", id);
     set({ activeAccountId: id });
   },
 
@@ -403,11 +486,7 @@ export const useTradingStore = create<TradingState>((set, get) => ({
         return;
     }
     // 3. Resolve symbol-correct decimal precision (cached after first hit)
-    if (!_symbolDecimals.has(symbolName)) {
-      const sym = get().symbols.find((s) => s.name === symbolName);
-      if (sym) _symbolDecimals.set(symbolName, _pipDecimals(sym.tickSize));
-    }
-    const decimals = _symbolDecimals.get(symbolName) ?? 5;
+    const decimals = _resolveDecimals(symbolName, get().symbols);
     _pendingTicks.set(symbolName, {
       bid,
       ask,
@@ -441,11 +520,7 @@ export const useTradingStore = create<TradingState>((set, get) => ({
       )
         return;
     }
-    if (!_symbolDecimals.has(symbolName)) {
-      const sym = get().symbols.find((s) => s.name === symbolName);
-      if (sym) _symbolDecimals.set(symbolName, _pipDecimals(sym.tickSize));
-    }
-    const decimals = _symbolDecimals.get(symbolName) ?? 5;
+    const decimals = _resolveDecimals(symbolName, get().symbols);
     _pendingLiveTicks.set(symbolName, {
       bid,
       ask,
@@ -470,12 +545,14 @@ export const useTradingStore = create<TradingState>((set, get) => ({
     }));
   },
 
-  setSelectedSymbol: (symbol) =>
+  setSelectedSymbol: (symbol) => {
+    safeStorageSet("oc_selected_symbol", symbol);
     set((state) =>
       state.selectedSymbol === symbol
         ? { selectedSymbol: symbol }
         : { selectedSymbol: symbol, liveCandleUpdates: {} },
-    ),
+    );
+  },
   setPositions: (positions) => set({ positions }),
   setOrders: (orders) => set({ orders }),
   setReplaySessionDate: (date) => set({ replaySessionDate: date }),

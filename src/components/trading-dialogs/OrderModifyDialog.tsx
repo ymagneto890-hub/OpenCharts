@@ -5,6 +5,7 @@ import { cn, formatNumber } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { X, SlidersHorizontal } from "lucide-react";
 import { useInstrumentLabels } from "../../hooks/useInstrumentLabels.ts";
+import { getPipDigits } from "../../pages/trading/utils.ts";
 
 interface OrderModifyDialogProps {
   order: {
@@ -44,38 +45,64 @@ export function OrderModifyDialog({ order, onClose, onSaved, tick }: OrderModify
       setTp(order.takeProfit != null ? String(order.takeProfit) : "");
       setSl(order.stopLoss != null ? String(order.stopLoss) : "");
     }
-  }, [order]);
+  }, [order?.id, order?.price, order?.stopPrice, order?.quantity, order?.takeProfit, order?.stopLoss]);
 
   if (!order) return null;
 
+  const digits = getPipDigits(order.symbolName);
+  const priceStep = (10 ** -digits).toFixed(digits);
+  const baseAsset = order.symbolName.split("/")[0] || unitLabelCap;
+
   const handleSave = async () => {
+    const currentPrice = order.type === "STOP" ? order.stopPrice : order.price;
+    const newPrice = parseFloat(price);
+    if ((price !== "" || currentPrice != null) && (!Number.isFinite(newPrice) || newPrice <= 0)) {
+      toast.warning("Invalid Price", "Enter a valid positive order price");
+      return;
+    }
+    const newQty = parseFloat(quantity);
+    if (!Number.isFinite(newQty) || newQty <= 0) {
+      toast.warning("Invalid Quantity", "Enter a valid positive order quantity");
+      return;
+    }
+    const newTp = tp !== "" ? parseFloat(tp) : null;
+    if (tp !== "" && (newTp === null || !Number.isFinite(newTp) || newTp <= 0)) {
+      toast.warning("Invalid Level", "Take Profit must be a valid positive price");
+      return;
+    }
+    const newSl = sl !== "" ? parseFloat(sl) : null;
+    if (sl !== "" && (newSl === null || !Number.isFinite(newSl) || newSl <= 0)) {
+      toast.warning("Invalid Level", "Stop Loss must be a valid positive price");
+      return;
+    }
+
+    const modifications: {
+      price?: number;
+      quantity?: number;
+      takeProfit?: number | null;
+      stopLoss?: number | null;
+    } = {};
+    if (price !== "" && Number.isFinite(newPrice) && newPrice > 0 && newPrice !== currentPrice) {
+      if (order.type === "STOP") {
+        (modifications as Record<string, unknown>).stopPrice = newPrice;
+        modifications.price = newPrice;
+      } else {
+        modifications.price = newPrice;
+      }
+    }
+    if (newQty !== order.quantity) modifications.quantity = newQty;
+    if (tp !== "" && newTp !== order.takeProfit) modifications.takeProfit = newTp;
+    if (sl !== "" && newSl !== order.stopLoss) modifications.stopLoss = newSl;
+    if (tp === "" && order.takeProfit != null) modifications.takeProfit = null;
+    if (sl === "" && order.stopLoss != null) modifications.stopLoss = null;
+
+    if (Object.keys(modifications).length === 0) {
+      toast.info("No Changes", "No modifications to apply");
+      return;
+    }
+
     setSaving(true);
     try {
-      const modifications: {
-        price?: number;
-        quantity?: number;
-        takeProfit?: number | null;
-        stopLoss?: number | null;
-      } = {};
-      const newPrice = parseFloat(price);
-      const newQty = parseFloat(quantity);
-      const newTp = tp ? parseFloat(tp) : null;
-      const newSl = sl ? parseFloat(sl) : null;
-
-      if (!isNaN(newPrice) && newPrice > 0) modifications.price = newPrice;
-      if (!isNaN(newQty) && newQty > 0 && newQty !== order.quantity)
-        modifications.quantity = newQty;
-      if (tp !== "" && newTp !== order.takeProfit) modifications.takeProfit = newTp;
-      if (sl !== "" && newSl !== order.stopLoss) modifications.stopLoss = newSl;
-      if (tp === "" && order.takeProfit != null) modifications.takeProfit = null;
-      if (sl === "" && order.stopLoss != null) modifications.stopLoss = null;
-
-      if (Object.keys(modifications).length === 0) {
-        toast.info("No Changes", "No modifications to apply");
-        setSaving(false);
-        return;
-      }
-
       await api.modifyOrder(order.id, modifications);
       toast.success("Order Modified", "Pending order has been updated");
       onSaved();
@@ -97,7 +124,12 @@ export function OrderModifyDialog({ order, onClose, onSaved, tick }: OrderModify
   return (
     <>
       <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onClose();
+        }}
+      >
         <div className="w-full max-w-sm bg-card border border-border rounded-xl shadow-2xl overflow-hidden">
           <div
             className={cn(
@@ -124,20 +156,20 @@ export function OrderModifyDialog({ order, onClose, onSaved, tick }: OrderModify
                 value={price}
                 onChange={(e) => setPrice(e.target.value)}
                 className="w-full mt-1 text-sm font-mono"
-                step="0.00001"
+                step={priceStep}
               />
             </div>
             <div>
               <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-                Quantity ({unitLabelCap})
+                Quantity ({baseAsset} Units)
               </label>
               <input
                 type="number"
                 value={quantity}
                 onChange={(e) => setQuantity(e.target.value)}
                 className="w-full mt-1 text-sm font-mono"
-                step={isFutures ? "1" : "0.01"}
-                min={isFutures ? "1" : "0.01"}
+                step={isFutures ? "1" : "0.001"}
+                min={isFutures ? "1" : "0.0001"}
               />
             </div>
             <div className="grid grid-cols-2 gap-2">
@@ -150,7 +182,7 @@ export function OrderModifyDialog({ order, onClose, onSaved, tick }: OrderModify
                   value={tp}
                   onChange={(e) => setTp(e.target.value)}
                   className="w-full mt-1 text-sm font-mono"
-                  step="0.00001"
+                  step={priceStep}
                 />
               </div>
               <div>
@@ -162,7 +194,7 @@ export function OrderModifyDialog({ order, onClose, onSaved, tick }: OrderModify
                   value={sl}
                   onChange={(e) => setSl(e.target.value)}
                   className="w-full mt-1 text-sm font-mono"
-                  step="0.00001"
+                  step={priceStep}
                 />
               </div>
             </div>
@@ -170,10 +202,10 @@ export function OrderModifyDialog({ order, onClose, onSaved, tick }: OrderModify
             {tick && (
               <div className="text-[10px] text-muted-foreground flex gap-3">
                 <span>
-                  Bid: <span className="font-mono text-sell">{formatNumber(tick.bid, 5)}</span>
+                  Bid: <span className="font-mono text-sell">{formatNumber(tick.bid, digits)}</span>
                 </span>
                 <span>
-                  Ask: <span className="font-mono text-buy">{formatNumber(tick.ask, 5)}</span>
+                  Ask: <span className="font-mono text-buy">{formatNumber(tick.ask, digits)}</span>
                 </span>
               </div>
             )}

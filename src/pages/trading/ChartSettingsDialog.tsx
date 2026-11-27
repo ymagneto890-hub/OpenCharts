@@ -48,8 +48,9 @@ const RESET_BY_TAB: Partial<Record<TabId, Partial<ChartPreferences>>> = {
     showWicks: true,
     showCandleBorders: true,
     showVolume: true,
+    showVolumeMa: true,
     showGrid: true,
-    showWatermark: true,
+    showWatermark: false,
     showCountdown: true,
     showOhlcLegend: true,
   },
@@ -68,12 +69,12 @@ const RESET_BY_TAB: Partial<Record<TabId, Partial<ChartPreferences>>> = {
     colorTpLine: "",
     colorSlLine: "",
   },
-  trading: { showBidLine: true, showAskLine: true, overlayPositionsOnChart: true },
+  trading: { showBidLine: false, showAskLine: false, overlayPositionsOnChart: true },
   challenge: {
-    challengeOverlay: true,
-    challengeDailyLossLine: true,
-    challengeMaxDrawdownLine: true,
-    challengeProfitTargetLine: true,
+    challengeOverlay: false,
+    challengeDailyLossLine: false,
+    challengeMaxDrawdownLine: false,
+    challengeProfitTargetLine: false,
   },
 };
 
@@ -223,14 +224,15 @@ function AppearanceTab({ prefs }: { prefs: ChartPreferences }) {
         onChange={(v) => set({ showVolume: v })}
       />
       <ToggleRow
+        label="Media de volumen (MA 20)"
+        hint="Media móvil simple de 20 periodos sobre el volumen"
+        checked={prefs.showVolumeMa ?? true}
+        onChange={(v) => set({ showVolumeMa: v })}
+      />
+      <ToggleRow
         label="Grid lines"
         checked={prefs.showGrid}
         onChange={(v) => set({ showGrid: v })}
-      />
-      <ToggleRow
-        label="Symbol watermark"
-        checked={prefs.showWatermark}
-        onChange={(v) => set({ showWatermark: v })}
       />
       <ToggleRow
         label="Candle countdown"

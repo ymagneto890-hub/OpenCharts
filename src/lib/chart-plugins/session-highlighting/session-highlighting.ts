@@ -65,17 +65,27 @@ class SessionHighlightingPaneView implements ISeriesPrimitivePaneView {
 
   update() {
     const timeScale = this._source.chart.timeScale();
-    this._data.data = this._source._backgroundColors.map((d) => {
-      return {
-        x: timeScale.timeToCoordinate(d.time) ?? -100,
-        color: d.color,
-      };
-    });
-    if (this._data.data.length > 1) {
-      this._data.barWidth = this._data.data[1]!.x - this._data.data[0]!.x;
-    } else {
-      this._data.barWidth = 6;
+    const coords = this._source._backgroundColors.map((d) => ({
+      coord: timeScale.timeToCoordinate(d.time),
+      color: d.color,
+    }));
+    this._data.data = coords.map((c) => ({
+      x: c.coord ?? -100,
+      color: c.color,
+    }));
+    let computedBarWidth = 0;
+    for (let i = 1; i < coords.length; i++) {
+      const prev = coords[i - 1]!.coord;
+      const curr = coords[i]!.coord;
+      if (prev !== null && curr !== null && curr > prev) {
+        computedBarWidth = curr - prev;
+        break;
+      }
     }
+    if (!(computedBarWidth > 0)) {
+      computedBarWidth = timeScale.options().barSpacing || 6;
+    }
+    this._data.barWidth = computedBarWidth;
   }
 
   renderer() {

@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { formatCurrency } from "@/lib/utils";
-import {} from "lucide-react";
 
 // ── Trade Calculator (#57) ──────────────────────────────────
 
@@ -22,7 +21,7 @@ export function TradeCalculator({ tick: _tick, symbolInfo }: TradeCalcProps) {
   const balance = parseFloat(accountBalance) || 0;
   const risk = parseFloat(riskPercent) || 0;
   const slDistance = parseFloat(slPips) || 0;
-  const pipValue = (symbolInfo?.contractSize || 100000) * 0.0001;
+  const pipValue = (symbolInfo?.contractSize || 100000) * (symbolInfo?.pip || 0.0001);
   const riskAmount = balance * (risk / 100);
   const recommendedLots = slDistance > 0 ? riskAmount / (slDistance * pipValue) : 0;
 

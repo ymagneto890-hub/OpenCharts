@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { formatNumber, cn } from "../../lib/utils.ts";
+import { getPipDigits } from "./utils.ts";
 
 export function DOMPanel({
   symbol,
@@ -8,6 +9,7 @@ export function DOMPanel({
   symbol: string;
   tick?: { bid: number; ask: number };
 }) {
+  const pipDigits = useMemo(() => getPipDigits(undefined, symbol), [symbol]);
   const levels = useMemo(() => {
     if (!tick) return [];
     const mid = (tick.bid + tick.ask) / 2;
@@ -51,25 +53,25 @@ export function DOMPanel({
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex items-center justify-between px-3 py-2 border-b border-border bg-secondary">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-secondary">
+        <h3 className="text-sm font-bold uppercase tracking-wider text-muted-foreground">
           Depth of Market
         </h3>
-        <span className="text-xs font-semibold">{symbol}</span>
+        <span className="text-sm font-bold">{symbol}</span>
       </div>
       <div className="flex-1 overflow-y-auto">
-        <table className="w-full text-[11px]">
+        <table className="w-full text-sm">
           <thead className="sticky top-0 bg-card z-10">
             <tr>
-              <th className="text-right w-[30%]">Bid Size</th>
-              <th className="text-center w-[40%]">Price</th>
-              <th className="text-left w-[30%]">Ask Size</th>
+              <th className="text-right w-[30%] py-2.5">Bid Size</th>
+              <th className="text-center w-[40%] py-2.5">Price</th>
+              <th className="text-left w-[30%] py-2.5">Ask Size</th>
             </tr>
           </thead>
           <tbody>
             {levels.map((l, i) => (
               <tr key={i} className="relative hover:bg-secondary/50">
-                <td className="text-right relative">
+                <td className="text-right relative py-2 font-mono font-semibold">
                   {l.bidSize > 0 && (
                     <>
                       <div
@@ -82,13 +84,13 @@ export function DOMPanel({
                 </td>
                 <td
                   className={cn(
-                    "text-center font-mono",
+                    "text-center font-mono font-bold py-2",
                     l.type === "ask" ? "text-sell" : "text-buy",
                   )}
                 >
-                  {formatNumber(l.price, 5)}
+                  {formatNumber(l.price, pipDigits)}
                 </td>
-                <td className="text-left relative">
+                <td className="text-left relative py-2 font-mono font-semibold">
                   {l.askSize > 0 && (
                     <>
                       <div

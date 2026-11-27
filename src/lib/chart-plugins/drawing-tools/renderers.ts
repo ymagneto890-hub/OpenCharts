@@ -80,7 +80,7 @@ function drawHandle(scope: BitmapCoordinatesRenderingScope, p: BPt, color: strin
 export function renderEntry(
   scope: BitmapCoordinatesRenderingScope,
   e: ResolvedEntry,
-  info: DrawCtxInfo,
+  _info: DrawCtxInfo,
 ): void {
   switch (e.d.type) {
     case "trendline":
@@ -96,7 +96,7 @@ export function renderEntry(
       renderFibonacci(scope, e);
       break;
     case "position":
-      renderPosition(scope, e, info);
+      renderPosition(scope, e);
       break;
     case "vertical":
       renderVertical(scope, e);
@@ -306,7 +306,6 @@ const POS_RED = "#f23645";
 function renderPosition(
   scope: BitmapCoordinatesRenderingScope,
   e: ResolvedEntry,
-  info: DrawCtxInfo,
 ): void {
   const { x1, x2, y1, yStop, yTarget } = e;
   if (x1 === null || x2 === null || y1 === null || yStop == null || yTarget == null) return;
@@ -316,10 +315,14 @@ function renderPosition(
   posZone(scope, xa, xb, y1, yStop, POS_RED);
   strokeLine(scope, toBitmap(scope, xa, y1), toBitmap(scope, xb, y1), "#d1d4dc", 1.5, [5, 3]);
   if (showHandles(e)) renderPositionHandles(scope, e, xa, xb, y1);
-  const lines = positionReadout(e.d, info);
+  const lines = positionReadout(e.d);
   if (lines.length > 0) {
     const at = toBitmap(scope, xb + 8, y1);
-    drawLabelBox(scope, at.x, at.y, lines, e.d.color);
+    drawLabelBox(scope, at.x, at.y, lines, e.d.color, {
+      fontSizePx: 16,
+      bold: true,
+      centerY: true,
+    });
   }
 }
 
@@ -357,29 +360,36 @@ function renderPositionHandles(
   drawHandle(scope, toBitmap(scope, xb, y1), e.d.color);
 }
 
-function positionReadout(d: DrawingLine, info: DrawCtxInfo): string[] {
+export function positionReadout(d: DrawingLine): string[] {
   if (d.stopPrice == null || d.targetPrice == null) return [];
   const reward = Math.abs(d.targetPrice - d.price);
   const risk = Math.abs(d.price - d.stopPrice);
   const rr = risk > 0 ? reward / risk : 0;
-  const side = d.side === "short" ? "Short" : "Long";
-  const lines = [
-    `${side}  RR ${rr.toFixed(2)}`,
-    `T ${info.priceFormat(d.targetPrice)}  ${signPct(d.targetPrice, d.price)}`,
-    `S ${info.priceFormat(d.stopPrice)}  ${signPct(d.stopPrice, d.price)}`,
-  ];
-  if (info.accountEquity > 0 && risk > 0) {
-    const riskAmt = (info.accountEquity * (d.riskPct ?? 1)) / 100;
-    const qty = riskAmt / risk;
-    lines.push(`Risk $${riskAmt.toFixed(0)} · Qty ${qty >= 100 ? qty.toFixed(0) : qty.toFixed(2)}`);
-  }
-  return lines;
+  return [`R:R 1 : ${rr.toFixed(2)}`];
 }
 
-function signPct(v: number, entry: number): string {
-  if (entry === 0) return "0%";
-  const p = ((v - entry) / entry) * 100;
-  return `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`;
+function roundedRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+): void {
+  if (typeof ctx.roundRect === "function") {
+    ctx.roundRect(x, y, w, h, r);
+    return;
+  }
+  const radius = Math.min(r, w / 2, h / 2);
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + w - radius, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+  ctx.lineTo(x + w, y + h - radius);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+  ctx.lineTo(x + radius, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
 }
 
 // Reusable dark readout box (position stats, text labels).
@@ -389,51 +399,146 @@ function drawLabelBox(
   y: number,
   lines: string[],
   borderColor: string,
+  opts?: { fontSizePx?: number; bold?: boolean; centerY?: boolean },
 ): void {
   const ctx = scope.context;
   const hpr = scope.horizontalPixelRatio;
   const vpr = scope.verticalPixelRatio;
+  const fontSize = opts?.fontSizePx ?? 10;
+  const isBold = Boolean(opts?.bold);
   ctx.save();
-  ctx.font = `${Math.round(10 * vpr)}px monospace`;
-  const lineH = 13 * vpr;
-  const pad = 6 * hpr;
-  const width = Math.max(...lines.map((l) => ctx.measureText(l).width)) + pad * 2;
-  const height = lines.length * lineH + pad;
-  const bx = Math.min(x, scope.bitmapSize.width - width);
-  const by = Math.min(Math.max(y, 0), scope.bitmapSize.height - height);
-  ctx.fillStyle = "rgba(20, 24, 35, 0.92)";
+  ctx.font = `${isBold ? "700 " : ""}${Math.round(fontSize * vpr)}px monospace`;
+  const lineH = Math.round(fontSize * 1.35 * vpr);
+  const padX = Math.round((opts?.fontSizePx ? 10 : 6) * hpr);
+  const padY = Math.round((opts?.fontSizePx ? 6 : 3) * vpr);
+  const width = Math.max(...lines.map((l) => ctx.measureText(l).width)) + padX * 2;
+  const height = lines.length * lineH + padY * 2;
+  const rawY = opts?.centerY ? y - height / 2 : y;
+  const bx = Math.max(0, Math.min(x, scope.bitmapSize.width - width));
+  const by = Math.max(0, Math.min(rawY, scope.bitmapSize.height - height));
+  ctx.fillStyle = "rgba(20, 24, 35, 0.94)";
   ctx.beginPath();
-  ctx.roundRect(bx, by, width, height, 4 * hpr);
+  roundedRectPath(ctx, bx, by, width, height, (isBold ? 6 : 4) * hpr);
   ctx.fill();
   ctx.strokeStyle = borderColor;
-  ctx.lineWidth = 1;
+  ctx.lineWidth = (isBold ? 1.5 : 1) * hpr;
   ctx.stroke();
-  ctx.fillStyle = "#e0e3ea";
-  ctx.textBaseline = "top";
-  lines.forEach((l, i) => ctx.fillText(l, bx + pad, by + pad / 2 + i * lineH));
+  ctx.fillStyle = isBold ? "#ffffff" : "#e0e3ea";
+  ctx.textBaseline = "middle";
+  lines.forEach((l, i) => ctx.fillText(l, bx + padX, by + padY + (i + 0.5) * lineH));
   ctx.restore();
+}
+
+function renderMeasureTool(
+  scope: BitmapCoordinatesRenderingScope,
+  e: ResolvedEntry,
+  a: BPt,
+  b: BPt,
+): void {
+  const isBull = b.y <= a.y;
+  const color = isBull ? "#00E676" : "#FF3B56";
+  const hpr = scope.horizontalPixelRatio;
+  const vpr = scope.verticalPixelRatio;
+
+  // Ensure a comfortable minimum width (70px) so vertical measurements show a clean bracket
+  const minW = 70 * hpr;
+  const rawW = Math.abs(b.x - a.x);
+  let left = Math.min(a.x, b.x);
+  let right = Math.max(a.x, b.x);
+  if (rawW < minW) {
+    const midX = (a.x + b.x) / 2;
+    left = midX - minW / 2;
+    right = midX + minW / 2;
+  }
+  const top = Math.min(a.y, b.y);
+  const bottom = Math.max(a.y, b.y);
+  const width = Math.max(1, right - left);
+  const height = Math.max(2 * vpr, bottom - top);
+  const centerX = (left + right) / 2;
+
+  const ctx = scope.context;
+  ctx.save();
+  // 1. Vivid shaded measurement zone
+  ctx.fillStyle = isBull ? "rgba(0, 230, 118, 0.22)" : "rgba(255, 59, 86, 0.22)";
+  ctx.fillRect(left, top, width, height);
+
+  // 2. High-contrast dashed boundary rectangle
+  ctx.strokeStyle = isBull ? "rgba(0, 230, 118, 0.88)" : "rgba(255, 59, 86, 0.88)";
+  ctx.lineWidth = 1.5 * hpr;
+  ctx.setLineDash([4 * hpr, 3 * hpr]);
+  ctx.strokeRect(left, top, width, height);
+  ctx.restore();
+
+  // 3. Strong horizontal bracket caps at start and end prices
+  strokeLine(scope, { x: left, y: a.y }, { x: right, y: a.y }, color, 2.2);
+  strokeLine(scope, { x: left, y: b.y }, { x: right, y: b.y }, color, 2.2);
+
+  // 4. Central vertical connecting line + direction arrowhead
+  strokeLine(
+    scope,
+    { x: centerX, y: a.y },
+    { x: centerX, y: b.y },
+    color,
+    2,
+    [4, 3],
+  );
+  if (Math.abs(b.y - a.y) >= 14 * vpr) {
+    drawArrowhead(scope, { x: centerX, y: a.y }, { x: centerX, y: b.y }, color);
+  }
+
+  // 5. Handles at the measurement points
+  drawHandle(scope, { x: centerX, y: a.y }, color);
+  drawHandle(scope, { x: centerX, y: b.y }, color);
+
+  // 6. High-contrast stats badge (delta price, % change, candles count)
+  if (e.stats && e.stats.length > 0) {
+    drawStatsBox(
+      scope,
+      { x: right, y: b.y },
+      e.stats,
+      { color },
+      { x: right, y: a.y },
+      true,
+    );
+  }
 }
 
 function renderTrendline(scope: BitmapCoordinatesRenderingScope, e: ResolvedEntry): void {
   if (e.x1 === null || e.y1 === null || e.x2 === null || e.y2 === null) return;
   const a = toBitmap(scope, e.x1, e.y1);
   const b = toBitmap(scope, e.x2, e.y2);
+
+  if (e.d.id === "measure") {
+    renderMeasureTool(scope, e, a, b);
+    return;
+  }
+
   const seg = e.seg ?? { x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2 };
   const sa = toBitmap(scope, seg.x1, seg.y1);
   const sb = toBitmap(scope, seg.x2, seg.y2);
-  strokeLine(scope, sa, sb, e.d.color, e.d.width ?? LINE_WIDTH, dashFor(e.d.lineStyle));
+
+  strokeLine(
+    scope,
+    sa,
+    sb,
+    e.d.color,
+    e.d.width ?? LINE_WIDTH,
+    dashFor(e.d.lineStyle),
+  );
   if (e.d.arrowEnd) drawArrowhead(scope, sa, sb, e.d.color);
   if (e.d.arrowStart) drawArrowhead(scope, sb, sa, e.d.color);
-  if (showHandles(e)) {
+  if (showHandles(e) || e.state === "preview") {
     drawHandle(scope, a, e.d.color);
     drawHandle(scope, b, e.d.color);
-    drawMidpointHandle(scope, a, b, e.d.color);
+    if (showHandles(e)) drawMidpointHandle(scope, a, b, e.d.color);
   }
   if (e.d.alertEnabled) {
     const right = a.x >= b.x ? a : b;
     drawAlertBadge(scope, right.x, right.y);
   }
-  if (e.stats && e.stats.length > 0) drawStatsBox(scope, b, e.stats, e.d, a);
+  if (e.stats && e.stats.length > 0) {
+    drawStatsBox(scope, b, e.stats, e.d, a, false);
+  }
 }
 
 // Smaller square handle at the anchor midpoint — grabbing it body-drags the
@@ -466,10 +571,76 @@ function drawStatsBox(
   stats: string[],
   d: { color: string },
   from: BPt,
+  isMeasure = false,
 ): void {
   const ctx = scope.context;
   const hpr = scope.horizontalPixelRatio;
   const vpr = scope.verticalPixelRatio;
+
+  if (isMeasure) {
+    const headline = stats[0] ?? "";
+    const subline = stats[1] ?? "";
+    const isBull = from.y >= at.y;
+    const accent = isBull ? "#00E676" : "#FF3B56";
+    const pctColor = isBull ? "#4ADE80" : "#FF6B81";
+
+    ctx.save();
+    const headFont = `700 ${Math.round(13.5 * vpr)}px 'Inter', -apple-system, BlinkMacSystemFont, 'JetBrains Mono', monospace`;
+    const subFont = `600 ${Math.round(11 * vpr)}px 'Inter', -apple-system, BlinkMacSystemFont, monospace`;
+    const padX = 10 * hpr;
+    const padY = 8 * vpr;
+    const lineH1 = 18 * vpr;
+    const lineH2 = 15 * vpr;
+
+    ctx.font = headFont;
+    const w1 = ctx.measureText(headline).width;
+    ctx.font = subFont;
+    const w2 = subline ? ctx.measureText(subline).width : 0;
+
+    const width = Math.max(w1, w2) + padX * 2;
+    const height = (subline ? lineH1 + lineH2 : lineH1) + padY * 2 - 2 * vpr;
+    const x = Math.min(Math.max(4 * hpr, at.x + 12 * hpr), scope.bitmapSize.width - width - 4 * hpr);
+    const y = Math.min(Math.max(4 * vpr, at.y + 10 * vpr), scope.bitmapSize.height - height - 4 * vpr);
+
+    // Rich dark high-contrast card with colored tint & vivid 2px border
+    ctx.fillStyle = "rgba(10, 14, 22, 0.96)";
+    ctx.beginPath();
+    roundedRectPath(ctx, x, y, width, height, 6 * hpr);
+    ctx.fill();
+
+    ctx.fillStyle = isBull ? "rgba(0, 230, 118, 0.14)" : "rgba(255, 59, 86, 0.14)";
+    ctx.fill();
+
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 2 * hpr;
+    ctx.stroke();
+
+    // Render headline: price delta in pure crisp white, percentage in vivid neon green/red
+    ctx.font = headFont;
+    ctx.textBaseline = "top";
+    const pctSepIdx = headline.indexOf(" (");
+    if (pctSepIdx !== -1) {
+      const pricePart = headline.slice(0, pctSepIdx);
+      const pctPart = headline.slice(pctSepIdx);
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillText(pricePart, x + padX, y + padY);
+      const priceW = ctx.measureText(pricePart).width;
+      ctx.fillStyle = pctColor;
+      ctx.fillText(pctPart, x + padX + priceW, y + padY);
+    } else {
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillText(headline, x + padX, y + padY);
+    }
+
+    if (subline) {
+      ctx.font = subFont;
+      ctx.fillStyle = "#CBD5E1";
+      ctx.fillText(subline, x + padX, y + padY + lineH1);
+    }
+    ctx.restore();
+    return;
+  }
+
   const angleDeg = Math.round((Math.atan2(from.y - at.y, at.x - from.x) * 180) / Math.PI);
   const lines = [...stats, `${angleDeg}°`];
   ctx.save();
@@ -478,11 +649,11 @@ function drawStatsBox(
   const pad = 6 * hpr;
   const width = Math.max(...lines.map((l) => ctx.measureText(l).width)) + pad * 2;
   const height = lines.length * lineH + pad;
-  const x = Math.min(at.x + 10 * hpr, scope.bitmapSize.width - width);
-  const y = Math.min(at.y + 10 * vpr, scope.bitmapSize.height - height);
+  const x = Math.max(0, Math.min(at.x + 10 * hpr, scope.bitmapSize.width - width));
+  const y = Math.max(0, Math.min(at.y + 10 * vpr, scope.bitmapSize.height - height));
   ctx.fillStyle = "rgba(20, 24, 35, 0.92)";
   ctx.beginPath();
-  ctx.roundRect(x, y, width, height, 4 * hpr);
+  roundedRectPath(ctx, x, y, width, height, 4 * hpr);
   ctx.fill();
   ctx.strokeStyle = d.color;
   ctx.lineWidth = 1;

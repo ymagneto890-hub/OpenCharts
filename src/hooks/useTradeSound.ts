@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const STORAGE_KEY = "tradeSoundMuted";
 
@@ -10,8 +10,21 @@ const STORAGE_KEY = "tradeSoundMuted";
  * a short, satisfying "cha-ching" tone (no external audio file needed).
  */
 export function useTradeSound() {
-  const [muted, setMuted] = useState(() => localStorage.getItem(STORAGE_KEY) === "true");
+  const [muted, setMuted] = useState(() => {
+    try {
+      return localStorage.getItem(STORAGE_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
   const ctxRef = useRef<AudioContext | null>(null);
+
+  useEffect(() => {
+    return () => {
+      ctxRef.current?.close().catch(() => {});
+      ctxRef.current = null;
+    };
+  }, []);
 
   const getCtx = useCallback(() => {
     if (!ctxRef.current || ctxRef.current.state === "closed") {
@@ -25,7 +38,7 @@ export function useTradeSound() {
     if (muted) return;
     try {
       const ctx = getCtx();
-      if (ctx.state === "suspended") ctx.resume();
+      if (ctx.state === "suspended") void ctx.resume().catch(() => {});
       const now = ctx.currentTime;
 
       // --- Tone 1: short high blip ---
@@ -59,7 +72,11 @@ export function useTradeSound() {
   const toggleMute = useCallback(() => {
     setMuted((prev) => {
       const next = !prev;
-      localStorage.setItem(STORAGE_KEY, String(next));
+      try {
+        localStorage.setItem(STORAGE_KEY, String(next));
+      } catch {
+        // ignore storage errors
+      }
       return next;
     });
   }, []);

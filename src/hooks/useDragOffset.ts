@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 
 /**
  * Drag-to-move for floating dialogs/panels (TradingView-style).
@@ -17,29 +17,60 @@ export function useDragOffset(): {
   const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(
     null,
   );
+  const cleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      cleanupRef.current?.();
+      cleanupRef.current = null;
+    };
+  }, []);
 
   const onPointerDown = useCallback(
     (e: PointerEvent<HTMLElement>) => {
       // Ignore drags starting on interactive elements inside the handle.
       if ((e.target as HTMLElement).closest("button, input, select, textarea, a")) return;
       e.preventDefault();
+      cleanupRef.current?.();
       dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: offset.x, baseY: offset.y };
+
+      let rafId: number | null = null;
+      let nextOffset = { x: offset.x, y: offset.y };
 
       const onMove = (ev: globalThis.PointerEvent) => {
         const drag = dragRef.current;
         if (!drag) return;
-        setOffset({
+        nextOffset = {
           x: drag.baseX + (ev.clientX - drag.startX),
           y: drag.baseY + (ev.clientY - drag.startY),
-        });
+        };
+        if (rafId === null) {
+          rafId = requestAnimationFrame(() => {
+            setOffset(nextOffset);
+            rafId = null;
+          });
+        }
       };
-      const onUp = () => {
+      const removeListeners = () => {
         dragRef.current = null;
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+        if (cleanupRef.current === removeListeners) cleanupRef.current = null;
       };
-      window.addEventListener("pointermove", onMove);
+      const onUp = () => {
+        const hadPendingRaf = rafId !== null;
+        removeListeners();
+        if (hadPendingRaf) setOffset(nextOffset);
+      };
+      cleanupRef.current = removeListeners;
+      window.addEventListener("pointermove", onMove, { passive: true });
       window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
     },
     [offset.x, offset.y],
   );

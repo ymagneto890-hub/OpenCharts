@@ -2,6 +2,7 @@ import { useState } from "react";
 import { cn, formatCurrency, formatNumber, formatDate } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { BookOpen, Star, Pencil, Trash2, Plus } from "lucide-react";
+import { getPipDigits } from "@/pages/trading/utils";
 
 const EMOTIONS = [
   "Calm",
@@ -110,9 +111,12 @@ export function TradeJournalPanel({
       data.accountId = accountId;
       data.symbolName = symbolName || undefined;
       data.side = side;
-      data.entryPrice = entryPrice ? parseFloat(entryPrice) : undefined;
-      data.exitPrice = exitPrice ? parseFloat(exitPrice) : undefined;
-      data.pnl = pnl ? parseFloat(pnl) : undefined;
+      const parsedEntry = entryPrice ? parseFloat(entryPrice) : NaN;
+      const parsedExit = exitPrice ? parseFloat(exitPrice) : NaN;
+      const parsedPnl = pnl ? parseFloat(pnl) : NaN;
+      data.entryPrice = Number.isFinite(parsedEntry) ? parsedEntry : undefined;
+      data.exitPrice = Number.isFinite(parsedExit) ? parsedExit : undefined;
+      data.pnl = Number.isFinite(parsedPnl) ? parsedPnl : undefined;
       onCreateEntry(data);
     }
     resetForm();
@@ -310,7 +314,7 @@ export function TradeJournalPanel({
                     )}
                     {entry.rating != null && entry.rating > 0 && (
                       <span className="text-yellow-400 text-[10px]">
-                        {"★".repeat(entry.rating)}
+                        {"★".repeat(Math.min(5, Math.max(0, Math.floor(entry.rating))))}
                       </span>
                     )}
                   </div>
@@ -329,9 +333,9 @@ export function TradeJournalPanel({
                     </button>
                   </div>
                 </div>
-                {entry.tags.length > 0 && (
+                {(entry.tags ?? []).length > 0 && (
                   <div className="flex gap-1 mb-1">
-                    {entry.tags.map((tag) => (
+                    {(entry.tags ?? []).map((tag) => (
                       <span
                         key={tag}
                         className="px-1 py-0.5 rounded bg-secondary text-[9px] text-muted-foreground"
@@ -344,13 +348,20 @@ export function TradeJournalPanel({
                 {entry.notes && (
                   <p className="text-[11px] text-foreground/80 leading-relaxed">{entry.notes}</p>
                 )}
-                <div className="flex items-center gap-3 mt-1 text-[10px] text-muted-foreground">
-                  {entry.entryPrice != null && (
-                    <span>Entry: {formatNumber(entry.entryPrice, 5)}</span>
-                  )}
-                  {entry.exitPrice != null && <span>Exit: {formatNumber(entry.exitPrice, 5)}</span>}
-                  <span>{formatDate(entry.createdAt)}</span>
-                </div>
+                {(() => {
+                  const digits = getPipDigits(undefined, entry.symbolName ?? undefined);
+                  return (
+                    <div className="flex items-center gap-3 mt-1 text-[10px] text-muted-foreground font-mono">
+                      {entry.entryPrice != null && (
+                        <span>Entry: {formatNumber(entry.entryPrice, digits)}</span>
+                      )}
+                      {entry.exitPrice != null && (
+                        <span>Exit: {formatNumber(entry.exitPrice, digits)}</span>
+                      )}
+                      <span className="font-sans">{formatDate(entry.createdAt)}</span>
+                    </div>
+                  );
+                })()}
               </div>
             ))}
           </div>

@@ -5,6 +5,7 @@ import type {
   DrawingType,
   MagnetMode,
 } from "../../../pages/trading/constants";
+import { generateId } from "../../utils";
 import { DrawingsPrimitive } from "./drawings-primitive";
 import { dist, type Pt, snapAngle } from "./geometry";
 import { hitTest } from "./hit-test";
@@ -81,7 +82,23 @@ function definedOnly<T extends object>(obj: T): Partial<T> {
 
 function isTextInputTarget(t: EventTarget | null): boolean {
   if (!(t instanceof HTMLElement)) return false;
-  return t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName);
+  if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+  if (t.tagName === "INPUT") {
+    const type = ((t as HTMLInputElement).type || "text").toLowerCase();
+    return [
+      "text",
+      "search",
+      "email",
+      "password",
+      "url",
+      "tel",
+      "number",
+      "date",
+      "time",
+      "datetime-local",
+    ].includes(type);
+  }
+  return false;
 }
 
 interface GroupMember {
@@ -132,6 +149,13 @@ export interface DrawingToolsManagerOptions {
  * phase so the chart never pans underneath a drag.
  */
 export class DrawingToolsManager {
+  /** Manager whose chart the pointer last entered/pressed (keyboard shortcut target). */
+  private static active: DrawingToolsManager | null = null;
+
+  private readonly handlePointerEnter = (): void => {
+    DrawingToolsManager.active = this;
+  };
+
   private readonly chart: IChartApi;
   private readonly series: ISeriesApi<SeriesType>;
   private readonly container: HTMLElement;
@@ -172,6 +196,8 @@ export class DrawingToolsManager {
     this.primitive.setAccountEquity(opts.accountEquity ?? 0);
     this.series.attachPrimitive(this.primitive);
     this.container.addEventListener("mousedown", this.handleMouseDown, true);
+    this.container.addEventListener("mouseenter", this.handlePointerEnter);
+    this.container.addEventListener("mousedown", this.handlePointerEnter, true);
     this.container.addEventListener("dblclick", this.handleDblClick);
     this.container.addEventListener("contextmenu", this.handleContextMenu);
     this.container.addEventListener("touchstart", this.handleTouchStart, {
@@ -189,6 +215,9 @@ export class DrawingToolsManager {
   destroy(): void {
     this.clearLongPress();
     this.container.removeEventListener("mousedown", this.handleMouseDown, true);
+    this.container.removeEventListener("mouseenter", this.handlePointerEnter);
+    this.container.removeEventListener("mousedown", this.handlePointerEnter, true);
+    if (DrawingToolsManager.active === this) DrawingToolsManager.active = null;
     this.container.removeEventListener("dblclick", this.handleDblClick);
     this.container.removeEventListener("contextmenu", this.handleContextMenu);
     this.container.removeEventListener("touchstart", this.handleTouchStart, true);
@@ -268,8 +297,18 @@ export class DrawingToolsManager {
     const x = clientX - rect.left;
     const y = clientY - rect.top;
     const timeScale = this.chart.timeScale();
-    const paneWidth = timeScale.width();
-    const paneHeight = rect.height - timeScale.height();
+    const tsWidth = timeScale.width();
+    const tsHeight = timeScale.height();
+    let priceScaleWidth = 0;
+    try {
+      priceScaleWidth = this.chart.priceScale("right").width();
+    } catch {
+      priceScaleWidth = 0;
+    }
+    // In multi-pane layout (RSI, Price, MACD), timeScale.visible is false on non-bottom panes,
+    // which makes timeScale.width() return 0 in lightweight-charts!
+    const paneWidth = tsWidth > 0 ? tsWidth : Math.max(0, rect.width - priceScaleWidth);
+    const paneHeight = rect.height - tsHeight;
     if (paneWidth <= 0 || x < 0 || y < 0 || x > paneWidth || y > paneHeight) return null;
     return { x, y };
   }
@@ -304,7 +343,7 @@ export class DrawingToolsManager {
       return this.makePosition(tool === "long-position" ? "long" : "short", p1, p2);
     }
     const base = {
-      id: crypto.randomUUID(),
+      id: generateId(),
       color: tool === "trendline" ? "#2196F3" : "#f0b90b",
       createdTf: this.timeframe,
     };
@@ -315,13 +354,56 @@ export class DrawingToolsManager {
     if (tool === "extended")
       return { ...two, type: "trendline", extendLeft: true, extendRight: true };
     if (tool === "measure")
-      return { ...two, type: "trendline", color: "#b2b5be", lineStyle: "dashed" };
+      return { ...two, id: "measure", type: "trendline", color: "#b2b5be", lineStyle: "dashed" };
     if (tool === "channel") {
       // Offset line defaults parallel and mirrored below so it's visible/draggable.
       return { ...two, type: "channel", time3: p1.time, price3: 2 * p1.price - p2.price };
     }
     if (tool === "text") return { ...two, type: "text", text: "Text" };
     return { ...two, type: tool as DrawingType };
+  }
+
+  /** 1-click Long/Short Risk-Reward box anchored on the clicked entry price (default 1:2 R:R). */
+  private makeDefaultPosition(side: "long" | "short", pt: DataPoint): DrawingLine {
+    const height = this.container.clientHeight || 400;
+    const topPrice = this.series.coordinateToPrice(0);
+    const botPrice = this.series.coordinateToPrice(height);
+    const visibleSpan =
+      topPrice !== null && botPrice !== null && Number.isFinite(topPrice) && Number.isFinite(botPrice)
+        ? Math.abs(topPrice - botPrice)
+        : 0;
+    const risk =
+      visibleSpan > 0
+        ? visibleSpan * 0.08
+        : Math.max(Math.abs(pt.price) * 0.01, 0.01);
+    const spanSec = Math.max(this.intervalSec, 60) * 18;
+    return {
+      id: generateId(),
+      type: "position",
+      side,
+      color: side === "long" ? "#089981" : "#f23645",
+      createdTf: this.timeframe,
+      price: pt.price,
+      time: pt.time,
+      time2: this.defaultPositionEndTime(pt, pt.time + spanSec),
+      targetPrice: side === "long" ? pt.price + 2 * risk : pt.price - 2 * risk,
+      stopPrice: side === "long" ? pt.price - risk : pt.price + risk,
+      riskPct: 1,
+    };
+  }
+
+  /** Right edge of a new position box: 18 *bars* wide on screen, whatever the data gaps. */
+  private defaultPositionEndTime(pt: DataPoint, fallback: number): number {
+    try {
+      const ctx = this.ctx();
+      const x1 = timeToX(ctx, pt.time);
+      const spacing = this.chart.timeScale().options?.()?.barSpacing ?? 0;
+      if (x1 === null || !(spacing > 0)) return fallback;
+      const t2 = xToTime(ctx, x1 + spacing * 18);
+      return t2 !== null && t2 > pt.time ? t2 : fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   // Position tool: entry = first anchor price; the drag's release price becomes
@@ -331,7 +413,7 @@ export class DrawingToolsManager {
     const entry = p1.price;
     const target = p2.price;
     return {
-      id: crypto.randomUUID(),
+      id: generateId(),
       type: "position",
       side,
       color: side === "long" ? "#089981" : "#f23645",
@@ -472,6 +554,8 @@ export class DrawingToolsManager {
 
   private handleKeyDown = (e: KeyboardEvent): void => {
     if (isTextInputTarget(e.target)) return;
+    // With several charts on screen only the one under the pointer reacts to shortcuts.
+    if (DrawingToolsManager.active && DrawingToolsManager.active !== this) return;
     if (this.handleHistoryShortcut(e) || this.handleToolShortcut(e)) return;
     if (this.handleClipboardShortcut(e) || this.handleArrowNudge(e)) return;
     if (e.key === "Escape") {
@@ -491,13 +575,25 @@ export class DrawingToolsManager {
   /** Ctrl/Cmd+Z undo, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redo. */
   private handleHistoryShortcut(e: KeyboardEvent): boolean {
     if (!e.ctrlKey && !e.metaKey) return false;
-    if (e.code === "KeyZ") {
+    const key = e.key?.toLowerCase();
+    if (e.code === "KeyZ" || key === "z") {
       e.preventDefault();
-      if (e.shiftKey) this.cb.onRedo?.();
-      else this.cb.onUndo?.();
+      if (e.shiftKey) {
+        this.cb.onRedo?.();
+      } else {
+        if (this.placing) {
+          this.cancelPlacement();
+          return true;
+        }
+        if (this.measureResult) {
+          this.clearMeasure();
+          return true;
+        }
+        this.cb.onUndo?.();
+      }
       return true;
     }
-    if (e.code === "KeyY") {
+    if (e.code === "KeyY" || key === "y") {
       e.preventDefault();
       this.cb.onRedo?.();
       return true;
@@ -519,15 +615,18 @@ export class DrawingToolsManager {
   private handleClipboardShortcut(e: KeyboardEvent): boolean {
     if (!e.ctrlKey && !e.metaKey) return false;
     if (e.code === "KeyC") {
+      if (this.selectedIds.length === 0) return false;
       this.copySelected();
       return true;
     }
     if (e.code === "KeyV") {
+      if (this.clipboard.length === 0) return false;
       e.preventDefault();
       this.pasteClipboard();
       return true;
     }
     if (e.code === "KeyD") {
+      if (this.selectedIds.length === 0) return false;
       e.preventDefault();
       this.copySelected();
       this.pasteClipboard();
@@ -571,7 +670,7 @@ export class DrawingToolsManager {
   private offsetCopy(d: DrawingLine, dt: number): DrawingLine {
     return {
       ...d,
-      id: crypto.randomUUID(),
+      id: generateId(),
       time: d.time != null ? d.time + dt : undefined,
       time2: d.time2 != null ? d.time2 + dt : undefined,
       time3: d.time3 != null ? d.time3 + dt : undefined,
@@ -617,6 +716,12 @@ export class DrawingToolsManager {
     e.stopPropagation();
     if (this.tool === "horizontal" || this.tool === "vertical" || this.tool === "text") {
       this.commitDrawing(this.makeNew(this.tool, pt, pt));
+      return;
+    }
+    if (this.tool === "long-position" || this.tool === "short-position") {
+      this.commitDrawing(
+        this.makeDefaultPosition(this.tool === "long-position" ? "long" : "short", pt),
+      );
       return;
     }
     if (this.placing) {
@@ -788,6 +893,9 @@ export class DrawingToolsManager {
     const { timeKey, priceKey } = drag.hit.region;
     if (timeKey) updated[timeKey] = pt.time;
     if (priceKey) updated[priceKey] = pt.price;
+    if (updated.type === "position" && updated.time != null && updated.time === updated.time2) {
+      return null;
+    }
     return updated;
   }
 
@@ -838,20 +946,44 @@ export class DrawingToolsManager {
   }
 
   // Body-drag a position: shift the box in time and every price row together.
+  // Both horizontal anchors are re-projected from their own pixel position. The
+  // chart axis is index-based (one slot per bar) while anchors are stored in
+  // seconds, so applying one shared Δseconds to both edges stretches/shrinks the
+  // box whenever the data has gaps (sparse pre-market, overnight, weekends).
   private shiftPosition(
     origin: DrawingLine,
     entry: ResolvedEntry,
     dx: number,
     dy: number,
   ): DrawingLine | null {
-    const p = this.shiftPoint(entry.x1, entry.y1, dx, dy);
+    if (entry.x1 === null || entry.y1 === null) return null;
+    const ctx = this.ctx();
+    const x1 = entry.x1;
+    const x2 = entry.x2;
+    const xa = x2 !== null ? Math.min(x1, x2) : x1;
+    const xb = x2 !== null ? Math.max(x1, x2) : x1;
+    const p = this.shiftPoint(xa, entry.y1, dx, dy);
     if (!p) return null;
     const dPrice = p.price - origin.price;
-    const dTime = p.time - (origin.time ?? p.time);
+    const t1 = xToTime(ctx, xa + dx) ?? p.time;
+    let spacing = 6;
+    try {
+      const s = this.chart.timeScale().options?.()?.barSpacing;
+      if (typeof s === "number" && s > 0) spacing = s;
+    } catch {
+      // Test mocks may omit timeScale().options().
+    }
+    const widthBars =
+      x2 !== null
+        ? Math.max(Math.round(Math.max(xb - xa, spacing) / spacing), 1)
+        : 18;
+    const fallbackT2 = t1 + widthBars * Math.max(this.intervalSec, 60);
+    const shiftedEnd = x2 !== null ? xToTime(ctx, xb + dx) : null;
+    const time2 = shiftedEnd !== null && shiftedEnd > t1 ? shiftedEnd : fallbackT2;
     return {
       ...origin,
-      time: (origin.time ?? 0) + dTime,
-      time2: (origin.time2 ?? 0) + dTime,
+      time: t1,
+      time2,
       price: p.price,
       stopPrice: origin.stopPrice != null ? origin.stopPrice + dPrice : undefined,
       targetPrice: origin.targetPrice != null ? origin.targetPrice + dPrice : undefined,
@@ -918,9 +1050,17 @@ export class DrawingToolsManager {
     return out;
   }
 
-  /** Pixel position of the first anchor while placing a trendline. */
+  /** Pixel position of the first anchor while placing a 2-point directional line. */
   private placementAnchorPx(): Pt | null {
-    if (!this.placing || this.tool !== "trendline") return null;
+    if (
+      !this.placing ||
+      (this.tool !== "trendline" &&
+        this.tool !== "ray" &&
+        this.tool !== "extended" &&
+        this.tool !== "arrow")
+    ) {
+      return null;
+    }
     const x = timeToX(this.ctx(), this.placing.p1.time);
     const y = this.series.priceToCoordinate(this.placing.p1.price);
     return x !== null && y !== null ? { x, y } : null;

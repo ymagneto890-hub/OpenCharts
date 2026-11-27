@@ -33,6 +33,7 @@ class BandsIndicatorPaneRenderer implements ISeriesPrimitivePaneRenderer {
   draw() {}
   drawBackground(target: CanvasRenderingTarget2D) {
     const points: BandRendererData[] = this._viewData.data;
+    if (points.length === 0) return;
     target.useBitmapCoordinateSpace((scope) => {
       const ctx = scope.context;
       ctx.scale(scope.horizontalPixelRatio, scope.verticalPixelRatio);
@@ -186,7 +187,8 @@ export class BandsIndicator extends PluginBase implements ISeriesPrimitive<Time>
     this._upperLower = new UpperLowerInRange(this._bandsData, 4);
   }
 
-  autoscaleInfo(startTimePoint: Logical, endTimePoint: Logical): AutoscaleInfo {
+  autoscaleInfo(startTimePoint: Logical, endTimePoint: Logical): AutoscaleInfo | null {
+    if (this._bandsData.length === 0) return null;
     const ts = this.chart.timeScale();
     const startTime = (ts.coordinateToTime(ts.logicalToCoordinate(startTimePoint) ?? 0) ??
       0) as number;
@@ -194,7 +196,11 @@ export class BandsIndicator extends PluginBase implements ISeriesPrimitive<Time>
       5000000000) as number;
     const startIndex = this._timeIndices.findClosestIndex(startTime, "left");
     const endIndex = this._timeIndices.findClosestIndex(endTime, "right");
+    if (startIndex < 0 || endIndex < 0) return null;
     const range = this._upperLower.getMinMax(startIndex, endIndex);
+    if (!Number.isFinite(range.lower) || !Number.isFinite(range.upper) || range.lower > range.upper) {
+      return null;
+    }
     return {
       priceRange: {
         minValue: range.lower,

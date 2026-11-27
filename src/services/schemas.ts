@@ -96,6 +96,13 @@ export const OrderSchema = z.object({
   comment: z.string().nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
+  source: z.enum(["live", "replay"]).optional(),
+  notes: z.string().optional(),
+  oneHourScreenshot: z.string().optional(),
+  fourHourScreenshot: z.string().optional(),
+  entryScreenshot: z.string().optional(),
+  dailyScreenshot: z.string().optional(),
+  entryTimeframe: z.string().optional(),
 });
 export type Order = z.infer<typeof OrderSchema>;
 
@@ -117,6 +124,14 @@ export const PositionSchema = z.object({
   openedAt: z.string(),
   takeProfit: z.number().nullable(),
   stopLoss: z.number().nullable(),
+  /** "replay" for positions opened while practising on historical candles. */
+  source: z.enum(["live", "replay"]).optional(),
+  notes: z.string().optional(),
+  oneHourScreenshot: z.string().optional(),
+  fourHourScreenshot: z.string().optional(),
+  entryScreenshot: z.string().optional(),
+  dailyScreenshot: z.string().optional(),
+  entryTimeframe: z.string().optional(),
 });
 export type Position = z.infer<typeof PositionSchema>;
 
@@ -142,12 +157,24 @@ export const ClosedPositionSchema = z.object({
   quantity: z.number(),
   entryPrice: z.number(),
   exitPrice: z.number(),
+  takeProfit: z.number().nullable().optional(),
+  stopLoss: z.number().nullable().optional(),
   realizedPnl: z.number(),
   commission: z.number(),
   swap: z.number(),
   openedAt: z.string(),
   closedAt: z.string().nullable(),
   isPartialClose: z.boolean().optional(),
+  source: z.enum(["live", "replay"]).optional(),
+  exitReason: z.enum(["manual", "stop-loss", "take-profit", "replay-end", "liquidation"]).optional(),
+  /** Account session (increments on every reset) the trade was closed in. */
+  sessionId: z.number().optional(),
+  notes: z.string().optional(),
+  oneHourScreenshot: z.string().optional(),
+  fourHourScreenshot: z.string().optional(),
+  entryScreenshot: z.string().optional(),
+  dailyScreenshot: z.string().optional(),
+  entryTimeframe: z.string().optional(),
 });
 export type ClosedPosition = z.infer<typeof ClosedPositionSchema>;
 
@@ -197,11 +224,17 @@ export const PlaceOrderInputSchema = z.object({
   symbol: z.string().min(1).max(20),
   side: z.enum(["BUY", "SELL"]),
   type: z.enum(["MARKET", "LIMIT", "STOP", "STOP_LIMIT"]),
-  quantity: z.number().positive().max(1000),
+  quantity: z.number().positive(),
   price: z.number().positive().optional(),
   stopPrice: z.number().positive().optional(),
   takeProfit: z.number().positive().optional(),
   stopLoss: z.number().positive().optional(),
+  notes: z.string().optional(),
+  oneHourScreenshot: z.string().optional(),
+  fourHourScreenshot: z.string().optional(),
+  entryScreenshot: z.string().optional(),
+  dailyScreenshot: z.string().optional(),
+  entryTimeframe: z.string().optional(),
 });
 export type PlaceOrderInput = z.infer<typeof PlaceOrderInputSchema>;
 

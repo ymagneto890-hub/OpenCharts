@@ -1,4 +1,6 @@
 import { formatNumber, formatDate } from "../../lib/utils.ts";
+import { formatAssetUnits } from "../../hooks/useInstrumentLabels.ts";
+import { getPipDigits } from "./utils.ts";
 
 interface OrderRow {
   id: string;
@@ -40,7 +42,7 @@ export function OrdersTable({
           <th>Symbol</th>
           <th>Side</th>
           <th>Type</th>
-          <th>Qty</th>
+          <th>Units</th>
           <th>Price</th>
           <th>SL</th>
           <th>TP</th>
@@ -50,67 +52,70 @@ export function OrdersTable({
         </tr>
       </thead>
       <tbody>
-        {orders.map((o) => (
-          <tr
-            key={o.id}
-            className={
-              onSelectSymbol ? "hover:bg-secondary/30 cursor-pointer" : "hover:bg-secondary/30"
-            }
-            onClick={() => onSelectSymbol?.(o.symbolName)}
-            onKeyDown={(e) => {
-              if (!onSelectSymbol) return;
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onSelectSymbol(o.symbolName);
+        {orders.map((o) => {
+          const digits = getPipDigits(o.symbolName);
+          return (
+            <tr
+              key={o.id}
+              className={
+                onSelectSymbol ? "hover:bg-secondary/30 cursor-pointer" : "hover:bg-secondary/30"
               }
-            }}
-            tabIndex={onSelectSymbol ? 0 : undefined}
-          >
-            <td className="font-semibold">{o.symbolName}</td>
-            <td className={o.side === "BUY" ? "text-buy" : "text-sell"}>{o.side}</td>
-            <td>{o.type}</td>
-            <td className="font-mono">{o.quantity}</td>
-            <td className="font-mono">
-              {o.price
-                ? formatNumber(o.price, 5)
-                : o.stopPrice
-                  ? formatNumber(o.stopPrice, 5)
-                  : "MKT"}
-            </td>
-            <td className="font-mono text-sell">
-              {o.stopLoss ? formatNumber(o.stopLoss, 5) : "--"}
-            </td>
-            <td className="font-mono text-buy">
-              {o.takeProfit ? formatNumber(o.takeProfit, 5) : "--"}
-            </td>
-            <td>{o.status}</td>
-            <td className="text-muted-foreground">{formatDate(o.createdAt)}</td>
-            <td>
-              <div className="flex gap-1">
-                {onModify && (
+              onClick={() => onSelectSymbol?.(o.symbolName)}
+              onKeyDown={(e) => {
+                if (!onSelectSymbol) return;
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onSelectSymbol(o.symbolName);
+                }
+              }}
+              tabIndex={onSelectSymbol ? 0 : undefined}
+            >
+              <td className="font-semibold">{o.symbolName}</td>
+              <td className={o.side === "BUY" ? "text-buy" : "text-sell"}>{o.side}</td>
+              <td>{o.type}</td>
+              <td className="font-mono">{formatAssetUnits(o.quantity, o.symbolName)}</td>
+              <td className="font-mono">
+                {o.price
+                  ? formatNumber(o.price, digits)
+                  : o.stopPrice
+                    ? formatNumber(o.stopPrice, digits)
+                    : "MKT"}
+              </td>
+              <td className="font-mono text-sell">
+                {o.stopLoss ? formatNumber(o.stopLoss, digits) : "--"}
+              </td>
+              <td className="font-mono text-buy">
+                {o.takeProfit ? formatNumber(o.takeProfit, digits) : "--"}
+              </td>
+              <td>{o.status}</td>
+              <td className="text-muted-foreground">{formatDate(o.createdAt)}</td>
+              <td>
+                <div className="flex gap-1">
+                  {onModify && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onModify(o);
+                      }}
+                      className="px-1.5 py-0.5 text-[10px] rounded bg-accent/20 text-accent hover:bg-accent/30"
+                    >
+                      Modify
+                    </button>
+                  )}
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      onModify(o);
+                      onCancel(o.id);
                     }}
-                    className="px-1.5 py-0.5 text-[10px] rounded bg-accent/20 text-accent hover:bg-accent/30"
+                    className="px-1.5 py-0.5 text-[10px] rounded bg-warning/20 text-warning hover:bg-warning/30"
                   >
-                    Modify
+                    Cancel
                   </button>
-                )}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCancel(o.id);
-                  }}
-                  className="px-1.5 py-0.5 text-[10px] rounded bg-warning/20 text-warning hover:bg-warning/30"
-                >
-                  Cancel
-                </button>
-              </div>
-            </td>
-          </tr>
-        ))}
+                </div>
+              </td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   );

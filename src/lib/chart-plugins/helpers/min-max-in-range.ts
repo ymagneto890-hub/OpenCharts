@@ -14,18 +14,23 @@ export class UpperLowerInRange<T extends UpperLowerData> {
   }
 
   public getMinMax(startIndex: number, endIndex: number): UpperLowerData {
-    const cacheKey = `${startIndex}:${endIndex}`;
-    if (this._cache.has(cacheKey)) {
-      return this._cache.get(cacheKey) as T;
-    }
-
     const result: UpperLowerData = {
       lower: Infinity,
       upper: -Infinity,
     };
+    if (this._arr.length === 0) return result;
+    const clampedStart = Math.max(0, Math.min(startIndex, this._arr.length - 1));
+    const clampedEnd = Math.max(0, Math.min(endIndex, this._arr.length - 1));
+    if (clampedStart > clampedEnd) return result;
+
+    const cacheKey = `${clampedStart}:${clampedEnd}`;
+    if (this._cache.has(cacheKey)) {
+      return this._cache.get(cacheKey) as T;
+    }
+
     // Check if we have precalculated min and max values for any of the chunks.
-    const startChunkIndex = Math.floor(startIndex / this._chunkSize);
-    const endChunkIndex = Math.floor(endIndex / this._chunkSize);
+    const startChunkIndex = Math.floor(clampedStart / this._chunkSize);
+    const endChunkIndex = Math.floor(clampedEnd / this._chunkSize);
     for (let chunkIndex = startChunkIndex; chunkIndex <= endChunkIndex; chunkIndex++) {
       const chunkStart = chunkIndex * this._chunkSize;
       const chunkEnd = Math.min((chunkIndex + 1) * this._chunkSize - 1, this._arr.length - 1);

@@ -1,4 +1,11 @@
 // Chart templates persist to localStorage in demo mode (no backend).
+import type { IndicatorSettings } from "../../hooks/useIndicatorSettings.ts";
+
+export interface ChartTemplatePaneSnapshot {
+  timeframe: string;
+  indicators: string[];
+  showVolume?: boolean | null;
+}
 
 export interface ChartTemplateContent {
   version: 1;
@@ -6,6 +13,11 @@ export interface ChartTemplateContent {
   prefs: Record<string, string | boolean>;
   indicators: string[];
   plugins: string[];
+  chartLayout?: "1" | "2x1" | "2x2";
+  mainTimeframe?: string;
+  syncPrice2x1?: boolean;
+  panes?: Record<string, ChartTemplatePaneSnapshot>;
+  indicatorSettings?: IndicatorSettings;
 }
 
 export interface ChartTemplate {
@@ -27,7 +39,17 @@ function readAll(): ChartTemplate[] {
   }
 }
 function writeAll(list: ChartTemplate[]): void {
-  localStorage.setItem(KEY, JSON.stringify(list));
+  try {
+    localStorage.setItem(KEY, JSON.stringify(list));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function uid(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export const chartTemplatesApi = {
@@ -35,11 +57,18 @@ export const chartTemplatesApi = {
 
   /** Upserts by name (unique per user). */
   save: (name: string, content: ChartTemplateContent, isDefault = false) => {
-    const list = readAll().filter((t) => t.name !== name);
+    const list = readAll()
+      .filter((t) => t.name !== name)
+      .map((t) => (isDefault && t.isDefault ? { ...t, isDefault: false } : t));
     const template: ChartTemplate = {
-      id: crypto.randomUUID(),
+      id: uid(),
       name,
-      layoutType: "SINGLE",
+      layoutType:
+        content.chartLayout === "2x1"
+          ? "2X1"
+          : content.chartLayout === "2x2"
+            ? "2X2"
+            : "SINGLE",
       isDefault,
       panels: [content],
       updatedAt: new Date().toISOString(),

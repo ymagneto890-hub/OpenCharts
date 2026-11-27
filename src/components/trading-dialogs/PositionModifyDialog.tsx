@@ -4,6 +4,7 @@ import { toast } from "../../services/toast";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useInstrumentLabels } from "../../hooks/useInstrumentLabels.ts";
+import { getPipDigits } from "../../pages/trading/utils.ts";
 import {
   X,
   TrendingUp,
@@ -26,7 +27,7 @@ interface Position {
   stopLoss?: number | null;
   takeProfit?: number | null;
   openedAt: string;
-  /** Units per contract/lot. Defaults to 100000 (forex) when not provided. */
+  /** Units per contract. Defaults to 1 (spot/unit) when not provided. */
   contractSize?: number;
 }
 
@@ -53,17 +54,18 @@ export function PositionModifyDialog({
   const [activeTab, setActiveTab] = useState<"modify" | "partial">("modify");
 
   // BUG-62 FIX: Reinitialize form fields when the selected position changes.
-  // Previously used useState() callback which only runs on initial mount,
-  // meaning switching positions kept stale TP/SL values.
   useEffect(() => {
     if (position) {
       setTp(position.takeProfit != null ? String(position.takeProfit) : "");
       setSl(position.stopLoss != null ? String(position.stopLoss) : "");
       setPartialQty("");
     }
-  }, [position]);
+  }, [position?.id, position?.takeProfit, position?.stopLoss]);
 
   if (!position) return null;
+
+  const digits = getPipDigits(position.symbolName);
+  const priceStep = (10 ** -digits).toFixed(digits);
 
   const currentPrice = tick
     ? position.side === "LONG"
@@ -82,17 +84,25 @@ export function PositionModifyDialog({
       return;
     }
     const mods: { takeProfit?: number | null; stopLoss?: number | null } = {};
-    // Empty string means "remove this level". Non-empty means "set to this value".
-    // We only send the field if it actually changed from the persisted value.
     if (tp === "" && position.takeProfit != null) {
-      mods.takeProfit = null; // removal
-    } else if (tp !== "" && parseFloat(tp) !== position.takeProfit) {
-      mods.takeProfit = parseFloat(tp);
+      mods.takeProfit = null;
+    } else if (tp !== "") {
+      const nextTp = parseFloat(tp);
+      if (!Number.isFinite(nextTp) || nextTp <= 0) {
+        toast.warning("Invalid Level", "Take Profit and Stop Loss must be valid positive prices");
+        return;
+      }
+      if (nextTp !== position.takeProfit) mods.takeProfit = nextTp;
     }
     if (sl === "" && position.stopLoss != null) {
-      mods.stopLoss = null; // removal
-    } else if (sl !== "" && parseFloat(sl) !== position.stopLoss) {
-      mods.stopLoss = parseFloat(sl);
+      mods.stopLoss = null;
+    } else if (sl !== "") {
+      const nextSl = parseFloat(sl);
+      if (!Number.isFinite(nextSl) || nextSl <= 0) {
+        toast.warning("Invalid Level", "Take Profit and Stop Loss must be valid positive prices");
+        return;
+      }
+      if (nextSl !== position.stopLoss) mods.stopLoss = nextSl;
     }
     if (Object.keys(mods).length === 0) {
       toast.info("No Changes", "No modifications to apply");
@@ -125,14 +135,17 @@ export function PositionModifyDialog({
       return;
     }
     const qty = parseFloat(partialQty);
-    if (isNaN(qty) || qty <= 0 || qty > position.quantity) {
-      toast.warning("Invalid Quantity", `Enter a value between 0.01 and ${position.quantity}`);
+    if (!Number.isFinite(qty) || qty <= 0 || qty > position.quantity) {
+      toast.warning("Invalid Quantity", `Enter a value between 0.0001 and ${position.quantity}`);
       return;
     }
     setSaving(true);
     try {
       await api.closePosition(position.id, qty);
-      toast.success("Partial Close", `Closed ${formatQty(qty)} of ${formatQty(position.quantity)}`);
+      toast.success(
+        "Partial Close",
+        `Closed ${formatQty(qty, position.symbolName)} of ${formatQty(position.quantity, position.symbolName)}`,
+      );
       onSaved();
       onClose();
     } catch (err: unknown) {
@@ -163,8 +176,8 @@ export function PositionModifyDialog({
       ? Math.abs((tpVal - position.entryPrice) / (position.entryPrice - slVal))
       : null;
 
-  // Estimated P&L at TP/SL — use per-instrument contractSize if available.
-  const contractSize = position.contractSize ?? 100000;
+  // Estimated P&L at TP/SL — use per-instrument contractSize (default 1 for unit-based trading).
+  const contractSize = position.contractSize ?? 1;
   const tpPnl = !isNaN(tpVal)
     ? (position.side === "LONG" ? tpVal - position.entryPrice : position.entryPrice - tpVal) *
       position.quantity *
@@ -179,7 +192,12 @@ export function PositionModifyDialog({
   return (
     <>
       <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onClose();
+        }}
+      >
         <div className="w-full max-w-md bg-card border border-border rounded-xl shadow-2xl shadow-black/40 overflow-hidden">
           {/* Header */}
           <div className="flex items-center justify-between px-5 py-3 border-b border-border/60 bg-secondary/50">
@@ -199,7 +217,8 @@ export function PositionModifyDialog({
               <div>
                 <h3 className="text-sm font-semibold">Modify {position.symbolName}</h3>
                 <p className="text-[10px] text-muted-foreground">
-                  {position.side} {position.quantity} @ {formatNumber(position.entryPrice, 5)}
+                  {position.side} {formatQty(position.quantity, position.symbolName)} @{" "}
+                  {formatNumber(position.entryPrice, digits)}
                 </p>
               </div>
             </div>
@@ -212,7 +231,9 @@ export function PositionModifyDialog({
           <div className="px-5 py-3 grid grid-cols-3 gap-3 border-b border-border/40 text-center">
             <div>
               <div className="text-[10px] text-muted-foreground">Current</div>
-              <div className="text-sm font-mono font-semibold">{formatNumber(currentPrice, 5)}</div>
+              <div className="text-sm font-mono font-semibold">
+                {formatNumber(currentPrice, digits)}
+              </div>
             </div>
             <div>
               <div className="text-[10px] text-muted-foreground">P&L</div>
@@ -226,7 +247,7 @@ export function PositionModifyDialog({
                 {formatCurrency(position.unrealizedPnl || 0)}
               </div>
             </div>
-            {instrumentType === "FOREX" && (
+            {instrumentType === "FOREX_CFD" && (
               <div>
                 <div className="text-[10px] text-muted-foreground">Pips</div>
                 <div
@@ -235,7 +256,7 @@ export function PositionModifyDialog({
                     pnlPerUnit >= 0 ? "text-buy" : "text-sell",
                   )}
                 >
-                  {(pnlPerUnit * 10000).toFixed(1)}
+                  {(pnlPerUnit * (digits <= 3 ? 100 : 10000)).toFixed(1)}
                 </div>
               </div>
             )}
@@ -308,7 +329,7 @@ export function PositionModifyDialog({
                     onChange={(e) => setTp(e.target.value)}
                     placeholder={position.takeProfit ? String(position.takeProfit) : "Not set"}
                     className="w-full text-sm font-mono"
-                    step="0.00001"
+                    step={priceStep}
                   />
                   {tp && (
                     <Button
@@ -346,7 +367,7 @@ export function PositionModifyDialog({
                     onChange={(e) => setSl(e.target.value)}
                     placeholder={position.stopLoss ? String(position.stopLoss) : "Not set"}
                     className="w-full text-sm font-mono"
-                    step="0.00001"
+                    step={priceStep}
                   />
                   <div className="flex gap-1 mt-1">
                     <Button
@@ -355,7 +376,7 @@ export function PositionModifyDialog({
                       className="text-[10px] h-5 text-muted-foreground"
                       onClick={handleSetBreakeven}
                     >
-                      Breakeven ({formatNumber(position.entryPrice, 5)})
+                      Breakeven ({formatNumber(position.entryPrice, digits)})
                     </Button>
                     {sl && (
                       <Button
@@ -404,7 +425,7 @@ export function PositionModifyDialog({
               <>
                 <div>
                   <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-                    Close Volume ({unitLabel})
+                    Close Quantity ({unitLabel})
                   </label>
                   <input
                     type="number"
@@ -412,8 +433,8 @@ export function PositionModifyDialog({
                     onChange={(e) => setPartialQty(e.target.value)}
                     placeholder={`Max: ${position.quantity}`}
                     className="w-full mt-1 text-sm font-mono"
-                    step={isFutures ? "1" : "0.01"}
-                    min={isFutures ? "1" : "0.01"}
+                    step={isFutures ? "1" : "0.0001"}
+                    min={isFutures ? "1" : "0.0001"}
                     max={position.quantity}
                   />
                 </div>
@@ -422,14 +443,14 @@ export function PositionModifyDialog({
                 <div className="grid grid-cols-4 gap-1">
                   {[25, 50, 75, 100].map((pct) => {
                     const rawAmt = (position.quantity * pct) / 100;
-                    // For futures: snap to nearest integer, at least 1, at most position.quantity.
                     const amt = isFutures
                       ? Math.min(position.quantity, Math.max(1, Math.round(rawAmt)))
-                      : rawAmt;
+                      : Number(rawAmt.toFixed(6));
+                    const amtStr = String(amt);
                     return (
                       <button
                         key={pct}
-                        onClick={() => setPartialQty(isFutures ? String(amt) : amt.toFixed(2))}
+                        onClick={() => setPartialQty(amtStr)}
                         className={cn(
                           "text-[10px] py-1.5 rounded border border-border transition-colors",
                           parseFloat(partialQty) === amt
@@ -438,9 +459,7 @@ export function PositionModifyDialog({
                         )}
                       >
                         {pct}%
-                        <div className="text-[9px] text-muted-foreground">
-                          {isFutures ? amt : amt.toFixed(2)}
-                        </div>
+                        <div className="text-[9px] text-muted-foreground">{amtStr}</div>
                       </button>
                     );
                   })}
@@ -457,7 +476,7 @@ export function PositionModifyDialog({
                     ? "Closing..."
                     : !isFeedConnected
                       ? "Disconnected"
-                      : `Close ${partialQty || "?"} ${unitLabel}`}
+                      : `Close ${partialQty || "?"} ${position.symbolName.split("/")[0] || unitLabel}`}
                 </Button>
               </>
             )}

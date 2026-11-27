@@ -21,6 +21,7 @@ export { posthog };
  * events are trivially separable from firm funnel events in PostHog dashboards.
  */
 export function capturePlatform(event: string, properties?: Record<string, unknown>): void {
+  if (!apiKey) return;
   posthog.capture(event, {
     event_group: "platform",
     platform: "propsim",

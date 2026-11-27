@@ -51,7 +51,9 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
         disabled={disabled || loading}
         {...props}
       >
-        {loading ? (
+        {asChild ? (
+          children
+        ) : loading ? (
           <>
             <svg className="mr-2 h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
               <circle

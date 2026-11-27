@@ -7,14 +7,22 @@ import {
   updateChartPreferences,
   useChartPreferences,
 } from "../../hooks/useChartPreferences.ts";
+import {
+  type IndicatorSettings,
+  updateIndicatorSettings,
+  useIndicatorSettings,
+} from "../../hooks/useIndicatorSettings.ts";
 import type { IndicatorType } from "../../lib/indicators.ts";
 import { cn } from "../../lib/utils.ts";
 import {
   type ChartTemplate,
   type ChartTemplateContent,
+  type ChartTemplatePaneSnapshot,
   chartTemplatesApi,
 } from "../../services/api/chart-templates.ts";
 import { toast } from "../../services/toast.ts";
+import type { Timeframe } from "./constants.ts";
+import type { ChartLayout } from "./MultiChartPane.tsx";
 
 // ── Chart templates (TradingView/TradeLocker-style layout templates) ─────────
 // Save/load named snapshots of chart appearance (colors, element visibility,
@@ -24,23 +32,74 @@ import { toast } from "../../services/toast.ts";
 
 const AUTOSAVE_DEBOUNCE_MS = 1_500;
 
+export interface MultiChartTemplateState {
+  chartLayout: ChartLayout;
+  mainTimeframe: Timeframe;
+  mainIndicators: IndicatorType[];
+  syncPrice2x1: boolean;
+  paneTimeframes: Record<1 | 2 | 3, Timeframe>;
+  paneIndicators: Record<1 | 2 | 3, IndicatorType[]>;
+  paneShowVolume: Record<1 | 2 | 3, boolean | null>;
+}
+
+export interface MultiChartTemplateApplyPayload {
+  chartLayout?: ChartLayout;
+  mainTimeframe?: Timeframe;
+  mainIndicators: IndicatorType[];
+  syncPrice2x1?: boolean;
+  panes?: Record<string, ChartTemplatePaneSnapshot>;
+}
+
 export interface ChartTemplatesMenuProps {
   activeIndicators: IndicatorType[];
   onSetIndicators: (indicators: IndicatorType[]) => void;
   activePlugins: string[];
   onSetPlugins: (ids: string[]) => void;
+  multiChartState?: MultiChartTemplateState;
+  onApplyMultiChartState?: (payload: MultiChartTemplateApplyPayload) => void;
 }
 
 function snapshotContent(
   prefs: ChartPreferences,
   indicators: IndicatorType[],
   plugins: string[],
+  indicatorSettings: IndicatorSettings,
+  multiChartState?: MultiChartTemplateState,
 ): ChartTemplateContent {
   const snapshot: Record<string, string | boolean> = {};
   for (const key of TEMPLATE_PREF_KEYS) {
     snapshot[key] = prefs[key];
   }
-  return { version: 1, prefs: snapshot, indicators, plugins };
+  const base: ChartTemplateContent = {
+    version: 1,
+    prefs: snapshot,
+    indicators: multiChartState ? multiChartState.mainIndicators : indicators,
+    plugins,
+    indicatorSettings,
+  };
+  if (multiChartState) {
+    base.chartLayout = multiChartState.chartLayout;
+    base.mainTimeframe = multiChartState.mainTimeframe;
+    base.syncPrice2x1 = multiChartState.syncPrice2x1;
+    base.panes = {
+      "1": {
+        timeframe: multiChartState.paneTimeframes[1],
+        indicators: multiChartState.paneIndicators[1],
+        showVolume: multiChartState.paneShowVolume[1],
+      },
+      "2": {
+        timeframe: multiChartState.paneTimeframes[2],
+        indicators: multiChartState.paneIndicators[2],
+        showVolume: multiChartState.paneShowVolume[2],
+      },
+      "3": {
+        timeframe: multiChartState.paneTimeframes[3],
+        indicators: multiChartState.paneIndicators[3],
+        showVolume: multiChartState.paneShowVolume[3],
+      },
+    };
+  }
+  return base;
 }
 
 function contentToPrefsPatch(content: ChartTemplateContent): Partial<ChartPreferences> {
@@ -85,15 +144,19 @@ function useTemplateAutosave(
   const timerRef = useRef<number | null>(null);
   // Serialise so the effect only fires on real changes, not object identity.
   const serialized = JSON.stringify(content);
-  const skipFirstRef = useRef(true);
+  const prevActiveNameRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!enabled || !activeName) return;
-    if (skipFirstRef.current) {
-      // Don't save the snapshot we just loaded.
-      skipFirstRef.current = false;
+    if (prevActiveNameRef.current !== activeName) {
+      prevActiveNameRef.current = activeName;
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+      // Don't save the snapshot we just loaded / switched to.
       return;
     }
+    if (!enabled || !activeName) return;
     if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     timerRef.current = window.setTimeout(() => {
       saveFn({ name: activeName, content: JSON.parse(serialized) as ChartTemplateContent });
@@ -102,11 +165,6 @@ function useTemplateAutosave(
       if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     };
   }, [enabled, activeName, serialized, saveFn]);
-
-  // Re-arm the "skip first" guard whenever the active template changes.
-  useEffect(() => {
-    skipFirstRef.current = true;
-  }, [activeName]);
 }
 
 function MenuRow({
@@ -165,16 +223,22 @@ function AutosaveRow({ enabled, onToggle }: { enabled: boolean; onToggle: () => 
 function AddTemplateRow({ onAdd }: { onAdd: (name: string) => void }) {
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState("");
+  const committedRef = useRef(false);
   if (!adding) {
     return (
       <MenuRow
         icon={<Plus className="h-3.5 w-3.5" />}
         label="Add template"
-        onClick={() => setAdding(true)}
+        onClick={() => {
+          committedRef.current = false;
+          setAdding(true);
+        }}
       />
     );
   }
   const commit = () => {
+    if (committedRef.current) return;
+    committedRef.current = true;
     const trimmed = name.trim();
     if (trimmed) onAdd(trimmed);
     setAdding(false);
@@ -188,7 +252,11 @@ function AddTemplateRow({ onAdd }: { onAdd: (name: string) => void }) {
         onChange={(e) => setName(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter") commit();
-          if (e.key === "Escape") setAdding(false);
+          if (e.key === "Escape") {
+            committedRef.current = true;
+            setAdding(false);
+            setName("");
+          }
         }}
         onBlur={commit}
         placeholder="Template name…"
@@ -216,42 +284,69 @@ function TemplateList({
   }
   return (
     <>
-      {templates.map((t) => (
-        <div key={t.id} className="group flex items-center">
-          <button
-            onClick={() => onApply(t)}
-            className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left text-xs text-foreground hover:bg-secondary"
-          >
-            <span className="flex h-3.5 w-3.5 items-center justify-center text-primary">
-              {t.name === activeName && <Check className="h-3.5 w-3.5" />}
-            </span>
-            <span className="truncate">{t.name}</span>
-          </button>
-          {manageMode && (
+      {templates.map((t) => {
+        const layoutTag =
+          t.panels[0]?.chartLayout === "2x1" || t.layoutType === "2X1"
+            ? "2×1"
+            : t.panels[0]?.chartLayout === "2x2" || t.layoutType === "2X2"
+              ? "2×2"
+              : null;
+        return (
+          <div key={t.id} className="group flex items-center">
             <button
-              onClick={() => onDelete(t)}
-              title={`Delete "${t.name}"`}
-              className="px-2 text-red-400/70 hover:text-red-400"
+              onClick={() => onApply(t)}
+              className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left text-xs text-foreground hover:bg-secondary"
             >
-              <Trash2 className="h-3.5 w-3.5" />
+              <span className="flex h-3.5 w-3.5 items-center justify-center text-primary">
+                {t.name === activeName && <Check className="h-3.5 w-3.5" />}
+              </span>
+              <span className="truncate flex-1">{t.name}</span>
+              {layoutTag && (
+                <span className="shrink-0 rounded bg-primary/15 px-1 py-0.5 font-mono text-[9px] font-semibold text-primary">
+                  {layoutTag}
+                </span>
+              )}
             </button>
-          )}
-        </div>
-      ))}
+            {manageMode && (
+              <button
+                onClick={() => onDelete(t)}
+                title={`Delete "${t.name}"`}
+                className="px-2 text-red-400/70 hover:text-red-400"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        );
+      })}
     </>
   );
 }
 
 export function ChartTemplatesMenu(props: ChartTemplatesMenuProps) {
-  const { activeIndicators, onSetIndicators, activePlugins, onSetPlugins } = props;
+  const {
+    activeIndicators,
+    onSetIndicators,
+    activePlugins,
+    onSetPlugins,
+    multiChartState,
+    onApplyMultiChartState,
+  } = props;
   const prefs = useChartPreferences();
+  const indicatorSettings = useIndicatorSettings();
   const { templates, save, remove } = useChartTemplates();
   const [open, setOpen] = useState(false);
   const [manageMode, setManageMode] = useState(false);
 
   const activeName = prefs.activeChartTemplate;
   const autosave = prefs.chartTemplateAutosave;
-  const content = snapshotContent(prefs, activeIndicators, activePlugins);
+  const content = snapshotContent(
+    prefs,
+    activeIndicators,
+    activePlugins,
+    indicatorSettings,
+    multiChartState,
+  );
 
   // react-query guarantees `mutate` identity is stable across renders.
   const { mutate: saveMutate } = save;
@@ -265,8 +360,21 @@ export function ChartTemplatesMenu(props: ChartTemplatesMenuProps) {
     const c = t.panels[0];
     if (!c) return;
     updateChartPreferences({ ...contentToPrefsPatch(c), activeChartTemplate: t.name });
-    onSetIndicators((c.indicators ?? []) as IndicatorType[]);
+    if (c.indicatorSettings) {
+      updateIndicatorSettings(c.indicatorSettings);
+    }
     onSetPlugins(c.plugins ?? []);
+    if (onApplyMultiChartState) {
+      onApplyMultiChartState({
+        chartLayout: c.chartLayout,
+        mainTimeframe: c.mainTimeframe as Timeframe | undefined,
+        mainIndicators: (c.indicators ?? []) as IndicatorType[],
+        syncPrice2x1: c.syncPrice2x1,
+        panes: c.panes,
+      });
+    } else {
+      onSetIndicators((c.indicators ?? []) as IndicatorType[]);
+    }
     setOpen(false);
     toast.info("Templates", `Loaded "${t.name}"`);
   };

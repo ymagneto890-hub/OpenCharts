@@ -18,15 +18,24 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     async function boot() {
-      await demoLogin();
-      // OpenCharts paper trades genuinely execute against the in-browser engine,
-      // so this is a real (non-demo) session — clears the "trading disabled" gate.
-      localStorage.setItem("is_demo", "false");
-      useAuthStore.setState({ isDemo: false });
-      await Promise.all([loadSymbols(), loadAccounts()]);
-      if (!cancelled) setReady(true);
+      try {
+        await demoLogin();
+        // OpenCharts paper trades genuinely execute against the in-browser engine,
+        // so this is a real (non-demo) session — clears the "trading disabled" gate.
+        try {
+          localStorage.setItem("is_demo", "false");
+        } catch {
+          // ignore storage errors
+        }
+        useAuthStore.setState({ isDemo: false });
+        await Promise.all([loadSymbols(), loadAccounts()]);
+      } catch (err) {
+        console.warn("[App] boot initialization error:", err);
+      } finally {
+        if (!cancelled) setReady(true);
+      }
     }
-    boot();
+    void boot();
     return () => {
       cancelled = true;
     };

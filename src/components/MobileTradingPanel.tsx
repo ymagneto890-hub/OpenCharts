@@ -7,6 +7,8 @@
 import { useState, useRef, useCallback } from "react";
 import { cn } from "@/lib/utils";
 import { useInstrumentLabels } from "../hooks/useInstrumentLabels.ts";
+import { getPipDigits } from "../pages/trading/utils.ts";
+import { toast } from "../services/toast.ts";
 
 interface MobilePosition {
   id: string;
@@ -31,6 +33,7 @@ interface MobileTradingPanelProps {
     quantity: number;
     type: "MARKET" | "LIMIT" | "STOP";
     price?: number;
+    stopPrice?: number;
     stopLoss?: number;
     takeProfit?: number;
     symbol: string;
@@ -64,10 +67,11 @@ export function MobileTradingPanel({
   closingAll = false,
 }: MobileTradingPanelProps) {
   const { formatQty } = useInstrumentLabels();
+  const digits = getPipDigits(symbol);
   const spread = spreadProp ?? ask - bid;
   const [activeTab, setActiveTab] = useState<Tab>("order");
   const [orderType, setOrderType] = useState<"MARKET" | "LIMIT" | "STOP">("MARKET");
-  const [quantity, setQuantity] = useState(0.1);
+  const [quantityText, setQuantityText] = useState("0.1");
   const [limitPrice, setLimitPrice] = useState<string>("");
   const [stopLoss, setStopLoss] = useState<string>("");
   const [takeProfit, setTakeProfit] = useState<string>("");
@@ -75,15 +79,22 @@ export function MobileTradingPanel({
 
   // Swipe tracking
   const touchStartX = useRef(0);
+  const touchStartY = useRef(0);
 
   const handleTouchStart = useCallback((e: React.TouchEvent) => {
-    touchStartX.current = e.touches[0]!.clientX;
+    const touch = e.touches[0];
+    if (!touch) return;
+    touchStartX.current = touch.clientX;
+    touchStartY.current = touch.clientY;
   }, []);
 
   const handleTouchEnd = useCallback(
     (e: React.TouchEvent) => {
-      const dx = e.changedTouches[0]!.clientX - touchStartX.current;
-      if (Math.abs(dx) > 60) {
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      const dx = touch.clientX - touchStartX.current;
+      const dy = touch.clientY - touchStartY.current;
+      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.2) {
         const currentIdx = TABS.indexOf(activeTab);
         if (dx > 0 && currentIdx > 0) {
           setActiveTab(TABS[currentIdx - 1]!);
@@ -96,14 +107,51 @@ export function MobileTradingPanel({
   );
 
   const handleOrder = (side: "BUY" | "SELL") => {
+    const qty = Number(quantityText);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      toast.warning("Invalid Quantity", "Enter a positive quantity");
+      return;
+    }
+
+    let triggerPx: number | undefined;
+    if (orderType !== "MARKET") {
+      triggerPx = Number(limitPrice);
+      if (!Number.isFinite(triggerPx) || triggerPx <= 0) {
+        toast.warning(
+          "Invalid Price",
+          `Enter a valid ${orderType === "LIMIT" ? "limit" : "stop"} price`,
+        );
+        return;
+      }
+    }
+
+    let parsedSl: number | undefined;
+    if (stopLoss.trim() !== "") {
+      parsedSl = Number(stopLoss);
+      if (!Number.isFinite(parsedSl) || parsedSl <= 0) {
+        toast.warning("Invalid Stop Loss", "Enter a positive stop loss price");
+        return;
+      }
+    }
+
+    let parsedTp: number | undefined;
+    if (takeProfit.trim() !== "") {
+      parsedTp = Number(takeProfit);
+      if (!Number.isFinite(parsedTp) || parsedTp <= 0) {
+        toast.warning("Invalid Take Profit", "Enter a positive take profit price");
+        return;
+      }
+    }
+
     onPlaceOrder({
       side,
-      quantity,
+      quantity: qty,
       type: orderType,
       symbol,
-      price: orderType !== "MARKET" && limitPrice ? Number(limitPrice) : undefined,
-      stopLoss: stopLoss ? Number(stopLoss) : undefined,
-      takeProfit: takeProfit ? Number(takeProfit) : undefined,
+      price: orderType === "LIMIT" ? triggerPx : undefined,
+      stopPrice: orderType === "STOP" ? triggerPx : undefined,
+      stopLoss: parsedSl,
+      takeProfit: parsedTp,
     });
   };
 
@@ -145,7 +193,7 @@ export function MobileTradingPanel({
           <div className="flex items-center justify-between">
             <span className="text-sm font-bold text-white">{symbol}</span>
             <span className="text-xs text-slate-500">
-              Spread: <span className="text-amber-400">{spread.toFixed(1)} pts</span>
+              Spread: <span className="text-amber-400">{spread.toFixed(digits)}</span>
             </span>
           </div>
 
@@ -176,7 +224,7 @@ export function MobileTradingPanel({
                 step="any"
                 value={limitPrice}
                 onChange={(e) => setLimitPrice(e.target.value)}
-                placeholder={bid.toFixed(5)}
+                placeholder={bid.toFixed(digits)}
                 className="w-full px-3 py-2.5 bg-slate-800 border border-slate-600 rounded-lg text-white text-sm font-mono text-center focus:ring-2 focus:ring-violet-500"
               />
             </div>
@@ -185,16 +233,16 @@ export function MobileTradingPanel({
           {/* Lot size presets */}
           <div>
             <label className="text-xs text-slate-400 mb-1.5 block">
-              Lot Size: <span className="text-white font-mono">{quantity}</span>
+              Lot Size: <span className="text-white font-mono">{quantityText}</span>
             </label>
             <div className="grid grid-cols-3 min-[400px]:grid-cols-6 gap-1.5">
               {LOT_PRESETS.map((lot) => (
                 <button
                   key={lot}
-                  onClick={() => setQuantity(lot)}
+                  onClick={() => setQuantityText(String(lot))}
                   className={cn(
                     "py-2.5 rounded-lg text-xs font-mono font-medium transition active:scale-95",
-                    quantity === lot
+                    Number(quantityText) === lot
                       ? "bg-violet-600 text-white ring-1 ring-violet-400"
                       : "bg-slate-800 text-slate-300",
                   )}
@@ -208,8 +256,8 @@ export function MobileTradingPanel({
               type="number"
               step="0.01"
               min="0.01"
-              value={quantity}
-              onChange={(e) => setQuantity(Number(e.target.value) || 0.01)}
+              value={quantityText}
+              onChange={(e) => setQuantityText(e.target.value)}
               className="w-full mt-2 px-3 py-2 bg-slate-800 border border-slate-600 rounded-lg text-white text-sm font-mono text-center focus:ring-2 focus:ring-violet-500"
             />
           </div>
@@ -256,14 +304,14 @@ export function MobileTradingPanel({
               className="py-4 rounded-xl bg-red-600 hover:bg-red-500 active:bg-red-700 active:scale-[0.98] text-white font-bold transition-all"
             >
               <div className="text-lg">SELL</div>
-              <div className="text-xs font-mono opacity-80">{bid.toFixed(5)}</div>
+              <div className="text-xs font-mono opacity-80">{bid.toFixed(digits)}</div>
             </button>
             <button
               onClick={() => handleOrder("BUY")}
               className="py-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 active:scale-[0.98] text-white font-bold transition-all"
             >
               <div className="text-lg">BUY</div>
-              <div className="text-xs font-mono opacity-80">{ask.toFixed(5)}</div>
+              <div className="text-xs font-mono opacity-80">{ask.toFixed(digits)}</div>
             </button>
           </div>
 
@@ -338,7 +386,7 @@ export function MobileTradingPanel({
                     </div>
                     <div className="flex items-center justify-between">
                       <span className="text-xs text-slate-500 font-mono">
-                        Entry: {pos.entryPrice?.toFixed(5) ?? "—"}
+                        Entry: {pos.entryPrice?.toFixed(getPipDigits(posSymbol)) ?? "—"}
                       </span>
                       {onClosePosition && (
                         <button

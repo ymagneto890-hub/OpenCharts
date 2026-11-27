@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Clock } from "lucide-react";
 import type { Symbol } from "../../services/schemas";
 import { useTradingStore } from "../../services/store.tsx";
@@ -32,14 +32,24 @@ const DAY_MAP: Record<string, number> = {
   Sat: 6,
 };
 
+const zoneFormatterCache = new Map<string, Intl.DateTimeFormat>();
+function getZoneFormatter(timezone: string): Intl.DateTimeFormat {
+  let fmt = zoneFormatterCache.get(timezone);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+    zoneFormatterCache.set(timezone, fmt);
+  }
+  return fmt;
+}
+
 function getTimeInZone(date: Date, timezone: string): { day: number; time: string } {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(date);
+  const parts = getZoneFormatter(timezone).formatToParts(date);
   const day = DAY_MAP[parts.find((p) => p.type === "weekday")?.value ?? ""] ?? date.getUTCDay();
   const h = parts.find((p) => p.type === "hour")?.value?.padStart(2, "0") ?? "00";
   const m = parts.find((p) => p.type === "minute")?.value?.padStart(2, "0") ?? "00";
@@ -77,26 +87,29 @@ function isForexDefaultOpen(date: Date): boolean {
   return true;
 }
 
-function msUntilNextOpen(
+function findNextOpenMs(
   windows: TradingHours[],
   tz: string,
   category: string,
-  now: Date,
+  nowMs: number,
 ): number | null {
-  if (category?.toUpperCase() === "CRYPTO") return null;
+  const catUpper = category?.toUpperCase();
+  if (catUpper === "CRYPTO" || catUpper === "FUTURES") return null;
 
-  // Scan minute-by-minute up to 7 days ahead
+  // Snap to minute boundary and scan minute-by-minute up to 7 days ahead
+  const baseMinMs = Math.floor(nowMs / 60_000) * 60_000;
   for (let m = 1; m <= 10080; m++) {
-    const candidate = new Date(now.getTime() + m * 60_000);
+    const t = baseMinMs + m * 60_000;
+    const candidate = new Date(t);
     const open =
       windows.length > 0 ? isInWindow(windows, tz, candidate) : isForexDefaultOpen(candidate);
-    if (open) return m * 60_000;
+    if (open) return t;
   }
   return null;
 }
 
 function formatCountdown(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const days = Math.floor(totalSeconds / 86400);
   const hours = Math.floor((totalSeconds % 86400) / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
@@ -114,40 +127,48 @@ interface Props {
 }
 
 export function MarketClosedBanner({ symbolInfo }: Props) {
-  const [now, setNow] = useState(() => new Date());
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [mountedAt] = useState(() => Date.now());
   const ticks = useTradingStore((s) => s.ticks);
 
-  useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(id);
-  }, []);
+  const category: string = symbolInfo?.category ?? "";
+  const catUpper = category.toUpperCase();
+  const is247 = !symbolInfo || catUpper === "CRYPTO" || catUpper === "FUTURES";
 
-  if (!symbolInfo) return null;
+  const symbolTick = symbolInfo ? ticks[symbolInfo.name ?? ""] : undefined;
+  const hasRecentTick = Boolean(symbolTick && nowMs - symbolTick.timestamp < LIVE_TICK_GRACE_MS);
+  const inStartupHoldoff = !symbolTick && nowMs - mountedAt < STARTUP_HOLDOFF_MS;
 
-  const category: string = symbolInfo.category ?? "";
-  if (category.toUpperCase() === "CRYPTO") return null;
-
-  // If the feed is actively delivering ticks for this symbol, the market is open.
-  const symbolTick = ticks[symbolInfo.name ?? ""];
-  if (symbolTick && Date.now() - symbolTick.timestamp < LIVE_TICK_GRACE_MS) return null;
-
-  // No tick yet — give the WebSocket connection time to deliver the first tick
-  // before falling back to schedule-based logic. Prevents a false "closed"
-  // flash on page load and after tab resume.
-  if (!symbolTick && Date.now() - mountedAt < STARTUP_HOLDOFF_MS) return null;
-
-  const tradingHours = ((symbolInfo as Record<string, unknown>).tradingHours ??
+  const tradingHours = ((symbolInfo as Record<string, unknown> | undefined)?.tradingHours ??
     []) as TradingHours[];
   const tz: string =
-    ((symbolInfo as Record<string, unknown>).sessionTimezone as string | undefined) ?? "UTC";
+    ((symbolInfo as Record<string, unknown> | undefined)?.sessionTimezone as string | undefined) ??
+    "UTC";
 
+  const nowDate = useMemo(() => new Date(nowMs), [nowMs]);
   const isOpen =
-    tradingHours.length > 0 ? isInWindow(tradingHours, tz, now) : isForexDefaultOpen(now);
+    is247 ||
+    hasRecentTick ||
+    inStartupHoldoff ||
+    (tradingHours.length > 0 ? isInWindow(tradingHours, tz, nowDate) : isForexDefaultOpen(nowDate));
+
+  // Compute next open timestamp only when closed (recomputes once per minute if not yet reached)
+  const closedMinuteBucket = Math.floor(nowMs / 60_000);
+  const nextOpenAtMs = useMemo(() => {
+    if (isOpen) return null;
+    return findNextOpenMs(tradingHours, tz, category, nowMs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, symbolInfo?.name, tz, category, closedMinuteBucket]);
+
+  useEffect(() => {
+    if (is247) return;
+    const id = setInterval(() => setNowMs(Date.now()), isOpen ? 10_000 : 1000);
+    return () => clearInterval(id);
+  }, [is247, isOpen]);
 
   if (isOpen) return null;
 
-  const msUntilOpen = msUntilNextOpen(tradingHours, tz, category, now);
+  const msUntilOpen = nextOpenAtMs != null ? Math.max(0, nextOpenAtMs - nowMs) : null;
 
   return (
     <div
@@ -162,9 +183,7 @@ export function MarketClosedBanner({ symbolInfo }: Props) {
           <>
             {" "}
             · Opens in{" "}
-            <span className="font-mono tabular-nums">
-              {formatCountdown(msUntilOpen - (new Date().getTime() - now.getTime()))}
-            </span>
+            <span className="font-mono tabular-nums">{formatCountdown(msUntilOpen)}</span>
           </>
         )}
       </span>

@@ -28,6 +28,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn, formatCurrency } from "@/lib/utils";
+import { useEconomicCalendar } from "@/services/queries";
 
 // ── Price Alert Manager (#53) ────────────────────────────────
 interface PriceAlert {
@@ -42,7 +43,8 @@ interface PriceAlert {
 export function PriceAlertManager({ symbol }: { symbol: string }) {
   const [alerts, setAlerts] = useState<PriceAlert[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem("price_alerts") || "[]");
+      const parsed = JSON.parse(localStorage.getItem("price_alerts") || "[]");
+      return Array.isArray(parsed) ? (parsed as PriceAlert[]) : [];
     } catch {
       return [];
     }
@@ -53,12 +55,16 @@ export function PriceAlertManager({ symbol }: { symbol: string }) {
 
   function saveAlerts(newAlerts: PriceAlert[]) {
     setAlerts(newAlerts);
-    localStorage.setItem("price_alerts", JSON.stringify(newAlerts));
+    try {
+      localStorage.setItem("price_alerts", JSON.stringify(newAlerts));
+    } catch {
+      // Ignore storage quota errors
+    }
   }
 
   function addAlert() {
     const p = parseFloat(price);
-    if (isNaN(p) || p <= 0) return;
+    if (!Number.isFinite(p) || p <= 0) return;
     const alert: PriceAlert = {
       id: Date.now().toString(),
       symbol,
@@ -583,46 +589,79 @@ export function PnlHeatmap({ data = [] }: { data?: { hour: number; day: number; 
 
 // ── News Feed (#60) ──────────────────────────────────────────
 export function NewsFeed({ symbol }: { symbol: string }) {
-  const news = useMemo(
+  const [activeTab, setActiveTab] = useState<"recent" | "history">("recent");
+  const { data: calendarEvents } = useEconomicCalendar(["USD", "EUR", "GBP"]);
+
+  const recentNews = useMemo(
     () => [
       {
-        id: 1,
-        title: `${symbol.slice(0, 3)} Central Bank Rate Decision Ahead`,
+        id: "n-1",
+        title: `Decisión inminente sobre tipos de interés del banco central de ${symbol.slice(0, 3)}`,
         source: "Reuters",
-        time: "2h ago",
+        time: "Hace 2h",
         impact: "HIGH" as const,
       },
       {
-        id: 2,
-        title: `${symbol.slice(3, 6) || "USD"} Employment Data Exceeds Expectations`,
+        id: "n-2",
+        title: `Los datos de empleo de ${symbol.slice(3, 6) || "USD"} superan las expectativas del mercado`,
         source: "Bloomberg",
-        time: "4h ago",
+        time: "Hace 4h",
         impact: "MEDIUM" as const,
       },
       {
-        id: 3,
-        title: `Technical Analysis: ${symbol} Approaching Key Resistance`,
-        source: "TradingView",
-        time: "6h ago",
+        id: "n-3",
+        title: `Análisis Técnico: ${symbol} se aproxima a una resistencia clave`,
+        source: "IBKR Wire",
+        time: "Hace 6h",
         impact: "LOW" as const,
       },
       {
-        id: 4,
-        title: "Global Risk Appetite Improves on Trade Deal Progress",
+        id: "n-4",
+        title: "Mejora el apetito por el riesgo global ante avances en acuerdos comerciales",
         source: "FT",
-        time: "8h ago",
+        time: "Hace 8h",
         impact: "MEDIUM" as const,
       },
       {
-        id: 5,
-        title: `${symbol} Volatility Expected to Increase Ahead of NFP`,
+        id: "n-5",
+        title: `Se espera un repunte de volatilidad en ${symbol} previo a las Nóminas no Agrícolas (NFP)`,
         source: "ForexLive",
-        time: "12h ago",
+        time: "Hace 12h",
         impact: "HIGH" as const,
       },
     ],
     [symbol],
   );
+
+  const historicalNews = useMemo(() => {
+    if (!calendarEvents || calendarEvents.length === 0) return [];
+    return calendarEvents.map((ev) => {
+      const d = new Date(ev.time);
+      const isValidDate = !Number.isNaN(d.getTime());
+      const dateStr = isValidDate
+        ? d.toLocaleDateString(undefined, {
+            month: "short",
+            day: "numeric",
+            year: "numeric",
+          })
+        : "—";
+      const timeStr = isValidDate
+        ? d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+        : "";
+      return {
+        id: ev.id,
+        title: `[${ev.currency}] ${ev.event} - Actual: ${ev.actual || "Pendiente"} (Prev: ${ev.previous || "--"}, Previsión: ${ev.forecast || "--"})`,
+        source: ev.country ? `${ev.country} Macro` : "Dato Económico",
+        time: `${dateStr} ${timeStr}`,
+        impact: (ev.impact === "high" ? "HIGH" : ev.impact === "medium" ? "MEDIUM" : "LOW") as
+          | "HIGH"
+          | "MEDIUM"
+          | "LOW",
+      };
+    });
+  }, [calendarEvents]);
+
+  const items = activeTab === "recent" ? recentNews : historicalNews;
 
   const impactColors = {
     HIGH: "bg-red-500/10 text-red-500",
@@ -632,22 +671,50 @@ export function NewsFeed({ symbol }: { symbol: string }) {
 
   return (
     <Card>
-      <CardHeader className="p-3 pb-0">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <Globe className="h-4 w-4 text-accent" /> Market News
-        </CardTitle>
+      <CardHeader className="p-3 pb-1">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <Globe className="h-4 w-4 text-accent" /> Market News & Releases
+          </CardTitle>
+          <div className="flex items-center gap-1 bg-secondary/60 p-0.5 rounded text-[10px]">
+            <button
+              type="button"
+              onClick={() => setActiveTab("recent")}
+              className={cn(
+                "px-2 py-0.5 rounded font-medium transition-colors",
+                activeTab === "recent"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              Recientes
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("history")}
+              className={cn(
+                "px-2 py-0.5 rounded font-medium transition-colors",
+                activeTab === "history"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              Histórico ({historicalNews.length})
+            </button>
+          </div>
+        </div>
       </CardHeader>
-      <CardContent className="p-3 pt-2 space-y-2">
-        {news.map((item) => (
+      <CardContent className="p-3 pt-2 space-y-2 max-h-[calc(100vh-280px)] overflow-y-auto">
+        {items.map((item) => (
           <div
             key={item.id}
-            className="flex items-start gap-2 py-1.5 border-b border-border/30 last:border-0"
+            className="flex items-start gap-2 py-1.5 border-b border-border/30 last:border-0 hover:bg-secondary/20 px-1 rounded transition-colors"
           >
             <div className="flex-1 min-w-0">
               <p className="text-xs font-medium leading-tight line-clamp-2">{item.title}</p>
               <div className="flex items-center gap-2 mt-1">
                 <span className="text-[10px] text-muted-foreground">{item.source}</span>
-                <span className="text-[10px] text-muted-foreground flex items-center gap-0.5">
+                <span className="text-[10px] text-muted-foreground flex items-center gap-0.5 font-mono">
                   <Clock className="h-2.5 w-2.5" /> {item.time}
                 </span>
               </div>

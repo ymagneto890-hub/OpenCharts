@@ -1,33 +1,82 @@
-import type { CandlestickData, Time } from "lightweight-charts";
+import type { CandlestickData, HistogramData, LineData, Time } from "lightweight-charts";
 import type { CandleData } from "../../lib/indicators.ts";
+import { getBucketStartSec } from "../../lib/timeframes.ts";
+import { getDemoSymbol } from "../../services/demo/instruments.ts";
 import { KNOWN_CURRENCIES } from "./constants.ts";
 import type { Timeframe } from "./constants.ts";
 
+function tickSizeToDigits(tickSize: number | string): number | null {
+  const n = Number(tickSize);
+  if (Number.isFinite(n) && n > 0) {
+    if (n < 1) {
+      const s = n.toExponential();
+      if (s.includes("e-")) {
+        const [mantissa = "1", expStr = "2"] = s.split("e-");
+        const exp = parseInt(expStr, 10);
+        const frac = mantissa.includes(".") ? mantissa.split(".")[1]!.length : 0;
+        return Math.min(8, Math.max(exp + frac, 2));
+      }
+      const decimals = Math.max(0, Math.round(-Math.log10(n)));
+      return Math.min(8, Math.max(decimals, 2));
+    }
+    return 2;
+  }
+  const str = String(tickSize);
+  if (str.includes(".")) {
+    const dec = str.split(".")[1]!.replace(/0+$/, "").length || str.split(".")[1]!.length;
+    return Math.min(8, Math.max(dec, 2));
+  }
+  return null;
+}
+
 /** Derive pip (decimal) precision from symbolInfo.tickSize or symbol name */
 export function getPipDigits(
-  symbolInfo?: { tickSize?: number | string },
-  symbolName?: string,
+  first?: { tickSize?: number | string } | string | null,
+  second?: { tickSize?: number | string } | string | null,
 ): number {
-  const symbolDecimals = _symbolNameDecimals(symbolName);
+  const symbolInfo =
+    typeof first === "object" && first !== null
+      ? first
+      : typeof second === "object" && second !== null
+        ? second
+        : undefined;
+  const symbolName =
+    typeof first === "string" ? first : typeof second === "string" ? second : undefined;
+
   if (symbolInfo?.tickSize) {
-    const s = String(symbolInfo.tickSize);
-    const tickDecimals = s.includes(".")
-      ? s.split(".")[1]!.replace(/0+$/, "").length || s.split(".")[1]!.length
-      : 0;
-    // Use the higher of tick-derived or symbol-name-derived so forex pairs
-    // (tickSize=0.0001) still show 5 decimal places instead of 4.
-    return Math.max(tickDecimals, symbolDecimals, 2);
+    const d = tickSizeToDigits(symbolInfo.tickSize);
+    if (d !== null) return d;
   }
-  return symbolDecimals;
+  return _symbolNameDecimals(symbolName);
 }
 
 function _symbolNameDecimals(symbolName?: string): number {
-  if (!symbolName) return 5;
+  if (!symbolName) return 2;
+  const meta = getDemoSymbol(symbolName);
+  if (meta) {
+    if (typeof meta.precision === "number") return meta.precision;
+    const d = tickSizeToDigits(meta.tickSize);
+    if (d !== null) return d;
+  }
   const n = symbolName.toUpperCase();
-  if (n.includes("JPY") || n.includes("XAU") || n.includes("GOLD")) return 3;
-  if (n.includes("BTC") || n.includes("ETH")) return 2;
-  if (n.includes("US30") || n.includes("SPX") || n.includes("NAS") || n.includes("DAX")) return 2;
-  return 5;
+  if (n.includes("SHIB") || n.includes("PEPE") || n.includes("BONK") || n.includes("FLOKI")) return 8;
+  if (n.includes("DOGE") || n.includes("VET") || n.includes("GALA")) return 5;
+  if (n.includes("XRP") || n.includes("ADA") || n.includes("SUI") || n.includes("ARB")) return 4;
+  if (n.includes("DOT") || n.includes("LINK") || n.includes("NEAR") || n.includes("USDJPY")) return 3;
+  if (n.includes("JPY") || n.includes("XAU") || n.includes("GOLD")) return 2;
+  if (
+    n.includes("EURUSD") ||
+    n.includes("EURGBP") ||
+    n.includes("EURCHF") ||
+    n.includes("EURAUD") ||
+    n.includes("EURCAD") ||
+    n.includes("EURNZD") ||
+    n.includes("GBPUSD") ||
+    n.includes("AUDUSD") ||
+    n.includes("USDCAD")
+  )
+    return 4;
+  return 2;
 }
 
 /** Get the minMove for lightweight-charts priceFormat from pip digits */
@@ -46,15 +95,17 @@ export function toUnixMs(ts: number): number {
   return ts > 1e12 ? ts : ts * 1000;
 }
 
+export type ChartCandle = CandlestickData<Time> & { volume?: number };
+
 /** Convert candles for indicator lib */
-export function toIndicatorCandles(candles: CandlestickData<Time>[]): CandleData[] {
+export function toIndicatorCandles(candles: ChartCandle[]): CandleData[] {
   return candles.map((c) => ({
     time: c.time as number,
     open: c.open,
     high: c.high,
     low: c.low,
     close: c.close,
-    volume: 0,
+    volume: c.volume ?? 0,
   }));
 }
 
@@ -83,17 +134,30 @@ export function extractCurrencies(symbol: string): string[] {
 
 /** Return the candle-bucket start (unix seconds) for a given timestamp */
 export function getCandleBucketTime(timestampMs: number, tf: Timeframe): number {
-  const SEC = 1000;
-  const intervals: Record<Timeframe, number> = {
-    "1m": 60 * SEC,
-    "5m": 5 * 60 * SEC,
-    "15m": 15 * 60 * SEC,
-    "30m": 30 * 60 * SEC,
-    "1h": 60 * 60 * SEC,
-    "4h": 4 * 60 * 60 * SEC,
-    "1d": 24 * 60 * 60 * SEC,
-    "1w": 7 * 24 * 60 * 60 * SEC,
-  };
-  const ms = intervals[tf];
-  return Math.floor((Math.floor(timestampMs / ms) * ms) / 1000);
+  return getBucketStartSec(timestampMs, tf);
 }
+
+export function calculateVolumeMa(
+  volumeData: HistogramData<Time>[],
+  period = 20,
+): LineData<Time>[] {
+  const out: LineData<Time>[] = [];
+  const p = Math.floor(period);
+  if (!Number.isFinite(period) || p <= 0 || volumeData.length < p) return out;
+  let sum = 0;
+  for (let i = 0; i < volumeData.length; i++) {
+    sum += volumeData[i]!.value;
+    if (i >= p) {
+      sum -= volumeData[i - p]!.value;
+    }
+    if (i >= p - 1) {
+      out.push({
+        time: volumeData[i]!.time,
+        value: Number((sum / p).toFixed(2)),
+      });
+    }
+  }
+  return out;
+}
+
+

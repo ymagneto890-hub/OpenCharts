@@ -28,7 +28,11 @@ export function readTraderPrefs(userId?: string | null): TraderPrefs {
 }
 
 export function writeTraderPrefs(prefs: TraderPrefs, userId?: string | null): void {
-  localStorage.setItem(getTraderPrefsStorageKey(userId), JSON.stringify(prefs));
+  try {
+    localStorage.setItem(getTraderPrefsStorageKey(userId), JSON.stringify(prefs));
+  } catch {
+    // ignore storage quota errors
+  }
 }
 
 export function applyAccentColorFromPrefs(prefs: TraderPrefs): void {
@@ -48,6 +52,7 @@ export function useTraderPreferences() {
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     const local = readTraderPrefs(userId);
     setPrefs(local);
     applyAccentColorFromPrefs(local);
@@ -55,6 +60,7 @@ export function useTraderPreferences() {
     api
       .getPreferences()
       .then((serverPrefs) => {
+        if (cancelled) return;
         if (serverPrefs && typeof serverPrefs === "object") {
           const merged = { ...serverPrefs, ...local };
           setPrefs(merged);
@@ -63,7 +69,12 @@ export function useTraderPreferences() {
         }
         setLoaded(true);
       })
-      .catch(() => setLoaded(true));
+      .catch(() => {
+        if (!cancelled) setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [userId]);
 
   const savePreferences = useMemo(
@@ -79,10 +90,10 @@ export function useTraderPreferences() {
 
   const savePreference = useMemo(
     () => (key: string, value: string) => {
-      const next = { ...prefs, [key]: value };
+      const next = { ...readTraderPrefs(userId), [key]: value };
       savePreferences(next);
     },
-    [prefs, savePreferences],
+    [userId, savePreferences],
   );
 
   return {

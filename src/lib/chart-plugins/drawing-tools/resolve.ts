@@ -115,10 +115,25 @@ export function xToTime(ctx: ResolveCtx, x: number): number | null {
   // Snap to whole bar offsets so future anchors stay on the bar grid.
   if (logical > lastIdx) return lastTime + Math.round(logical - lastIdx) * intervalSec;
   if (logical < 0) return firstTime + Math.round(logical) * intervalSec;
-  return null;
+  const idx = Math.min(Math.max(Math.round(logical), 0), lastIdx);
+  return data[idx]!.time as number;
 }
 
 // ── Drawing resolution ───────────────────────────────────────────────────────
+
+function getPaneWidth(chart: ResolveCtx["chart"]): number {
+  const tsWidth = chart.timeScale().width();
+  if (tsWidth > 0) return tsWidth;
+  try {
+    const elWidth = chart.chartElement?.()?.clientWidth ?? 0;
+    const psWidth = chart.priceScale("right")?.width?.() ?? 0;
+    if (elWidth > psWidth) return elWidth - psWidth;
+    if (elWidth > 0) return elWidth;
+  } catch {
+    // fallback when headless or unmounted
+  }
+  return 2000;
+}
 
 /** Convert a drawing's data-space anchors into pane pixel coordinates. */
 export function resolveEntry(d: DrawingLine, ctx: ResolveCtx, state: EntryState): ResolvedEntry {
@@ -134,7 +149,7 @@ export function resolveEntry(d: DrawingLine, ctx: ResolveCtx, state: EntryState)
     entry.fibLevels = resolveFibLevels(d, ctx.series);
   }
   if (d.type === "trendline") {
-    entry.seg = trendlineSegment(entry, ctx.chart.timeScale().width());
+    entry.seg = trendlineSegment(entry, getPaneWidth(ctx.chart));
     if (state === "selected" || state === "preview") entry.stats = trendlineStats(d, ctx);
   }
   if (d.type === "position") {
@@ -155,7 +170,10 @@ function trendlineStats(d: DrawingLine, ctx: ResolveCtx): string[] {
   const pct = d.price !== 0 ? (dp / d.price) * 100 : 0;
   const bars = ctx.intervalSec > 0 ? Math.round(Math.abs(d.time2 - d.time) / ctx.intervalSec) : 0;
   const formatted = ctx.series.priceFormatter().format(Math.abs(dp));
-  return [`${dp >= 0 ? "+" : "−"}${formatted} (${pct.toFixed(2)}%)`, `${bars} bars`];
+  const sign = dp >= 0 ? "+" : "−";
+  const pctSign = pct >= 0 ? "+" : "";
+  const barLabel = bars === 1 ? "1 vela" : `${bars} velas`;
+  return [`${sign}${formatted} (${pctSign}${pct.toFixed(2)}%)`, barLabel];
 }
 
 type Segment = NonNullable<ResolvedEntry["seg"]>;

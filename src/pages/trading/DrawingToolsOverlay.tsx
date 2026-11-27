@@ -327,6 +327,7 @@ function FibLevelsRow({
   return (
     <SettingsRow label="Levels">
       <input
+        key={`${drawing.id}:${current.join(",")}`}
         type="text"
         defaultValue={current.join(", ")}
         onBlur={(e) => {
@@ -404,7 +405,9 @@ function CoordinateInputs({
         <NumRow
           label="Risk %"
           value={drawing.riskPct ?? 1}
-          onChange={(riskPct) => patch({ riskPct })}
+          onChange={(riskPct) => {
+            if (riskPct > 0) patch({ riskPct });
+          }}
         />
       )}
     </>
@@ -777,6 +780,16 @@ export function DrawingContextMenu({
     fn();
     onClose();
   };
+  const menuWidth = 184;
+  const menuHeight = canAlert ? 252 : 224;
+  const clampedLeft =
+    typeof window !== "undefined"
+      ? Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8))
+      : Math.max(8, x);
+  const clampedTop =
+    typeof window !== "undefined"
+      ? Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8))
+      : Math.max(8, y);
   return (
     <>
       <button
@@ -787,7 +800,7 @@ export function DrawingContextMenu({
       />
       <div
         className="fixed z-40 w-44 rounded-md bg-card border border-border shadow-2xl py-1"
-        style={{ left: x, top: y }}
+        style={{ left: clampedLeft, top: clampedTop }}
       >
         <MenuItem icon={Settings2} label="Settings" onClick={act(onSettings)} />
         <MenuItem icon={Copy} label="Duplicate" onClick={act(onDuplicate)} />

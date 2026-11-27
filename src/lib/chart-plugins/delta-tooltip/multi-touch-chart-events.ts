@@ -24,8 +24,19 @@ function determineChartX(
   mouseX: number,
 ): number | null {
   const chartBox = chartElement.getBoundingClientRect();
-  const x = mouseX - chartBox.left - chart.priceScale("left").width();
-  if (x < 0 || x > chart.timeScale().width()) return null;
+  const leftW = chart.priceScale("left").width();
+  const x = mouseX - chartBox.left - leftW;
+  let paneWidth = chart.timeScale().width();
+  if (paneWidth <= 0) {
+    let rightW = 0;
+    try {
+      rightW = chart.priceScale("right").width();
+    } catch {
+      rightW = 0;
+    }
+    paneWidth = Math.max(0, chartBox.width - leftW - rightW);
+  }
+  if (paneWidth <= 0 || x < 0 || x > paneWidth) return null;
   return x;
 }
 

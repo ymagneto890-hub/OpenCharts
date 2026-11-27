@@ -2,15 +2,15 @@ import { Time, isUTCTimestamp, isBusinessDay } from "lightweight-charts";
 
 export function convertTime(t: Time): number {
   if (isUTCTimestamp(t)) return t * 1000;
-  if (isBusinessDay(t)) return new Date(t.year, t.month, t.day).valueOf();
+  if (isBusinessDay(t)) return new Date(t.year, t.month - 1, t.day).valueOf();
   const parts = t.split("-").map(Number);
-  return new Date(parts[0]!, parts[1]!, parts[2]!).valueOf();
+  return new Date(parts[0]!, (parts[1] ?? 1) - 1, parts[2]!).valueOf();
 }
 
 export function displayTime(time: Time): string {
   if (typeof time == "string") return time;
   const date = isBusinessDay(time)
-    ? new Date(time.year, time.month, time.day)
+    ? new Date(time.year, time.month - 1, time.day)
     : new Date(time * 1000);
   return date.toLocaleDateString();
 }

@@ -2,6 +2,8 @@ import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { TrendingUp, TrendingDown } from "lucide-react";
 import { useInstrumentLabels } from "../../hooks/useInstrumentLabels.ts";
+import { getPipDigits } from "../../pages/trading/utils.ts";
+import { getSummary } from "../../services/demo/engine.ts";
 
 interface OrderConfirmDialogProps {
   isOpen: boolean;
@@ -21,6 +23,7 @@ interface OrderConfirmDialogProps {
   symbolInfo?: {
     digits?: number;
     pip?: number;
+    tickSize?: number;
     contractSize?: number;
     marginPercent?: number;
     commission?: number;
@@ -41,6 +44,9 @@ export function OrderConfirmDialog({
   const { formatQty } = useInstrumentLabels();
   if (!isOpen || !order) return null;
 
+  const digits = getPipDigits(order.symbol, symbolInfo ?? undefined);
+  const contractSize = symbolInfo?.contractSize ?? 1;
+
   const executionPrice =
     order.type === "MARKET"
       ? order.side === "BUY"
@@ -48,15 +54,20 @@ export function OrderConfirmDialog({
         : tick?.bid
       : order.price || order.stopPrice;
 
+  const notional = executionPrice ? order.quantity * contractSize * executionPrice : null;
+
   const marginRequired =
-    executionPrice && symbolInfo
-      ? order.quantity *
-        (symbolInfo.contractSize || 100000) *
-        executionPrice *
-        ((symbolInfo.marginPercent || 1) / 100)
+    notional !== null && symbolInfo
+      ? notional * ((symbolInfo.marginPercent || 1) / 100)
       : null;
 
-  const commission = symbolInfo ? (symbolInfo.commission || 0) * order.quantity : null;
+  const feeRate = getSummary().feeRate;
+  const commission =
+    notional !== null
+      ? symbolInfo?.commission
+        ? symbolInfo.commission * order.quantity
+        : notional * feeRate
+      : null;
 
   const tpPnl =
     order.takeProfit && executionPrice
@@ -64,20 +75,25 @@ export function OrderConfirmDialog({
           ? order.takeProfit - executionPrice
           : executionPrice - order.takeProfit) *
         order.quantity *
-        (symbolInfo?.contractSize || 100000)
+        contractSize
       : null;
 
   const slPnl =
     order.stopLoss && executionPrice
       ? (order.side === "BUY" ? order.stopLoss - executionPrice : executionPrice - order.stopLoss) *
         order.quantity *
-        (symbolInfo?.contractSize || 100000)
+        contractSize
       : null;
 
   return (
     <>
       <div className="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm" onClick={onCancel} />
-      <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+      <div
+        className="fixed inset-0 z-[70] flex items-center justify-center p-4"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onCancel();
+        }}
+      >
         <div className="w-full max-w-sm bg-card border border-border rounded-xl shadow-2xl overflow-hidden">
           <div
             className={cn(
@@ -103,12 +119,13 @@ export function OrderConfirmDialog({
               valueClass={order.side === "BUY" ? "text-buy" : "text-sell"}
             />
             <Row label="Type" value={order.type} />
-            <Row label="Volume" value={formatQty(order.quantity)} />
-            {executionPrice && <Row label="Price" value={formatNumber(executionPrice, 5)} />}
+            <Row label="Quantity (Units)" value={formatQty(order.quantity, order.symbol)} />
+            {executionPrice && <Row label="Price" value={formatNumber(executionPrice, digits)} />}
+            {notional !== null && <Row label="Notional Value" value={formatCurrency(notional)} />}
             {order.takeProfit && (
               <Row
                 label="Take Profit"
-                value={formatNumber(order.takeProfit, 5)}
+                value={formatNumber(order.takeProfit, digits)}
                 extra={
                   tpPnl !== null ? `(${tpPnl >= 0 ? "+" : ""}${formatCurrency(tpPnl)})` : undefined
                 }
@@ -118,7 +135,7 @@ export function OrderConfirmDialog({
             {order.stopLoss && (
               <Row
                 label="Stop Loss"
-                value={formatNumber(order.stopLoss, 5)}
+                value={formatNumber(order.stopLoss, digits)}
                 extra={
                   slPnl !== null ? `(${slPnl >= 0 ? "+" : ""}${formatCurrency(slPnl)})` : undefined
                 }
@@ -128,7 +145,7 @@ export function OrderConfirmDialog({
             {marginRequired !== null && (
               <Row label="Margin Required" value={formatCurrency(marginRequired)} />
             )}
-            {commission !== null && <Row label="Commission" value={formatCurrency(commission)} />}
+            {commission !== null && <Row label="Est. Commission" value={formatCurrency(commission)} />}
           </div>
 
           <div className="px-5 py-3 border-t border-border/40 flex gap-2">

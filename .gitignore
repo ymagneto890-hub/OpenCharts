@@ -9,3 +9,7 @@ dist
 coverage
 playwright-report
 test-results
+trade_screenshots/ibkr_config.json
+trade_screenshots/fmp_float_cache.json
+trade_screenshots/historical_ibkr_cache.json
+trade_screenshots/sec_edgar_cache/

@@ -32,6 +32,7 @@ export function detectCrossings(
   nowSec: number,
   firedAt: Map<string, number>,
 ): DrawingLine[] {
+  if (!Number.isFinite(prevMid) || !Number.isFinite(mid)) return [];
   const out: DrawingLine[] = [];
   for (const d of drawings) {
     const lp = linePriceAt(d, nowSec);
@@ -57,7 +58,9 @@ export function playAlertBeep(): void {
     gain.connect(ac.destination);
     osc.start();
     osc.stop(ac.currentTime + 0.15);
-    osc.onended = () => ac.close();
+    osc.onended = () => {
+      ac.close().catch(() => {});
+    };
   } catch {
     /* audio unavailable */
   }

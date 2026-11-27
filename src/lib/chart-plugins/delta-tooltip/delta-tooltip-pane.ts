@@ -344,7 +344,7 @@ const defaultOptions: DeltaTooltipData = {
   deltaTopLine: "",
   deltaBottomLine: "",
   deltaBackgroundColor: "#ffffff",
-  deltaTextColor: "#",
+  deltaTextColor: "#000000",
   topSpacing: 20,
   tooltips: [],
 };

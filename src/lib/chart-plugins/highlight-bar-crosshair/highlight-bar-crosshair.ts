@@ -145,13 +145,25 @@ export class CrosshairHighlightPrimitive implements ISeriesPrimitive<Time> {
     const ts = chart.timeScale();
     const visibleLogicalRange = ts.getVisibleLogicalRange();
     if (!visibleLogicalRange) return 6;
-    return ts.width() / (visibleLogicalRange.to - visibleLogicalRange.from);
+    const span = visibleLogicalRange.to - visibleLogicalRange.from;
+    if (!(span > 0)) return 6;
+    let width = ts.width();
+    if (width <= 0) {
+      let rightW = 0;
+      try {
+        rightW = chart.priceScale("right").width();
+      } catch {
+        rightW = 0;
+      }
+      width = Math.max(0, chart.chartElement().clientWidth - rightW);
+    }
+    return width > 0 ? width / span : 6;
   }
 
   private _onMouseMove(param: MouseEventParams) {
     const chart = this.chart();
     const logical = param.logical;
-    if (!logical || !chart) {
+    if (logical == null || !chart) {
       this.setData({
         x: 0,
         visible: false,

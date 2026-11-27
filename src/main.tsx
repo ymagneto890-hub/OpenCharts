@@ -63,6 +63,8 @@ function handleChunkLoadError(event: ErrorEvent | PromiseRejectionEvent) {
 window.addEventListener("error", handleChunkLoadError);
 window.addEventListener("unhandledrejection", handleChunkLoadError);
 
+import "./lib/dom-patch.ts";
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>

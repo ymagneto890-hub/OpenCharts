@@ -115,7 +115,8 @@ function hitPosition(e: ResolvedEntry, p: Pt, tol: Tol): Hit | null {
     return pointHit(e, null, "stopPrice");
   }
   if (dist(p, { x: xm, y: y1 }) <= tol.handle) return pointHit(e, null, "price");
-  if (dist(p, { x: xb, y: y1 }) <= tol.handle) return pointHit(e, "time2", null);
+  const rightKey: TimeKey = x2 >= x1 ? "time2" : "time";
+  if (dist(p, { x: xb, y: y1 }) <= tol.handle) return pointHit(e, rightKey, null);
   const ys = [y1, yStop ?? y1, yTarget ?? y1];
   const top = Math.min(...ys);
   const bot = Math.max(...ys);

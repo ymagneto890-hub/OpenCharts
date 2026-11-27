@@ -21,6 +21,7 @@ export class ClosestTimeIndexFinder<T extends { time: number }> {
   }
 
   private _performSearch(target: number, direction: SearchDirection): number {
+    if (this.numbers.length === 0) return -1;
     let low = 0;
     let high = this.numbers.length - 1;
 

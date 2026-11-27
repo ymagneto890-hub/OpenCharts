@@ -56,7 +56,11 @@ class PriceAxisLabelView implements ISeriesPrimitiveAxisView {
   }
 
   update(): void {
-    this._y = this._source.series.priceToCoordinate(this._price);
+    try {
+      this._y = this._source.series.priceToCoordinate(this._price);
+    } catch {
+      this._y = null;
+    }
   }
 
   coordinate(): number {
@@ -72,7 +76,11 @@ class PriceAxisLabelView implements ISeriesPrimitiveAxisView {
   }
 
   text(): string {
-    return this._source.series.priceFormatter().format(this._price);
+    try {
+      return this._source.series.priceFormatter().format(this._price);
+    } catch {
+      return String(this._price);
+    }
   }
 
   textColor(): string {
@@ -149,7 +157,13 @@ export class DrawingsPrimitive extends PluginBase {
   drawInfo(): DrawCtxInfo {
     return {
       accountEquity: this._accountEquity,
-      priceFormat: (p: number) => this.series.priceFormatter().format(p),
+      priceFormat: (p: number) => {
+        try {
+          return this.series.priceFormatter().format(p);
+        } catch {
+          return String(p);
+        }
+      },
     };
   }
 
@@ -176,10 +190,14 @@ export class DrawingsPrimitive extends PluginBase {
   }
 
   resolveEntries(): ResolvedEntry[] {
-    const ctx = makeResolveCtx(this.chart, this.series, this._intervalSec);
-    const entries = this._drawings.map((d) => resolveEntry(d, ctx, this._stateFor(d.id)));
-    if (this._preview) entries.push(resolveEntry(this._preview, ctx, "preview"));
-    return entries;
+    try {
+      const ctx = makeResolveCtx(this.chart, this.series, this._intervalSec);
+      const entries = this._drawings.map((d) => resolveEntry(d, ctx, this._stateFor(d.id)));
+      if (this._preview) entries.push(resolveEntry(this._preview, ctx, "preview"));
+      return entries;
+    } catch {
+      return [];
+    }
   }
 
   private _stateFor(id: string): EntryState {

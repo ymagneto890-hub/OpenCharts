@@ -1,114 +1,100 @@
 import {
-  ArrowDownRight,
-  ArrowRight,
-  ArrowUpRight,
-  Circle,
   Equal,
   EyeOff,
   GripVertical,
   Layers,
-  Layers3,
-  type LucideIcon,
   Minus,
   MousePointer2,
-  MoveUpRight,
   MoveVertical,
   PenTool,
   Ruler,
-  Spline,
   Square,
+  TrendingDown,
   TrendingUp,
-  Triangle,
   Type,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ComponentType, useEffect, useRef, useState } from "react";
 import { useDragOffset } from "../../hooks/useDragOffset.ts";
 import { cn } from "../../lib/utils.ts";
 import type { DrawingTool } from "./constants.ts";
 
+type RailIcon = ComponentType<{ className?: string }>;
+
+function TrendLineIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <circle cx="5" cy="19" r="2" />
+      <circle cx="19" cy="5" r="2" />
+      <line x1="6.4" y1="17.6" x2="17.6" y2="6.4" />
+    </svg>
+  );
+}
+
 interface ToolMeta {
   tool: DrawingTool;
-  icon: LucideIcon;
+  icon: RailIcon;
   label: string;
 }
 
 interface ToolGroup {
   id: string;
-  icon: LucideIcon;
+  icon: RailIcon;
   label: string;
   tools: ToolMeta[];
 }
 
-// TradingView-style left rail: tools grouped behind a flyout per category.
-const GROUPS: ToolGroup[] = [
-  {
-    id: "lines",
-    icon: TrendingUp,
-    label: "Lines",
-    tools: [
-      { tool: "trendline", icon: TrendingUp, label: "Trend Line" },
-      { tool: "ray", icon: MoveUpRight, label: "Ray" },
-      { tool: "extended", icon: Spline, label: "Extended Line" },
-      { tool: "horizontal", icon: Minus, label: "Horizontal Line" },
-      { tool: "vertical", icon: MoveVertical, label: "Vertical Line" },
-      { tool: "channel", icon: Equal, label: "Parallel Channel" },
-    ],
-  },
-  {
-    id: "fib",
-    icon: Layers,
-    label: "Fibonacci",
-    tools: [
-      { tool: "fibonacci", icon: Layers, label: "Fib Retracement" },
-      { tool: "fibextension", icon: Layers3, label: "Fib Extension" },
-    ],
-  },
-  {
-    id: "shapes",
-    icon: Square,
-    label: "Shapes",
-    tools: [
-      { tool: "rectangle", icon: Square, label: "Rectangle" },
-      { tool: "ellipse", icon: Circle, label: "Ellipse" },
-      { tool: "triangle", icon: Triangle, label: "Triangle" },
-      { tool: "arrow", icon: ArrowRight, label: "Arrow" },
-    ],
-  },
-  {
-    id: "trade",
-    icon: ArrowUpRight,
-    label: "Trade",
-    tools: [
-      { tool: "long-position", icon: ArrowUpRight, label: "Long Position" },
-      { tool: "short-position", icon: ArrowDownRight, label: "Short Position" },
-      { tool: "measure", icon: Ruler, label: "Measure" },
-    ],
-  },
-  { id: "text", icon: Type, label: "Text", tools: [{ tool: "text", icon: Type, label: "Text" }] },
-];
+// Clean left rail: only essential tools requested by trader
+const LINES_GROUP: ToolGroup = {
+  id: "lines",
+  icon: Minus,
+  label: "Lines",
+  tools: [
+    { tool: "horizontal", icon: Minus, label: "Horizontal Line" },
+    { tool: "vertical", icon: MoveVertical, label: "Vertical Line" },
+    { tool: "channel", icon: Equal, label: "Parallel Channel" },
+  ],
+};
 
 function RailButton({
   icon: Icon,
   title,
   active,
   onClick,
+  testId,
+  activeClassName,
+  iconClassName,
 }: {
-  icon: LucideIcon;
+  icon: RailIcon;
   title: string;
   active?: boolean;
   onClick: () => void;
+  testId?: string;
+  activeClassName?: string;
+  iconClassName?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       title={title}
       onClick={onClick}
       className={cn(
         "p-1.5 rounded hover:bg-secondary",
-        active ? "bg-primary/20 text-primary" : "text-muted-foreground",
+        active ? (activeClassName ?? "bg-primary/20 text-primary") : "text-muted-foreground",
       )}
     >
-      <Icon className="h-4 w-4" />
+      <Icon className={cn("h-4 w-4", iconClassName)} />
     </button>
   );
 }
@@ -128,6 +114,8 @@ function RailGroup({
 }) {
   const activeMeta = group.tools.find((t) => t.tool === activeTool);
   const Icon = activeMeta?.icon ?? group.icon;
+
+
   return (
     <div className="relative">
       <RailButton icon={Icon} title={group.label} active={Boolean(activeMeta)} onClick={onToggle} />
@@ -156,9 +144,13 @@ function RailGroup({
 export function DrawingToolRail({
   drawingTool,
   onDrawingTool,
+  onZoomIn,
+  onZoomOut,
 }: {
   drawingTool: DrawingTool;
   onDrawingTool: (t: DrawingTool) => void;
+  onZoomIn?: () => void;
+  onZoomOut?: () => void;
 }) {
   const [openGroup, setOpenGroup] = useState<string | null>(null);
   const [hidden, setHidden] = useState(false);
@@ -192,7 +184,7 @@ export function DrawingToolRail({
         title="Show drawing tools"
         onClick={() => setHidden(false)}
         style={drag.style}
-        className="absolute left-1 top-1 z-20 rounded-md border border-border bg-card/90 p-1.5 text-muted-foreground backdrop-blur-sm hover:text-primary"
+        className="absolute left-1.5 top-12 z-20 rounded-md border border-border bg-card/90 p-1.5 text-muted-foreground backdrop-blur-sm hover:text-primary shadow-md"
       >
         <PenTool className="h-4 w-4" />
       </button>
@@ -203,7 +195,7 @@ export function DrawingToolRail({
     <div
       ref={ref}
       style={drag.style}
-      className="absolute left-1 top-1 z-20 flex flex-col items-center gap-0.5 rounded-md bg-card/90 border border-border p-0.5 backdrop-blur-sm"
+      className="absolute left-1.5 top-12 z-20 flex flex-col items-center gap-0.5 rounded-md bg-card/90 border border-border p-0.5 backdrop-blur-sm shadow-md"
     >
       <div
         onPointerDown={drag.onPointerDown}
@@ -212,6 +204,7 @@ export function DrawingToolRail({
       >
         <GripVertical className="h-3.5 w-3.5" />
       </div>
+      {/* 1. Cursor */}
       <RailButton
         icon={MousePointer2}
         title="Cursor"
@@ -221,16 +214,111 @@ export function DrawingToolRail({
           setOpenGroup(null);
         }}
       />
-      {GROUPS.map((g) => (
-        <RailGroup
-          key={g.id}
-          group={g}
-          activeTool={drawingTool}
-          open={openGroup === g.id}
-          onToggle={() => setOpenGroup((o) => (o === g.id ? null : g.id))}
-          onSelect={select}
+
+      {/* 2. Líneas (Horizontal, Vertical, Canal) */}
+      <RailGroup
+        group={LINES_GROUP}
+        activeTool={drawingTool}
+        open={openGroup === "lines"}
+        onToggle={() => setOpenGroup((o) => (o === "lines" ? null : "lines"))}
+        onSelect={select}
+      />
+
+      {/* 3. Trend Line (1 clic directo) */}
+      <RailButton
+        icon={TrendLineIcon}
+        title="Trend Line (Alt+T)"
+        active={drawingTool === "trendline"}
+        onClick={() => {
+          onDrawingTool(drawingTool === "trendline" ? "none" : "trendline");
+          setOpenGroup(null);
+        }}
+      />
+
+      {/* 4. Rectángulo (1 clic directo) */}
+      <RailButton
+        icon={Square}
+        title="Rectángulo (Alt+R)"
+        active={drawingTool === "rectangle"}
+        onClick={() => {
+          onDrawingTool(drawingTool === "rectangle" ? "none" : "rectangle");
+          setOpenGroup(null);
+        }}
+      />
+
+      {/* 4. Regla (Medir porcentaje y precio) - Antes que Fibonacci */}
+      <RailButton
+        icon={Ruler}
+        title="Medir porcentaje y precio rápido (Regla - Alt+M)"
+        active={drawingTool === "measure"}
+        onClick={() => {
+          onDrawingTool(drawingTool === "measure" ? "none" : "measure");
+          setOpenGroup(null);
+        }}
+      />
+
+      {/* 5. Calculadora Risk/Reward desde punto de entrada elegido (Long / Short) */}
+      <RailButton
+        testId="tool-long-position"
+        icon={TrendingUp}
+        title="Posición Larga (R:R) — Haz clic en tu punto de entrada y ajusta TP/SL"
+        active={drawingTool === "long-position"}
+        activeClassName="bg-emerald-500/20 text-emerald-400"
+        iconClassName={drawingTool === "long-position" ? "text-emerald-400" : "text-emerald-400/80"}
+        onClick={() => {
+          onDrawingTool(drawingTool === "long-position" ? "none" : "long-position");
+          setOpenGroup(null);
+        }}
+      />
+      <RailButton
+        testId="tool-short-position"
+        icon={TrendingDown}
+        title="Posición Corta (R:R) — Haz clic en tu punto de entrada y ajusta TP/SL"
+        active={drawingTool === "short-position"}
+        activeClassName="bg-rose-500/20 text-rose-400"
+        iconClassName={drawingTool === "short-position" ? "text-rose-400" : "text-rose-400/80"}
+        onClick={() => {
+          onDrawingTool(drawingTool === "short-position" ? "none" : "short-position");
+          setOpenGroup(null);
+        }}
+      />
+
+      {/* 6. Retroceso de Fibonacci (1 clic directo) */}
+      <RailButton
+        icon={Layers}
+        title="Fibonacci"
+        active={drawingTool === "fibonacci"}
+        onClick={() => {
+          onDrawingTool(drawingTool === "fibonacci" ? "none" : "fibonacci");
+          setOpenGroup(null);
+        }}
+      />
+
+      {/* 6. Texto */}
+      <RailButton
+        icon={Type}
+        title="Texto"
+        active={drawingTool === "text"}
+        onClick={() => {
+          onDrawingTool(drawingTool === "text" ? "none" : "text");
+          setOpenGroup(null);
+        }}
+      />
+      <div className="my-0.5 w-full border-t border-border/50" />
+      {onZoomIn && (
+        <RailButton
+          icon={ZoomIn}
+          title="Acercar gráfico (Zoom In / +)"
+          onClick={onZoomIn}
         />
-      ))}
+      )}
+      {onZoomOut && (
+        <RailButton
+          icon={ZoomOut}
+          title="Alejar gráfico (Zoom Out / -)"
+          onClick={onZoomOut}
+        />
+      )}
       <div className="my-0.5 w-full border-t border-border/50" />
       <RailButton icon={EyeOff} title="Hide toolbar" onClick={hide} />
     </div>

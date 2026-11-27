@@ -207,7 +207,7 @@ export class TooltipPrimitive implements ISeriesPrimitive<Time> {
     const chart = this.chart();
     const series = this.series();
     const logical = param.logical;
-    if (!logical || !chart || !series) {
+    if (logical == null || !chart || !series) {
       this._hideCrosshair();
       return;
     }

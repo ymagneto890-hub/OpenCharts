@@ -1,8 +1,9 @@
 import { useEffect, startTransition } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useAuthStore, useTradingStore } from "../services/store.tsx";
+import { useTradingStore } from "../services/store.tsx";
 import { wsClient } from "../services/ws.ts";
-import { queryKeys } from "../services/queries.ts";
+import { queryKeys, type MarketDataCandlesPayload } from "../services/queries.ts";
+import { getHistory } from "../services/demo/candles.ts";
 import type { Position, Order } from "../services/schemas.ts";
 
 /**
@@ -36,24 +37,20 @@ type MarketDataEvent =
       volume: number;
       timestamp: number;
     }
-  | { eventType: "CandleClosed"; symbol: string; timeframe: string }
-  | {
-      eventType: "ReplayStateChanged";
-      action?: string;
-      speed?: number;
-      userId?: string;
-      cursorTimestamp?: number;
-    };
+  | { eventType: "CandleClosed"; symbol: string; timeframe: string };
 
 // Position WS event types — enriched server-side with _entity for direct cache updates
 type PositionWsEvent = {
-  eventType: "PositionOpened" | "PositionUpdated" | "PositionClosed";
+  eventType: "PositionOpened" | "PositionUpdated" | "PositionClosed" | "ModeChanged";
   accountId: string;
   positionId: string;
   // PositionUpdated fields (surgical patch — no DB lookup needed)
   unrealizedPnl?: number;
   quantity?: number;
   averagePrice?: number;
+  /** Present only when the event changes the level (null = removed). */
+  stopLoss?: number | null;
+  takeProfit?: number | null;
   // Attached by ws-handler enrichment (PositionOpened only)
   _entity?: Position;
 };
@@ -168,7 +165,6 @@ export function MarketDataBridge() {
   const updateTick = useTradingStore((s) => s.updateTick);
   const updateLiveTick = useTradingStore((s) => s.updateLiveTick);
   const updateCandleFromWs = useTradingStore((s) => s.updateCandleFromWs);
-  const onReplayStateChanged = useTradingStore((s) => s.onReplayStateChanged);
   const updateAccountInStore = useTradingStore((s) => s.updateAccountInStore);
   const loadAccounts = useTradingStore((s) => s.loadAccounts);
   const queryClient = useQueryClient();
@@ -192,23 +188,32 @@ export function MarketDataBridge() {
           timestamp: wsEvent.timestamp,
         });
       } else if (wsEvent.eventType === "CandleClosed") {
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.market.candles(wsEvent.symbol, wsEvent.timeframe),
-        });
-      } else if (wsEvent.eventType === "ReplayStateChanged") {
-        const currentUserId = useAuthStore.getState().user?.id;
-        if (wsEvent.userId && currentUserId && wsEvent.userId !== currentUserId) return;
-        onReplayStateChanged(wsEvent.action || "started", {
-          speed: wsEvent.speed,
-          cursorTimestamp: wsEvent.cursorTimestamp,
-        });
-        queryClient.invalidateQueries({ queryKey: ["candles"] });
+        // Immediately sync closed live bars from in-memory store into React Query cache
+        // so EMA 9, VWAP, and Volume MA(20) on 1m / 3m / 5m charts never skip closed bars.
+        const freshBars = getHistory(wsEvent.symbol, wsEvent.timeframe, 1_500);
+        if (freshBars.length > 0) {
+          queryClient.setQueriesData<MarketDataCandlesPayload>(
+            { queryKey: queryKeys.market.candles(wsEvent.symbol, wsEvent.timeframe) },
+            (old) => ({
+              candles: freshBars,
+              metadata: old?.metadata ?? {
+                isPartial: false,
+                backfillQueued: false,
+                historicalCoverageStart: null,
+              },
+            }),
+          );
+        } else {
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.market.candles(wsEvent.symbol, wsEvent.timeframe),
+          });
+        }
       }
     });
     return () => {
       unsub();
     };
-  }, [updateTick, updateLiveTick, updateCandleFromWs, onReplayStateChanged, queryClient]);
+  }, [updateTick, updateLiveTick, updateCandleFromWs, queryClient]);
 
   // Account/equity events.
   useEffect(() => {
@@ -275,6 +280,8 @@ export function MarketDataBridge() {
                     unrealizedPnl: ev.unrealizedPnl ?? p.unrealizedPnl,
                     quantity: ev.quantity ?? p.quantity,
                     entryPrice: ev.averagePrice ?? p.entryPrice,
+                    stopLoss: ev.stopLoss !== undefined ? ev.stopLoss : p.stopLoss,
+                    takeProfit: ev.takeProfit !== undefined ? ev.takeProfit : p.takeProfit,
                   }
                 : p,
             ),
@@ -284,6 +291,20 @@ export function MarketDataBridge() {
       }
 
       if (ev.eventType === "PositionClosed") {
+        const pendingBuf = _positionBatchBuffers.get(ev.accountId);
+        if (pendingBuf) {
+          const filtered = pendingBuf.filter((p) => p.id !== ev.positionId);
+          if (filtered.length === 0) {
+            _positionBatchBuffers.delete(ev.accountId);
+            const t = _positionBatchTimers.get(ev.accountId);
+            if (t) {
+              clearTimeout(t);
+              _positionBatchTimers.delete(ev.accountId);
+            }
+          } else {
+            _positionBatchBuffers.set(ev.accountId, filtered);
+          }
+        }
         startTransition(() => {
           queryClient.setQueryData<Position[]>(posKey, (old) =>
             (old ?? []).filter((p) => p.id !== ev.positionId),
@@ -291,6 +312,22 @@ export function MarketDataBridge() {
         });
         // Closed positions list needs a refresh — coalesced so burst closes → 1 fetch
         coalesceInvalidation(queryClient, ["closedPositions", ev.accountId]);
+        coalesceInvalidation(queryClient, ["fills", ev.accountId]);
+        return;
+      }
+
+      if (ev.eventType === "ModeChanged") {
+        const pendingTimer = _positionBatchTimers.get(ev.accountId);
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          _positionBatchTimers.delete(ev.accountId);
+        }
+        _positionBatchBuffers.delete(ev.accountId);
+        coalesceInvalidation(queryClient, posKey, 20);
+        coalesceInvalidation(queryClient, queryKeys.trading.orders(ev.accountId), 20);
+        coalesceInvalidation(queryClient, ["closedPositions", ev.accountId], 20);
+        coalesceInvalidation(queryClient, ["fills", ev.accountId], 20);
+        coalesceInvalidation(queryClient, queryKeys.accounts.detail(ev.accountId), 20);
         return;
       }
 
@@ -343,6 +380,17 @@ export function MarketDataBridge() {
     });
     return unsub;
   }, [queryClient]);
+
+  // Clear pending module-level batch/invalidation timers on unmount
+  useEffect(() => {
+    return () => {
+      for (const t of _positionBatchTimers.values()) clearTimeout(t);
+      _positionBatchTimers.clear();
+      _positionBatchBuffers.clear();
+      for (const t of _invalidateTimers.values()) clearTimeout(t);
+      _invalidateTimers.clear();
+    };
+  }, []);
 
   // Gap-fill on WS reconnect: refetch caches so anything that happened
   // while the socket was down lands instantly.
