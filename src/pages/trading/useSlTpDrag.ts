@@ -53,6 +53,7 @@ export function useSlTpDrag(
     | ((
         posId: string,
         mods: { takeProfit?: number | null; stopLoss?: number | null },
+        opts?: { commit?: boolean; startPrice?: number },
       ) => Promise<unknown> | void)
     | undefined,
   pipDigits: number,
@@ -199,7 +200,7 @@ export function useSlTpDrag(
                 draftRafRef.current = null;
                 if (pendingDraftUpdateRef.current && onModifyPositionRef.current) {
                   const { field, price: p } = pendingDraftUpdateRef.current;
-                  onModifyPositionRef.current("__draft__", { [field]: p });
+                  onModifyPositionRef.current("__draft__", { [field]: p }, { commit: false });
                 }
               });
             }
@@ -267,7 +268,7 @@ export function useSlTpDrag(
       }
       const rounded = parseFloat(newPrice.toFixed(pipDigitsRef.current));
 
-      if (Math.abs(rounded - drag.startPrice) < Math.pow(10, -pipDigitsRef.current)) {
+      if (Math.abs(rounded - drag.startPrice) < Math.pow(10, -pipDigitsRef.current) * 0.5) {
         revertLine();
         return;
       }
@@ -275,9 +276,11 @@ export function useSlTpDrag(
       drag.entry.price = rounded;
       if (onModifyPositionRef.current) {
         try {
-          const maybePromise = onModifyPositionRef.current(drag.positionId, {
-            [drag.field]: rounded,
-          });
+          const maybePromise = onModifyPositionRef.current(
+            drag.positionId,
+            { [drag.field]: rounded },
+            { commit: true, startPrice: drag.startPrice },
+          );
           if (maybePromise && typeof (maybePromise as Promise<unknown>).catch === "function") {
             (maybePromise as Promise<unknown>).catch(() => {
               revertLine();
@@ -308,7 +311,11 @@ export function useSlTpDrag(
         /* line may have been recreated */
       }
       if (drag.positionId === "__draft__" && onModifyPositionRef.current) {
-        onModifyPositionRef.current("__draft__", { [drag.field]: drag.startPrice });
+        onModifyPositionRef.current(
+          "__draft__",
+          { [drag.field]: drag.startPrice },
+          { commit: false },
+        );
       }
       for (const e of slTpLinesRef.current.values()) {
         e.isDragging = false;

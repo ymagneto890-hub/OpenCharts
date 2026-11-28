@@ -392,7 +392,15 @@ export function ChartToolbar({
     | { tickSize?: number | string }
     | undefined;
   const pipDigits = getPipDigits(selectedSymbolInfo, selectedSymbol);
-  const spreadRaw = tick ? tick.ask - tick.bid : null;
+  const isSelectedStock =
+    (
+      (
+        symbols.find((s) => s.name === selectedSymbol) ??
+        getDemoSymbol(selectedSymbol) ??
+        DEMO_SYMBOLS.find((s) => s.name.toUpperCase() === selectedSymbol.trim().toUpperCase())
+      )?.category ?? ""
+    ).toUpperCase() === "STOCKS";
+  const spreadRaw = tick ? Math.max(0, tick.ask - tick.bid) : null;
   const minStep = Math.pow(10, -pipDigits);
   const spread =
     spreadRaw == null || !Number.isFinite(spreadRaw)
@@ -736,7 +744,8 @@ export function ChartToolbar({
             className={cn(
               "flex items-center gap-1 text-[10px] font-semibold ml-1",
               feedLive
-                ? ibkrStatus?.connectionState === "connected" &&
+                ? isSelectedStock &&
+                  ibkrStatus?.connectionState === "connected" &&
                   (ibkrStatus.effectiveMarketDataType ?? ibkrStatus.marketDataType ?? ibkrStreamMdt) === 4
                   ? "text-sky-400"
                   : "text-green-500"
@@ -745,7 +754,8 @@ export function ChartToolbar({
           >
             <span className="h-1.5 w-1.5 rounded-full bg-current" />
             {feedLive
-              ? ibkrStatus?.connectionState === "connected" &&
+              ? isSelectedStock &&
+                ibkrStatus?.connectionState === "connected" &&
                 (ibkrStatus.effectiveMarketDataType ?? ibkrStatus.marketDataType ?? ibkrStreamMdt) === 4
                 ? "DIFERIDO"
                 : "LIVE"
@@ -1070,14 +1080,6 @@ export function ChartToolbar({
       )}
 
       {(() => {
-        const isSelectedStock =
-          (
-            (
-              symbols.find((s) => s.name === selectedSymbol) ??
-              getDemoSymbol(selectedSymbol) ??
-              DEMO_SYMBOLS.find((s) => s.name.toUpperCase() === selectedSymbol.trim().toUpperCase())
-            )?.category ?? ""
-          ).toUpperCase() === "STOCKS";
         if (!showScreener && !isSelectedStock) return null;
 
         const isConnected = ibkrStatus?.connectionState === "connected";

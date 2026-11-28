@@ -402,11 +402,10 @@ export async function captureOffscreenChart(
     let bars: Candle[] = allBars;
     if (typeof effectiveMaxTimeSec === "number" && Number.isFinite(effectiveMaxTimeSec) && effectiveMaxTimeSec > 0) {
       const filtered = allBars.filter((b) => Number(b.time) <= effectiveMaxTimeSec);
-      if (filtered.length > 0) {
-        bars = filtered;
-      } else {
-        bars = effectiveMaxTimeSec < allBars[0]!.time ? allBars.slice(0, 300) : allBars.slice(-300);
+      if (filtered.length === 0) {
+        return "";
       }
+      bars = filtered;
     }
     if (bars.length > 300) {
       bars = bars.slice(-300);

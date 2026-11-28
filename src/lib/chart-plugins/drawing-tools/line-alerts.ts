@@ -9,10 +9,14 @@ const REFIRE_COOLDOWN_SEC = 30;
 
 /** Price of an alert-enabled line at `timeSec`, or null if it can't cross now. */
 export function linePriceAt(d: DrawingLine, timeSec: number): number | null {
-  if (!d.alertEnabled) return null;
+  if (!d.alertEnabled || d.hidden) return null;
   if (d.type === "horizontal") return d.price;
   if (d.type === "trendline") {
     if (d.time == null || d.time2 == null || d.price2 == null) return null;
+    const minT = Math.min(d.time, d.time2);
+    const maxT = Math.max(d.time, d.time2);
+    if (!d.extendLeft && timeSec < minT) return null;
+    if (!d.extendRight && timeSec > maxT) return null;
     const dt = d.time2 - d.time;
     if (dt === 0) return null;
     const slope = (d.price2 - d.price) / dt;

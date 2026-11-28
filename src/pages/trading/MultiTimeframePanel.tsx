@@ -147,6 +147,8 @@ export function MultiTimeframePanel({
     });
 
     const id = setInterval(() => {
+      const r = useReplayStore.getState();
+      if ((r.phase === "active" || r.phase === "picking") && r.symbol === symbol) return;
       void loadAllTimeframes();
     }, 15_000);
 

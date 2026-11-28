@@ -115,9 +115,9 @@ export function FloatingOrderWidget({
   tick,
   accountId,
   accountBalance,
-  oneClick: _oneClick = true,
+  oneClick = true,
   onToggleOneClick: _onToggleOneClick,
-  onConfirmOrder: _onConfirmOrder,
+  onConfirmOrder,
   isFeedConnected = true,
   onOrderSuccess,
   onDraftPreviewChange,
@@ -452,13 +452,14 @@ export function FloatingOrderWidget({
       return;
     }
     const qty = parseFloat(quantity);
-    if (isNaN(qty) || qty <= 0) {
+    if (!Number.isFinite(qty) || qty <= 0) {
       toast.warning("Cantidad inválida", `Introduce una cantidad válida en ${baseUnit}`);
       return;
     }
-
-    isSubmittingRef.current = true;
-    setIsSubmitting(true);
+    if (qty > 1e12) {
+      toast.warning("Cantidad excesiva", `La cantidad excede el límite por orden en ${baseUnit}`);
+      return;
+    }
 
     const input: PlaceOrderInput = {
       accountId,
@@ -472,23 +473,39 @@ export function FloatingOrderWidget({
     if (slEnabled && stopLoss) input.stopLoss = parseFloat(stopLoss) || undefined;
     if (notes.trim()) input.notes = notes.trim();
 
-    try {
-      await placeOrder.mutateAsync(input, {
-        onSuccess: () => {
-          toast.success("Orden ejecutada", `${side === "BUY" ? "Compra" : "Venta"} a mercado: ${qty} ${baseUnit}`);
-          setNotes("");
-          onOrderSuccess?.();
-        },
-        onError: (err: unknown) => {
-          const e = err as { error?: { message?: string }; message?: string };
-          toast.error("Error en la orden", e?.error?.message || e?.message || "No se pudo ejecutar la orden");
-        },
+    const execute = async () => {
+      isSubmittingRef.current = true;
+      setIsSubmitting(true);
+      try {
+        return await placeOrder.mutateAsync(input, {
+          onSuccess: () => {
+            toast.success("Orden ejecutada", `${side === "BUY" ? "Compra" : "Venta"} a mercado: ${qty} ${baseUnit}`);
+            setNotes("");
+            onOrderSuccess?.();
+          },
+          onError: (err: unknown) => {
+            const e = err as { error?: { message?: string }; message?: string };
+            toast.error("Error en la orden", e?.error?.message || e?.message || "No se pudo ejecutar la orden");
+          },
+        });
+      } finally {
+        isSubmittingRef.current = false;
+        setIsSubmitting(false);
+      }
+    };
+
+    if (!oneClick && onConfirmOrder) {
+      onConfirmOrder({
+        ...input,
+        _submit: execute,
       });
+      return;
+    }
+
+    try {
+      await execute();
     } catch {
       // Handled in onError
-    } finally {
-      isSubmittingRef.current = false;
-      setIsSubmitting(false);
     }
   };
 

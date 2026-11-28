@@ -346,7 +346,13 @@ describe("Stock Screener News, IBKR Volume, 1m/3m/5m VWAP+EMA9 & Crypto APIs", (
     const b1m = getHistory("BTCUSD", "1m");
     const b5m = getHistory("BTCUSD", "5m");
     expect(b1m[b1m.length - 1]!.volume).toBe(11);
-    expect(b5m[b5m.length - 1]!.volume).toBe(16); // 5 initial + 8 + (11 - 8) = 16 (delta-safe)
+    expect(b5m[b5m.length - 1]!.volume).toBe(11); // 5 initial + (8 - 5) + (11 - 8) = 11 (no initial double-count)
+
+    // Next minute inside the same 5m bucket accumulates delta-safely onto 11
+    applyCryptoLiveBar("BTCUSD", { time: t0 + 60, open: 90180, high: 90220, low: 90150, close: 90200, volume: 4 });
+    applyCryptoLiveBar("BTCUSD", { time: t0 + 60, open: 90180, high: 90250, low: 90150, close: 90240, volume: 7 });
+    const b5mNextMin = getHistory("BTCUSD", "5m");
+    expect(b5mNextMin[b5mNextMin.length - 1]!.volume).toBe(18); // 11 + 4 + (7 - 4) = 18
 
     cryptoSvc.dispose();
     expect(MarketDataType.DELAYED_FROZEN).toBe(4);

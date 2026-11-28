@@ -1070,12 +1070,13 @@ describe("Dual-Chart Synchronized Bar Replay & Deep Price/Volume/VWAP/EMA Audit"
         expect(getByText("NRSN")).toBeTruthy();
       });
 
-      // Enabling Favorites again then toggling Solo Pre-Market also exits Favorites-only mode
+      // Enabling Favorites again then changing an active filter (RelVol >= 10x) also exits Favorites-only mode
       fireEvent.click(getByTestId("screener-favorites-toggle"));
       await waitFor(() => {
         expect(getByTestId("screener-favorites-banner")).toBeTruthy();
       });
-      fireEvent.click(getByText("Solo Pre-Market"));
+      fireEvent.click(getByTestId("screener-relvol-chip"));
+      fireEvent.click(getByText("≥ 10x"));
       await waitFor(() => {
         expect(queryByTestId("screener-favorites-banner")).toBeNull();
       });

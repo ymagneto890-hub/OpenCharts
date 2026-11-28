@@ -19,6 +19,7 @@ import {
 } from "@stoqey/ib";
 import {
   getNyTradingDayKey,
+  getSessionAnchorStartSec,
   type VwapSessionSeed,
 } from "../lib/indicators.ts";
 import {
@@ -712,6 +713,7 @@ export function computeVwapSessionSeedsFromBars(
   bars: ReadonlyArray<OhlcvBar>,
   visibleStartTimeSec: number,
   source: "hlc3" | "hl2" | "ohlc4" | "close" = "hlc3",
+  symbol?: string,
 ): { extended: VwapSessionSeed | null; regular: VwapSessionSeed | null } {
   if (bars.length === 0) return { extended: null, regular: null };
   const lastTime = bars[bars.length - 1]!.time;
@@ -745,6 +747,10 @@ export function computeVwapSessionSeedsFromBars(
     }
   }
 
+  const extAnchorSec = getSessionAnchorStartSec(lastTime, "america-new-york", false);
+  const regAnchorSec = getSessionAnchorStartSec(lastTime, "america-new-york", true);
+  const normSymbol = symbol ? symbol.trim().toUpperCase() : undefined;
+
   return {
     extended:
       extAcc.cumVol > 0
@@ -753,6 +759,12 @@ export function computeVwapSessionSeedsFromBars(
             cumVol: extAcc.cumVol,
             mean: extAcc.mean,
             sumSqWeightedDiff: extAcc.sumSqWeightedDiff,
+            coveredUntilSec: visibleStartTimeSec,
+            source,
+            ...(normSymbol ? { symbol: normSymbol } : {}),
+            sessionMode: "extended",
+            sessionAnchorSec: extAnchorSec,
+            coverageComplete: true,
           }
         : null,
     regular:
@@ -762,6 +774,12 @@ export function computeVwapSessionSeedsFromBars(
             cumVol: regAcc.cumVol,
             mean: regAcc.mean,
             sumSqWeightedDiff: regAcc.sumSqWeightedDiff,
+            coveredUntilSec: visibleStartTimeSec,
+            source,
+            ...(normSymbol ? { symbol: normSymbol } : {}),
+            sessionMode: "regular",
+            sessionAnchorSec: regAnchorSec,
+            coverageComplete: true,
           }
         : null,
   };
@@ -1010,6 +1028,7 @@ interface ActiveSymbolStream {
   lastCumulativeVolume: number | null;
   lastDelayedTradeSize: number;
   lastDelayedTimestampSec: number | null;
+  lastConsumedDelayedTsSec: number | null;
   lastTradeTimeSec: number | null;
   hasInitialDelayedSnapshot: boolean;
   lastBid: number | null;
@@ -1515,6 +1534,7 @@ export class IbkrEngine extends EventEmitter {
 
             if (shouldIngestCandle) {
               const tradeTimeSec = this.resolveStreamTradeTimeSec(stream);
+              stream.lastConsumedDelayedTsSec = stream.lastDelayedTimestampSec;
               stream.lastTradeTimeSec = tradeTimeSec;
               this.emitQuote(stream);
               this.ingestLiveTrade(stream, value, size, tradeTimeSec);
@@ -1551,17 +1571,20 @@ export class IbkrEngine extends EventEmitter {
           this.effectiveMarketDataType !== MarketDataType.REALTIME
         ) {
           if (field === IB_TICK.VOLUME || field === IB_TICK.DELAYED_VOLUME) {
-            const cumShares = Math.round(value);
-            if (cumShares >= 0) {
+            const rawCum = Math.round(value);
+            if (rawCum >= 0) {
               if (stream.lastCumulativeVolume === null) {
-                stream.lastCumulativeVolume = cumShares;
+                stream.lastCumulativeVolume = rawCum;
                 stream.lastDelayedTradeSize = 0;
-              } else if (cumShares > stream.lastCumulativeVolume) {
-                const deltaShares = cumShares - stream.lastCumulativeVolume;
-                stream.lastCumulativeVolume = cumShares;
+              } else if (rawCum > stream.lastCumulativeVolume) {
+                const rawDelta = rawCum - stream.lastCumulativeVolume;
+                stream.lastCumulativeVolume = rawCum;
                 stream.lastDelayedTradeSize = 0;
+                const volMult = this.inferStockVolumeMultiplier(stream, rawCum);
+                const deltaShares = rawDelta * volMult;
                 if (stream.lastPrice !== null && stream.lastPrice > 0 && deltaShares > 0) {
                   const tradeTimeSec = this.resolveStreamTradeTimeSec(stream);
+                  stream.lastConsumedDelayedTsSec = stream.lastDelayedTimestampSec;
                   stream.lastTradeTimeSec = tradeTimeSec;
                   this.ingestLiveTrade(stream, stream.lastPrice, deltaShares, tradeTimeSec);
                 }
@@ -2016,6 +2039,22 @@ export class IbkrEngine extends EventEmitter {
     return maxSec;
   }
 
+  private inferStockVolumeMultiplier(stream: ActiveSymbolStream, rawCumVol: number): number {
+    if (stream.contract.secType !== SecType.STK || !(rawCumVol > 0)) return 1;
+    const todayKey = getNyTradingDayKey(Math.floor(Date.now() / 1000));
+    let todayHistVol = 0;
+    for (const b of stream.sessionBars1m.values()) {
+      if (getNyTradingDayKey(b.time) === todayKey) {
+        todayHistVol += b.volume;
+      }
+    }
+    if (todayHistVol >= 1_000) {
+      const ratio = todayHistVol / rawCumVol;
+      if (ratio >= 30 && ratio <= 300) return 100;
+    }
+    return 1;
+  }
+
   private resolveStreamTradeTimeSec(stream: ActiveSymbolStream): number {
     const nowSec = Math.floor(Date.now() / 1000);
     if (
@@ -2025,10 +2064,16 @@ export class IbkrEngine extends EventEmitter {
       return nowSec;
     }
     const latestBarSec = this.getLatestKnownBarSec(stream);
-    if (stream.lastDelayedTimestampSec !== null && stream.lastDelayedTimestampSec > 0) {
-      return Math.max(stream.lastDelayedTimestampSec, latestBarSec);
-    }
     const delayedSec = nowSec - 900;
+    if (stream.lastDelayedTimestampSec !== null && stream.lastDelayedTimestampSec > 0) {
+      if (
+        stream.lastDelayedTimestampSec !== stream.lastConsumedDelayedTsSec ||
+        delayedSec - stream.lastDelayedTimestampSec < 60
+      ) {
+        return Math.max(stream.lastDelayedTimestampSec, latestBarSec);
+      }
+      return Math.max(delayedSec, stream.lastDelayedTimestampSec, latestBarSec);
+    }
     return Math.max(delayedSec, latestBarSec);
   }
 
@@ -2221,6 +2266,7 @@ export class IbkrEngine extends EventEmitter {
         lastCumulativeVolume: null,
         lastDelayedTradeSize: 0,
         lastDelayedTimestampSec: null,
+        lastConsumedDelayedTsSec: null,
         lastTradeTimeSec: null,
         hasInitialDelayedSnapshot: false,
         lastBid: null,
@@ -2512,15 +2558,7 @@ export class IbkrEngine extends EventEmitter {
           const latest = bars1s[bars1s.length - 1]!;
           stream.lastPrice = latest.close;
           stream.lastTradeTimeSec = latest.time;
-          this.emit("stream-event", {
-            type: "bar1s",
-            symbol: stream.symbol,
-            bar: latest,
-            vwap: {
-              extended: { ...stream.vwapExtended },
-              regular: { ...stream.vwapRegular },
-            },
-          } satisfies IbkrStreamEvent);
+          this.emitQuote(stream);
         } else if (bars1m.length > 0) {
           const latest1m = bars1m[bars1m.length - 1]!;
           if (stream.lastPrice === null) {
@@ -2558,26 +2596,35 @@ export class IbkrEngine extends EventEmitter {
     const ext = createVwapAccumulator(activeDay);
     const reg = createVwapAccumulator(activeDay);
 
-    const first1sMinBucket =
-      all1s.length > 0 ? getBucketStartSec(all1s[0]!.time, 60) : Number.MAX_SAFE_INTEGER;
+    const first1sFullMinBucket =
+      all1s.length > 0
+        ? all1s[0]!.time % 60 === 0
+          ? all1s[0]!.time
+          : getBucketStartSec(all1s[0]!.time, 60) + 60
+        : Number.MAX_SAFE_INTEGER;
 
     for (const b of all1m) {
-      if (b.time >= first1sMinBucket) continue;
+      if (b.time >= first1sFullMinBucket) continue;
       const ny = getNyClockParts(b.time);
-      if (ny.dayKey !== activeDay) continue;
+      if (ny.dayKey !== activeDay || ny.isWeekend) continue;
       const tp = (b.high + b.low + b.close) / 3;
-      updateVwapAccumulator(ext, activeDay, tp, b.volume);
-      if (!ny.isWeekend && ny.minutes >= 570 && ny.minutes < 960) {
+      if (ny.minutes >= 240 && ny.minutes < 1200) {
+        updateVwapAccumulator(ext, activeDay, tp, b.volume);
+      }
+      if (ny.minutes >= 570 && ny.minutes < 960) {
         updateVwapAccumulator(reg, activeDay, tp, b.volume);
       }
     }
 
     for (const b of all1s) {
+      if (b.time < first1sFullMinBucket) continue;
       const ny = getNyClockParts(b.time);
-      if (ny.dayKey !== activeDay) continue;
+      if (ny.dayKey !== activeDay || ny.isWeekend) continue;
       const tp = (b.high + b.low + b.close) / 3;
-      updateVwapAccumulator(ext, activeDay, tp, b.volume);
-      if (!ny.isWeekend && ny.minutes >= 570 && ny.minutes < 960) {
+      if (ny.minutes >= 240 && ny.minutes < 1200) {
+        updateVwapAccumulator(ext, activeDay, tp, b.volume);
+      }
+      if (ny.minutes >= 570 && ny.minutes < 960) {
         updateVwapAccumulator(reg, activeDay, tp, b.volume);
       }
     }
@@ -2777,7 +2824,9 @@ export class IbkrEngine extends EventEmitter {
               this.effectiveMarketDataType === MarketDataType.REALTIME ||
               this.effectiveMarketDataType === MarketDataType.FROZEN;
             const canUpdateClose = isRealtimeMode
-              ? b1s.time >= latestSession1mSec
+              ? ingestedAt > 0 &&
+                b1s.time >= latestSession1mSec &&
+                histFetchStartMs - ingestedAt <= 10_000
               : ingestedAt > histFetchStartMs || b1s.time > effectiveFetchCutSec;
             sameBucketLiveVol += b1s.volume;
             if (canUpdateClose) {
@@ -2851,7 +2900,7 @@ export class IbkrEngine extends EventEmitter {
           .catch(() => [] as OhlcvBar[]);
       }
       if (session1mBars.length > 0) {
-        vwapSeeds = computeVwapSessionSeedsFromBars(session1mBars, visibleStart);
+        vwapSeeds = computeVwapSessionSeedsFromBars(session1mBars, visibleStart, "hlc3", cleanSym);
       }
     }
 

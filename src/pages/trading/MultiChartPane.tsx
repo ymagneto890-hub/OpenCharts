@@ -53,6 +53,7 @@ import {
   hasRealStockSeries,
   isCryptoInstrument,
   subscribeCandleBucketClosed,
+  subscribeRealSeriesLoaded,
   TF_SECONDS,
 } from "../../services/demo/candles.ts";
 import {
@@ -884,10 +885,7 @@ export function MultiChartPane({
           high: liveCandle.high,
           low: liveCandle.low,
           close: liveCandle.close,
-          volume:
-            liveTs === last.time
-              ? Math.max(last.volume ?? 0, liveCandle.volume ?? 0)
-              : (liveCandle.volume ?? 0),
+          volume: liveCandle.volume ?? 0,
         };
         working = liveTs === last.time ? [...displayCandles.slice(0, -1), liveRow] : [...displayCandles, liveRow];
       }
@@ -1185,7 +1183,38 @@ export function MultiChartPane({
     paneTf,
   ]);
 
+  const [fine1mRevision, setFine1mRevision] = useState(0);
+  useEffect(() => {
+    if (isReplaying || !showVwap) return;
+    const tfSec = parseTimeframeSeconds(paneTf);
+    if (tfSec <= 60 || tfSec >= 86_400) return;
+    if (!sessionCtx.isStock && !isCryptoInstrument(paneSymbol)) return;
+
+    let cancelled = false;
+    const bump = () => {
+      if (!cancelled) setFine1mRevision((r) => r + 1);
+    };
+    const upperSym = paneSymbol.trim().toUpperCase();
+    const unsubLoaded = subscribeRealSeriesLoaded((sym, tf) => {
+      if (sym.trim().toUpperCase() === upperSym && tf === "1m") bump();
+    });
+    const unsubClosed = subscribeCandleBucketClosed((sym, tf) => {
+      if (sym.trim().toUpperCase() === upperSym && tf === "1m") bump();
+    });
+
+    void fetchHistoryAsync(paneSymbol, "1m", 1_500).then((bars) => {
+      if (!cancelled && bars.length > 0) bump();
+    });
+
+    return () => {
+      cancelled = true;
+      unsubLoaded();
+      unsubClosed();
+    };
+  }, [isReplaying, showVwap, paneTf, paneSymbol, sessionCtx.isStock]);
+
   const paneFine1mVwapBundle = useMemo(() => {
+    void fine1mRevision;
     const tfSec = parseTimeframeSeconds(paneTf);
     if (tfSec <= 60 || tfSec >= 86_400) {
       return { candles: null as PaneCandle[] | null, rawCoverageStartSec: undefined as number | undefined };
@@ -1220,6 +1249,7 @@ export function MultiChartPane({
     chartPrefs.showExtendedHours,
     hasExtendedFilterFallback,
     liveDisplayCandles,
+    fine1mRevision,
   ]);
   const paneFine1mVwapCandles = paneFine1mVwapBundle.candles;
   const paneRawCoverageStartSec = paneAnchorAtRegularOpen
@@ -1288,6 +1318,7 @@ export function MultiChartPane({
       sessionCtx.isUsStock ? "ny" : "utc",
       chartPrefs.showExtendedHours ? "ext" : "rth",
       paneAnchorAtRegularOpen ? "rth930" : "sess",
+      isReplaying ? "replay" : "live",
     ].join("|");
 
     const canReuseOverlays = overlayStructureKeyRef.current === nextOverlayKey;
@@ -1367,6 +1398,7 @@ export function MultiChartPane({
           rawCoverageStartSec: paneRawCoverageStartSec,
           fineRawCoverageStartSec: paneFine1mVwapBundle.rawCoverageStartSec,
           requireCompleteSession: sessionCtx.isUsStock || isReplaying,
+          validateInternalGaps: isReplaying,
           symbol: paneSymbol,
           simTimeSec: isReplaying ? replaySimTimeSec : undefined,
         },
@@ -1559,6 +1591,10 @@ export function MultiChartPane({
     showSmc,
     showVpvr,
     showVwap,
+    isReplaying,
+    replaySimTimeSec,
+    paneRawCoverageStartSec,
+    paneFine1mVwapBundle.rawCoverageStartSec,
   ]);
 
   // Replay bar-picker click subscription on secondary panes
@@ -1631,10 +1667,7 @@ export function MultiChartPane({
       prev19VolSumRef.current = nextWindow.reduce((acc, v) => acc + v, 0);
       hasVolumeMaRef.current = nextWindow.length >= 19;
     }
-    const nextVol =
-      ts === last.time
-        ? Math.max(last.volume, liveCandle.volume ?? 0)
-        : (liveCandle.volume ?? 0);
+    const nextVol = liveCandle.volume ?? 0;
     const next = {
       symbol: paneSymbol,
       time: ts,

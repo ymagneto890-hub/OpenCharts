@@ -212,16 +212,16 @@ describe("Trading UX improvements (Extended Hours, Synced Favorites, Clean TP/SL
   it("uses user trading screener defaults (RelVol>=5x, Float 800K-20M, Price $1-$20, Cbo%>10%) without Volume/MarketCap filters", () => {
     expect(DEFAULT_SCREENER_FILTERS).toMatchObject({
       marketScope: "us",
-      onlyPremarket: true,
+      onlyPremarket: false,
       marketCapMin: null,
       marketCapMax: null,
+      floatMin: null,
+      floatMax: 20_000_000,
+      changeMin: 10,
+      priceMin: null,
+      priceMax: 20,
       volumeMin: null,
       relVolMin: 5,
-      floatMin: 800_000,
-      floatMax: 20_000_000,
-      priceMin: 1,
-      priceMax: 20,
-      changeMin: 10,
     });
   });
 

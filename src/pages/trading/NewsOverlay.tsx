@@ -20,7 +20,10 @@ const NEWS_SENTIMENT_STORAGE_KEY = "oc_news_sentiment_overrides_v1";
 function loadSentimentOverrides(): Record<string, "bullish" | "bearish" | "neutral"> {
   try {
     const raw = localStorage.getItem(NEWS_SENTIMENT_STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as Record<string, "bullish" | "bearish" | "neutral">) : {};
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, "bullish" | "bearish" | "neutral">)
+      : {};
   } catch {
     return {};
   }

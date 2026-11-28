@@ -309,9 +309,9 @@ export function getStockVwapSeed(
   timeframe?: string,
 ): VwapSessionSeed | null {
   const upper = symbol.trim().toUpperCase();
-  const seeds =
-    (timeframe ? stockVwapSeeds.get(`${upper}_${timeframe}`) : undefined) ??
-    stockVwapSeeds.get(upper);
+  const seeds = timeframe
+    ? stockVwapSeeds.get(`${upper}_${timeframe}`)
+    : stockVwapSeeds.get(upper);
   if (!seeds) return null;
   return extendedHours ? seeds.extended : seeds.regular;
 }
@@ -359,6 +359,7 @@ export function invalidateStockSeries(symbol: string): void {
     if (k.toUpperCase().startsWith(prefix)) stockVwapSeeds.delete(k);
   }
   bars1sBySymbol.delete(upper);
+  lastCrypto1mBarBySymbol.delete(upper);
   stockVwapSeeds.delete(upper);
   liveVwapBySymbol.delete(upper);
   latestRealStockBarMs.delete(upper);
@@ -706,6 +707,9 @@ export function setRealStockSeries(symbol: string, timeframe: string, bars: Cand
   const key = `${cleanSym}_${timeframe}`;
   const sorted = normalizeSortedUniqueBars(bars);
   series.set(key, sorted);
+  if (timeframe === "1m") {
+    lastCrypto1mBarBySymbol.delete(cleanSym);
+  }
   syntheticSeriesKeys.delete(key);
   syntheticSeriesKeys.delete(`${symbol}_${timeframe}`);
   liveSeriesKeys.add(key);
@@ -1809,7 +1813,13 @@ export function applyCryptoLiveBar(
     volume: Number.isFinite(bar1m.volume) && bar1m.volume >= 0 ? bar1m.volume : 0,
   };
 
-  const prev1m = lastCrypto1mBarBySymbol.get(upperSym);
+  const existing1mSeries = series.get(`${upperSym}_1m`);
+  const prev1m =
+    lastCrypto1mBarBySymbol.get(upperSym) ??
+    (existing1mSeries && existing1mSeries.length > 0
+      ? existing1mSeries[existing1mSeries.length - 1]
+      : undefined);
+  const isInitialSnapshotWithout1m = !prev1m;
   const prevSameMinVol = prev1m && prev1m.time === normalized.time ? prev1m.volume : 0;
   const volDelta = Math.max(0, normalized.volume - prevSameMinVol);
   lastCrypto1mBarBySymbol.set(upperSym, { ...normalized });
@@ -1855,7 +1865,9 @@ export function applyCryptoLiveBar(
               high: Math.max(last.high, normalized.high),
               low: Math.min(last.low, normalized.low),
               close: normalized.close,
-              volume: last.volume + volDelta,
+              volume: isInitialSnapshotWithout1m
+                ? Math.max(last.volume, normalized.volume)
+                : last.volume + volDelta,
             };
       nextBars[lastIdx] = updated;
       series.set(k, nextBars);
@@ -2009,11 +2021,8 @@ export async function fetchHistoryAsync(
           extended: payload.vwapSeeds.extended ?? null,
           regular: payload.vwapSeeds.regular ?? null,
         };
-        // Isolate historical targetDate VWAP seeds from live trading VWAP seeds
+        // Isolate VWAP seeds strictly per symbol + timeframe (and targetDate)
         stockVwapSeeds.set(key, seedEntry);
-        if (!targetDate && (seedEntry.extended || seedEntry.regular)) {
-          stockVwapSeeds.set(upperSym, seedEntry);
-        }
       }
 
       if (typeof payload.dataSource === "string" && payload.dataSource.trim().length > 0) {
@@ -2119,7 +2128,6 @@ export async function fetchHistoryAsync(
             if (prevLast.time === nextLast.time) {
               nextLast.high = Math.max(nextLast.high, prevLast.high);
               nextLast.low = Math.min(nextLast.low, prevLast.low);
-              nextLast.volume = Math.max(nextLast.volume, prevLast.volume);
             } else if (prevLast.time > nextLast.time && prevLast.time - nextLast.time <= tfSec * 2) {
               validBars.push({ ...prevLast });
             }
@@ -2127,6 +2135,9 @@ export async function fetchHistoryAsync(
 
           if (timeframe === "1s") {
             bars1sBySymbol.set(upperSym, validBars.slice(-7_200));
+          }
+          if (isCrypto && timeframe === "1m" && validBars.length > 0) {
+            lastCrypto1mBarBySymbol.set(upperSym, { ...validBars[validBars.length - 1]! });
           }
 
           const wasMissing = !realStockSeriesKeys.has(key);
@@ -2427,14 +2438,14 @@ export function updateLatestBarPrice(
   price: number,
   occurredAtMs?: number,
   tradeVolume = 0,
-): Array<{ timeframe: string; candle: Candle }> {
+): Array<{ timeframe: string; candle: Candle; isNewBucket?: boolean }> {
   if (!Number.isFinite(price) || price <= 0) return [];
   const safeVol = Number.isFinite(tradeVolume) && tradeVolume > 0 ? tradeVolume : 0;
   const upperSym = symbol.trim().toUpperCase();
   const isStock = (getDemoSymbol(symbol)?.category ?? "").toUpperCase() === "STOCKS";
   const hasRealEventTime =
     typeof occurredAtMs === "number" && Number.isFinite(occurredAtMs) && occurredAtMs > 0;
-  const updatedBars: Array<{ timeframe: string; candle: Candle }> = [];
+  const updatedBars: Array<{ timeframe: string; candle: Candle; isNewBucket?: boolean }> = [];
 
   if (isStock && hasRealEventTime) {
     const prevTs = latestRealStockBarMs.get(upperSym) ?? 0;
@@ -2474,15 +2485,20 @@ export function updateLatestBarPrice(
             volume: safeVol,
           };
           bars.push(created);
-          updatedBars.push({ timeframe: tf, candle: { ...created } });
+          notifyCandleBucketClosed(upperSym, tf);
+          updatedBars.push({ timeframe: tf, candle: { ...created }, isNewBucket: true });
           continue;
         }
       }
-      last.close = price;
-      if (price > last.high) last.high = price;
-      if (price < last.low) last.low = price;
-      if (safeVol > 0) last.volume += safeVol;
-      updatedBars.push({ timeframe: tf, candle: { ...last } });
+      const updatedStock: Candle = {
+        ...last,
+        close: price,
+        high: Math.max(last.high, price),
+        low: Math.min(last.low, price),
+        volume: safeVol > 0 ? last.volume + safeVol : last.volume,
+      };
+      bars[bars.length - 1] = updatedStock;
+      updatedBars.push({ timeframe: tf, candle: { ...updatedStock }, isNewBucket: false });
       continue;
     }
 
@@ -2490,20 +2506,28 @@ export function updateLatestBarPrice(
     if (liveSeriesKeys.has(key)) {
       const bucket = hasRealEventTime ? bucketSecAt(occurredAtMs, tf) : currentBucketSec(tf);
       if (bucket > last.time) {
-        bars.push({
+        const created: Candle = {
           time: bucket,
           open: price,
           high: price,
           low: price,
           close: price,
           volume: 0,
-        });
+        };
+        bars.push(created);
+        notifyCandleBucketClosed(upperSym, tf);
+        updatedBars.push({ timeframe: tf, candle: { ...created }, isNewBucket: true });
         continue;
       }
     }
-    last.close = price;
-    if (price > last.high) last.high = price;
-    if (price < last.low) last.low = price;
+    const updatedOther: Candle = {
+      ...last,
+      close: price,
+      high: Math.max(last.high, price),
+      low: Math.min(last.low, price),
+    };
+    bars[bars.length - 1] = updatedOther;
+    updatedBars.push({ timeframe: tf, candle: { ...updatedOther }, isNewBucket: false });
   }
   return updatedBars;
 }

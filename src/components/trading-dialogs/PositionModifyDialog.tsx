@@ -3,7 +3,7 @@ import { api } from "../../services/api";
 import { toast } from "../../services/toast";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { useInstrumentLabels } from "../../hooks/useInstrumentLabels.ts";
+import { extractBaseAsset, useInstrumentLabels } from "../../hooks/useInstrumentLabels.ts";
 import { getPipDigits } from "../../pages/trading/utils.ts";
 import {
   X,
@@ -61,6 +61,15 @@ export function PositionModifyDialog({
       setPartialQty("");
     }
   }, [position?.id, position?.takeProfit, position?.stopLoss]);
+
+  useEffect(() => {
+    if (!position) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [position, onClose]);
 
   if (!position) return null;
 
@@ -476,7 +485,7 @@ export function PositionModifyDialog({
                     ? "Closing..."
                     : !isFeedConnected
                       ? "Disconnected"
-                      : `Close ${partialQty || "?"} ${position.symbolName.split("/")[0] || unitLabel}`}
+                      : `Close ${partialQty || "?"} ${extractBaseAsset(position.symbolName) || unitLabel}`}
                 </Button>
               </>
             )}

@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { cn } from "../../lib/utils.ts";
+import { getDemoSymbol } from "../../services/demo/instruments.ts";
 
 // ── Chart context menu (TradingView-style right-click menu) ──────────────────
 // Rendered by ChartPanel at the cursor position when the user right-clicks
@@ -82,6 +83,7 @@ function quickOrderQty(symbol: string): number {
   const upper = symbol.toUpperCase();
   if (upper.startsWith("BTC")) return 0.005;
   if (upper.startsWith("ETH")) return 0.05;
+  if (getDemoSymbol(symbol)?.category === "STOCKS") return 5;
   return 0.1;
 }
 

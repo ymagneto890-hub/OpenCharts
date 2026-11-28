@@ -553,9 +553,7 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         while (probe < series.length && !isRegularSessionCandle(s.symbol, tf, series[probe]!.time)) {
           probe++;
         }
-        if (probe < series.length) {
-          next = probe;
-        }
+        next = probe;
       }
       if (next >= series.length) {
         clearTimer();
@@ -704,9 +702,8 @@ export const useReplayStore = create<ReplayState>((set, get) => {
         while (probe >= 0 && !isRegularSessionCandle(s.symbol, tf, series[probe]!.time)) {
           probe--;
         }
-        if (probe >= 0) {
-          prev = probe;
-        }
+        if (probe < 0) return;
+        prev = probe;
       }
       const bar = series[prev]!;
       const prevSimTimeSec = isMidPartial ? currentBar!.time : bar.time + tfSec;

@@ -12,6 +12,7 @@ import {
 } from "../../hooks/useFavoriteSymbols.ts";
 import {
   DEMO_SYMBOLS,
+  discoverRemoteCrypto,
   discoverRemoteStocks,
   getDemoSymbol,
   registerDynamicSymbol,
@@ -69,12 +70,15 @@ export function WatchlistPanel({
     let cancelled = false;
     setSearchingRemote(true);
     const timer = setTimeout(() => {
-      void discoverRemoteStocks(q)
-        .then((stockFound) => {
+      void Promise.all([
+        discoverRemoteStocks(q).catch(() => [] as DemoSymbol[]),
+        discoverRemoteCrypto(q).catch(() => [] as DemoSymbol[]),
+      ])
+        .then(([stockFound, cryptoFound]) => {
           if (!cancelled) {
             const seen = new Set<string>();
             const merged: DemoSymbol[] = [];
-            for (const s of stockFound) {
+            for (const s of [...stockFound, ...cryptoFound]) {
               const key = normalizeFavoriteTicker(s.name);
               if (!seen.has(key)) {
                 seen.add(key);

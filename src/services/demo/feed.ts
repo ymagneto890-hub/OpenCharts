@@ -39,6 +39,7 @@ type SymbolCursor = {
   spread: number;
   bid?: number;
   ask?: number;
+  lastQuoteAt: number;
   lastLiveAt: number;
   lastExchangeTs: number;
 };
@@ -86,9 +87,20 @@ function makeCursorForSymbol(name: string): SymbolCursor | null {
     price: seed,
     anchorPrice: seed,
     spread: computeSpread(seed, sym.tickSize, isStock),
+    lastQuoteAt: 0,
     lastLiveAt: 0,
     lastExchangeTs: getLatestRealStockTimestampMs(sym.name) ?? 0,
   };
+}
+
+function syncBidAskOnTrade(cur: SymbolCursor, price: number, now: number): void {
+  const quoteStale = cur.lastQuoteAt > 0 && now - cur.lastQuoteAt > 3_000;
+  const outsideBid = typeof cur.bid === "number" && price < cur.bid;
+  const outsideAsk = typeof cur.ask === "number" && price > cur.ask;
+  if (quoteStale || outsideBid || outsideAsk) {
+    cur.bid = undefined;
+    cur.ask = undefined;
+  }
 }
 
 function syncCursors(): void {
@@ -191,6 +203,7 @@ export function applyCryptoLiveBarUpdate(symbol: string, bar1m: Candle): void {
   if (cur) {
     cur.price = bar1m.close;
     cur.anchorPrice = bar1m.close;
+    syncBidAskOnTrade(cur, bar1m.close, now);
     cur.spread = computeSpread(bar1m.close, sym?.tickSize ?? 0.01, false);
     cur.lastLiveAt = now;
     cur.lastExchangeTs = Math.max(cur.lastExchangeTs, now);
@@ -228,6 +241,7 @@ export function applyIbkrLiveBar1sUpdate(
   if (cur) {
     cur.price = bar1s.close;
     cur.anchorPrice = bar1s.close;
+    syncBidAskOnTrade(cur, bar1s.close, now);
     cur.spread = computeSpread(bar1s.close, sym?.tickSize ?? 0.01, isStockSymbol(targetSym));
     cur.lastLiveAt = now;
     cur.lastExchangeTs = Math.max(cur.lastExchangeTs, tsMs);
@@ -279,6 +293,7 @@ export function applyIbkrQuoteUpdate(evt: {
     cur.anchorPrice = refPrice;
     if (bid !== undefined) cur.bid = bid;
     if (ask !== undefined) cur.ask = ask;
+    if (bid !== undefined || ask !== undefined) cur.lastQuoteAt = now;
     cur.spread = bid && ask && ask > bid ? ask - bid : computeSpread(refPrice, sym?.tickSize ?? 0.01, isStock);
     cur.lastLiveAt = now;
     cur.lastExchangeTs = Math.max(cur.lastExchangeTs, evt.timestamp || now);
@@ -330,7 +345,7 @@ export function startDemoFeed(): void {
       const sym = getDemoSymbol(c.symbol);
       if (sym?.initialPrice && Number.isFinite(sym.initialPrice) && sym.initialPrice > 0) {
         c.anchorPrice = sym.initialPrice;
-        if (!(c.lastLiveAt > 0 && Date.now() - c.lastLiveAt < 5_000)) {
+        if (c.lastLiveAt === 0) {
           c.price = sym.initialPrice;
           c.spread =
             c.bid && c.ask && c.ask > c.bid
@@ -341,9 +356,11 @@ export function startDemoFeed(): void {
       if (c.price > 0 && !isReplaySymbol(c.symbol)) {
         mark(c.symbol, c.price);
       }
-      // Preserve real exchange timestamp when present so closed/quiet instruments never
-      // synthesize phantom zero-volume future candles on 1m / 3m / 5m charts.
-      emitTick(c, c.lastExchangeTs > 0 ? c.lastExchangeTs : undefined);
+      // Only emit ticks when backed by a real exchange timestamp or live update so quiet/Forex
+      // instruments never synthesize phantom zero-volume future candles with Date.now().
+      if (c.lastExchangeTs > 0 || c.lastLiveAt > 0) {
+        emitTick(c, c.lastExchangeTs > 0 ? c.lastExchangeTs : c.lastLiveAt);
+      }
     }
   }, TICK_MS);
 }
@@ -395,6 +412,7 @@ export function syncCursorPrice(symbol: string, price: number, occurredAtMs?: nu
   if (cur) {
     cur.price = price;
     cur.anchorPrice = price;
+    syncBidAskOnTrade(cur, price, Date.now());
     cur.spread = computeSpread(price, sym?.tickSize ?? 0.01, isStock);
     const realTs =
       typeof occurredAtMs === "number" && Number.isFinite(occurredAtMs) && occurredAtMs > 0
@@ -445,6 +463,7 @@ export function applyLiveStockTrade(
   if (cur) {
     cur.price = price;
     cur.anchorPrice = price;
+    syncBidAskOnTrade(cur, price, now);
     cur.spread = computeSpread(
       price,
       sym?.tickSize ?? 0.01,

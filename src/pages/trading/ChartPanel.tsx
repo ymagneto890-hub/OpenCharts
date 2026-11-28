@@ -72,11 +72,14 @@ import {
 } from "../../services/ibkrStream.ts";
 import {
   computeCausalReplayVwapSeed,
+  fetchHistoryAsync,
   getHistory,
   getStockSessionMetadata,
   getStockVwapSeed,
   hasRealStockSeries,
   isCryptoInstrument,
+  subscribeCandleBucketClosed,
+  subscribeRealSeriesLoaded,
 } from "../../services/demo/candles.ts";
 import { getDemoSymbol } from "../../services/demo/instruments.ts";
 import { getReplaySliceForTimeframe, useReplayStore } from "../../services/demo/replay.ts";
@@ -296,7 +299,10 @@ export interface ChartPanelProps {
   ) => Promise<unknown> | void;
   onClosePosition?: (positionId: string) => void;
   draftOrderPreview?: DraftOrderSlTpPreview | null;
-  onModifyDraftSlTp?: (mods: { takeProfit?: number | null; stopLoss?: number | null }) => void;
+  onModifyDraftSlTp?: (
+    mods: { takeProfit?: number | null; stopLoss?: number | null },
+    opts?: { commit?: boolean; startPrice?: number },
+  ) => void;
   replayTradeEvents?: Array<{
     id: string;
     type: "entry" | "exit" | "violation";
@@ -638,13 +644,26 @@ function paintTickVolume(
   ctx: RtCtx,
 ): void {
   if (!ctx.volume) return;
-  if (!isContinuation) ctx.legendVol.current = 0;
+  if (!isContinuation) {
+    const prevClosed = ctx.legendVol.current;
+    const nextWindow = [...ctx.recentVols.current, prevClosed].slice(-19);
+    ctx.recentVols.current = nextWindow;
+    ctx.prev19VolSum.current = nextWindow.reduce((acc, v) => acc + v, 0);
+    ctx.hasVolumeMa.current = nextWindow.length >= 19;
+    ctx.legendVol.current = 0;
+  }
   try {
     ctx.volume.update({
       time: bucketTime,
       value: ctx.legendVol.current,
       color: bar.close >= bar.open ? ctx.colors.volumeUp : ctx.colors.volumeDown,
     });
+    if (ctx.volumeMa && ctx.hasVolumeMa.current) {
+      ctx.volumeMa.update({
+        time: bucketTime,
+        value: Number(((ctx.prev19VolSum.current + ctx.legendVol.current) / 20).toFixed(2)),
+      });
+    }
   } catch {
     /* safe to ignore */
   }
@@ -751,13 +770,14 @@ function reapplyLive(live: LiveCandleData | undefined, ctx: RtCtx): void {
   const bar = liveBarFrom(live);
   if (!bar) return;
   if (ctx.allowLiveBar && !ctx.allowLiveBar(bar.time as number)) return;
+  const lastHistSec = (ctx.lastCandle.current?.time as number) ?? 0;
+  if ((bar.time as number) < lastHistSec) return;
+  const isNewBucket = ctx.lastCandle.current !== null && (bar.time as number) > lastHistSec;
   try {
     ctx.series.update(bar);
   } catch {
-    /* safe to ignore */
+    return;
   }
-  const isNewBucket =
-    ctx.lastCandle.current !== null && (bar.time as number) > (ctx.lastCandle.current.time as number);
   ctx.lastCandle.current = bar;
   paintServerVolume(live, bar.time, isNewBucket, ctx);
 }
@@ -1713,9 +1733,13 @@ export function ChartPanel({
   } = useNewsOverlay(containerRef, chartRef, selectedSymbol, isDark, chartData, chartEpoch, timeframe);
 
   const handleModifyPositionOrDraft = useCallback(
-    (posId: string, mods: { takeProfit?: number | null; stopLoss?: number | null }) => {
+    (
+      posId: string,
+      mods: { takeProfit?: number | null; stopLoss?: number | null },
+      opts?: { commit?: boolean; startPrice?: number },
+    ) => {
       if (posId === "__draft__") {
-        onModifyDraftSlTp?.(mods);
+        onModifyDraftSlTp?.(mods, opts);
         return;
       }
       return onModifyPosition?.(posId, mods);
@@ -1966,10 +1990,7 @@ export function ChartPanel({
           high: liveCandle.high,
           low: liveCandle.low,
           close: liveCandle.close,
-          volume:
-            liveTs === lastTimeSec
-              ? Math.max(last.volume ?? 0, liveCandle.volume ?? 0)
-              : (liveCandle.volume ?? 0),
+          volume: liveCandle.volume ?? 0,
         };
         working = liveTs === lastTimeSec ? [...chartData.slice(0, -1), liveRow] : [...chartData, liveRow];
       }
@@ -2066,7 +2087,39 @@ export function ChartPanel({
     timeframe,
   ]);
 
+  const [fine1mRevision, setFine1mRevision] = useState(0);
+  const isVwapActive = activeIndicators.includes("VWAP");
+  useEffect(() => {
+    if (isReplaying || !isVwapActive) return;
+    const tfSec = parseTimeframeSeconds(timeframe);
+    if (tfSec <= 60 || tfSec >= 86_400) return;
+    if (!isStockSymbol && !isCryptoInstrument(selectedSymbol)) return;
+
+    let cancelled = false;
+    const bump = () => {
+      if (!cancelled) setFine1mRevision((r) => r + 1);
+    };
+    const upperSym = selectedSymbol.trim().toUpperCase();
+    const unsubLoaded = subscribeRealSeriesLoaded((sym, tf) => {
+      if (sym.trim().toUpperCase() === upperSym && tf === "1m") bump();
+    });
+    const unsubClosed = subscribeCandleBucketClosed((sym, tf) => {
+      if (sym.trim().toUpperCase() === upperSym && tf === "1m") bump();
+    });
+
+    void fetchHistoryAsync(selectedSymbol, "1m", 1_500).then((bars) => {
+      if (!cancelled && bars.length > 0) bump();
+    });
+
+    return () => {
+      cancelled = true;
+      unsubLoaded();
+      unsubClosed();
+    };
+  }, [isReplaying, isVwapActive, timeframe, selectedSymbol, isStockSymbol]);
+
   const fine1mVwapBundle = useMemo(() => {
+    void fine1mRevision;
     const tfSec = parseTimeframeSeconds(timeframe);
     if (tfSec <= 60 || tfSec >= 86_400) {
       return { candles: null, rawCoverageStartSec: undefined as number | undefined };
@@ -2103,6 +2156,7 @@ export function ChartPanel({
     stockMetaForVwap,
     demoSymForVwap?.exchange,
     liveIndicatorData,
+    fine1mRevision,
   ]);
   const fine1mVwapCandles = fine1mVwapBundle.candles;
   const chartRawCoverageStartSec = anchorVwapAtRegularOpen
@@ -2673,8 +2727,10 @@ export function ChartPanel({
       }
       // If modular sub-panels (e.g. RSI above PRICE) offset `localTop` so the latest candle would clip
       // off-screen, shift/clamp the synced range so the active 1m candles stay cleanly framed.
+      const isClippedFallback =
+        refPrice > 0 && (refPrice < rawRange.minValue || refPrice > rawRange.maxValue);
       let effectiveRange = rawRange;
-      if (refPrice > 0 && (refPrice < rawRange.minValue || refPrice > rawRange.maxValue)) {
+      if (isClippedFallback) {
         effectiveRange = {
           minValue: Math.min(bounds.botPrice, refPrice * 0.995),
           maxValue: Math.max(bounds.topPrice, refPrice * 1.005),
@@ -2685,9 +2741,9 @@ export function ChartPanel({
           autoscaleInfoProvider: () => ({ priceRange: effectiveRange }),
         });
         chart.priceScale("right").applyOptions({
-          visible: false,
+          visible: isClippedFallback,
           autoScale: true,
-          scaleMargins: { top: 0.04, bottom: 0.16 },
+          scaleMargins: { top: 0, bottom: 0 },
         });
       } catch {
         /* chart disposed */

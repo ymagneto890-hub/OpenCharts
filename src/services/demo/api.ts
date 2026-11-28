@@ -256,54 +256,7 @@ export const demoApi = {
         }
       }
 
-      if (!oneHourScreenshot || !fourHourScreenshot || !dailyScreenshot) {
-        try {
-          const captureFn =
-            typeof window !== "undefined"
-              ? (window as unknown as { __opencharts_capture_screenshots?: (sym: string) => Promise<{
-                  oneHourScreenshot?: string;
-                  fourHourScreenshot?: string;
-                  dailyScreenshot?: string;
-                  entryScreenshot?: string;
-                  entryTimeframe?: string;
-                }> }).__opencharts_capture_screenshots
-              : undefined;
-
-          const captured = captureFn
-            ? await captureFn(data.symbol)
-            : await captureTradeScreenshots(data.symbol);
-
-          if (!oneHourScreenshot && captured.oneHourScreenshot) {
-            oneHourScreenshot = captured.oneHourScreenshot;
-          }
-          if (!fourHourScreenshot && captured.fourHourScreenshot) {
-            fourHourScreenshot = captured.fourHourScreenshot;
-          }
-          if (!dailyScreenshot && captured.dailyScreenshot) {
-            dailyScreenshot = captured.dailyScreenshot;
-          }
-          if (!entryScreenshot && captured.entryScreenshot) {
-            entryScreenshot = captured.entryScreenshot;
-          }
-          if (!entryTimeframe && captured.entryTimeframe) {
-            entryTimeframe = captured.entryTimeframe;
-          }
-
-          // Absolute sanity check: 4H and Daily MUST NEVER be identical images
-          if (fourHourScreenshot && dailyScreenshot && fourHourScreenshot === dailyScreenshot) {
-            const activeReplayTime = getActiveReplayTimeSec();
-            if (entryTimeframe === "1d") {
-              fourHourScreenshot = await captureFourHourChart(data.symbol, undefined, activeReplayTime);
-            } else {
-              dailyScreenshot = await captureDailyChart(data.symbol, undefined, activeReplayTime);
-            }
-          }
-        } catch (err) {
-          console.warn("[trade-screenshot] auto capture failed:", err);
-        }
-      }
-
-      return later(() =>
+      const order = await later(() =>
         engine.placeOrder({
           ...data,
           oneHourScreenshot,
@@ -313,6 +266,54 @@ export const demoApi = {
           entryTimeframe,
         }),
       );
+
+      if (!oneHourScreenshot || !fourHourScreenshot || !dailyScreenshot) {
+        void (async () => {
+          try {
+            const captureFn =
+              typeof window !== "undefined"
+                ? (window as unknown as { __opencharts_capture_screenshots?: (sym: string) => Promise<{
+                    oneHourScreenshot?: string;
+                    fourHourScreenshot?: string;
+                    dailyScreenshot?: string;
+                    entryScreenshot?: string;
+                    entryTimeframe?: string;
+                  }> }).__opencharts_capture_screenshots
+                : undefined;
+
+            const captured = captureFn
+              ? await captureFn(data.symbol)
+              : await captureTradeScreenshots(data.symbol);
+
+            let h1 = oneHourScreenshot || captured.oneHourScreenshot;
+            let h4 = fourHourScreenshot || captured.fourHourScreenshot;
+            let d1 = dailyScreenshot || captured.dailyScreenshot;
+            const entry = entryScreenshot || captured.entryScreenshot;
+            const entryTf = entryTimeframe || captured.entryTimeframe;
+
+            if (h4 && d1 && h4 === d1) {
+              const activeReplayTime = getActiveReplayTimeSec();
+              if (entryTf === "1d") {
+                h4 = await captureFourHourChart(data.symbol, undefined, activeReplayTime);
+              } else {
+                d1 = await captureDailyChart(data.symbol, undefined, activeReplayTime);
+              }
+            }
+
+            engine.attachOrderScreenshots(order.id, {
+              oneHourScreenshot: h1,
+              fourHourScreenshot: h4,
+              dailyScreenshot: d1,
+              entryScreenshot: entry,
+              entryTimeframe: entryTf,
+            });
+          } catch (err) {
+            console.warn("[trade-screenshot] auto capture failed:", err);
+          }
+        })();
+      }
+
+      return order;
     };
 
     const pending = executeOrder().then(

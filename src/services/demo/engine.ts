@@ -519,10 +519,18 @@ function takeReplaySnapshot(): ReplaySnapshot {
   };
 }
 
+const MAX_REPLAY_SNAPSHOTS = 300;
+
 function saveReplaySnapshot(): void {
   if (mode !== "replay" || replayClockMs == null) return;
   const sec = Math.floor(replayClockMs / 1000);
+  if (replaySnapshots.has(sec)) replaySnapshots.delete(sec);
   replaySnapshots.set(sec, takeReplaySnapshot());
+  while (replaySnapshots.size > MAX_REPLAY_SNAPSHOTS) {
+    const oldest = replaySnapshots.keys().next().value;
+    if (oldest === undefined) break;
+    replaySnapshots.delete(oldest);
+  }
 }
 
 function restoreReplaySnapshot(snap: ReplaySnapshot): void {
@@ -887,7 +895,7 @@ export function closePosition(positionId: string, quantity?: number): { success:
   if (quantity !== undefined && (!Number.isFinite(quantity) || quantity <= 0)) {
     return { success: false };
   }
-  const pos = state.positions.find((p) => p.id === positionId);
+  const pos = state.positions.find((p) => p.id === positionId && p.source === mode);
   if (!pos) return { success: false };
   const price = priceOfSource(pos.symbolName, pos.source) ?? pos.currentPrice ?? pos.entryPrice;
   const qty = quantity !== undefined && quantity < pos.quantity - EPS ? roundQty(quantity) : pos.quantity;
@@ -906,7 +914,7 @@ export function modifyPosition(
   positionId: string,
   mods: { takeProfit?: number | null; stopLoss?: number | null },
 ): Position | undefined {
-  const pos = state.positions.find((p) => p.id === positionId);
+  const pos = state.positions.find((p) => p.id === positionId && p.source === mode);
   if (!pos) return undefined;
   const price = priceOfSource(pos.symbolName, pos.source) ?? pos.currentPrice ?? pos.entryPrice;
   // Levels are validated against the current price: a level already on the wrong
@@ -938,7 +946,9 @@ export interface ModifyOrderArgs {
 }
 
 export function modifyOrder(orderId: string, mods: ModifyOrderArgs): Order | undefined {
-  const order = state.orders.find((o) => o.id === orderId && o.status === "PENDING");
+  const order = state.orders.find(
+    (o) => o.id === orderId && o.status === "PENDING" && o.source === mode,
+  );
   if (!order) return undefined;
   const nextQty = mods.quantity !== undefined ? roundQty(Number(mods.quantity)) : order.quantity;
   if (!(nextQty > 0)) throw new Error("Quantity must be greater than 0");
@@ -959,7 +969,6 @@ export function modifyOrder(orderId: string, mods: ModifyOrderArgs): Order | und
   const nextSl = mods.stopLoss !== undefined ? mods.stopLoss : order.stopLoss;
   const nextTp = mods.takeProfit !== undefined ? mods.takeProfit : order.takeProfit;
   const posSide = order.side === "BUY" ? "LONG" : "SHORT";
-  assertLevels(posSide, ref, nextSl, nextTp);
 
   const candidateOrder: Pick<Order, "side" | "type" | "price" | "stopPrice"> = {
     side: order.side,
@@ -976,7 +985,8 @@ export function modifyOrder(orderId: string, mods: ModifyOrderArgs): Order | und
     }
   }
 
-  // Validate margin before mutating the order state so a rejected margin check does not corrupt the order
+  // Validate SL/TP and margin against the actual execution reference before mutating state
+  assertLevels(posSide, immediatePx ?? ref, nextSl, nextTp);
   assertMargin(order.symbolName, nextQty, immediatePx ?? ref);
 
   order.quantity = nextQty;
@@ -1002,7 +1012,9 @@ export function modifyOrder(orderId: string, mods: ModifyOrderArgs): Order | und
 }
 
 export function cancelOrder(orderId: string): { success: boolean } {
-  const order = state.orders.find((o) => o.id === orderId && o.status === "PENDING");
+  const order = state.orders.find(
+    (o) => o.id === orderId && o.status === "PENDING" && o.source === mode,
+  );
   if (!order) return { success: false };
   order.status = "CANCELLED";
   order.updatedAt = nowIso();
@@ -1277,9 +1289,18 @@ export function setStartingBalance(startingBalance: number): DemoSummary {
   if (!(startingBalance >= 1 && startingBalance <= 1e9)) {
     throw new Error("Starting capital must be between 1 and 1,000,000,000");
   }
+  const delta = startingBalance - state.startingBalance;
   const realizedNetDelta = state.balance - state.startingBalance;
   state.startingBalance = startingBalance;
   state.balance = startingBalance + realizedNetDelta;
+  if (mode === "replay" && delta !== 0) {
+    if (replayInitialSnapshot) {
+      replayInitialSnapshot.balance += delta;
+    }
+    for (const snap of replaySnapshots.values()) {
+      snap.balance += delta;
+    }
+  }
   recomputeEquity();
   persist();
   saveReplaySnapshot();
@@ -1393,7 +1414,9 @@ export function getSummary(): DemoSummary {
       losses += 1;
     }
   }
-  const openFees = state.positions.reduce((s, p) => s + (p.entryFee ?? 0), 0);
+  const openFees = state.positions
+    .filter((p) => p.source === mode)
+    .reduce((s, p) => s + (p.entryFee ?? 0), 0);
   const trades = session.length;
   return {
     accountId: account.id,
@@ -1473,6 +1496,63 @@ export function updateTradeScreenshot(
     else if (type === "4h") pos.fourHourScreenshot = dataUrl;
     else if (type === "daily") pos.dailyScreenshot = dataUrl;
     else pos.entryScreenshot = dataUrl;
+    persist();
+    emitListsChanged();
+  }
+}
+
+export function attachOrderScreenshots(
+  orderId: string,
+  shots: {
+    oneHourScreenshot?: string;
+    fourHourScreenshot?: string;
+    dailyScreenshot?: string;
+    entryScreenshot?: string;
+    entryTimeframe?: string;
+  },
+): void {
+  const order = state.orders.find((o) => o.id === orderId);
+  if (!order) return;
+  let changed = false;
+  const applyTo = (
+    target: Pick<
+      EngineOrder,
+      "oneHourScreenshot" | "fourHourScreenshot" | "dailyScreenshot" | "entryScreenshot" | "entryTimeframe"
+    >,
+  ) => {
+    if (shots.oneHourScreenshot && !target.oneHourScreenshot) {
+      target.oneHourScreenshot = shots.oneHourScreenshot;
+      changed = true;
+    }
+    if (shots.fourHourScreenshot && !target.fourHourScreenshot) {
+      target.fourHourScreenshot = shots.fourHourScreenshot;
+      changed = true;
+    }
+    if (shots.dailyScreenshot && !target.dailyScreenshot) {
+      target.dailyScreenshot = shots.dailyScreenshot;
+      changed = true;
+    }
+    if (shots.entryScreenshot && !target.entryScreenshot) {
+      target.entryScreenshot = shots.entryScreenshot;
+      changed = true;
+    }
+    if (shots.entryTimeframe && !target.entryTimeframe) {
+      target.entryTimeframe = shots.entryTimeframe;
+      changed = true;
+    }
+  };
+  applyTo(order);
+  for (const pos of state.positions) {
+    if (pos.symbolName === order.symbolName && pos.openedAt === order.updatedAt) {
+      applyTo(pos);
+    }
+  }
+  for (const closed of state.closed) {
+    if (closed.symbolName === order.symbolName && closed.openedAt === order.updatedAt) {
+      applyTo(closed);
+    }
+  }
+  if (changed) {
     persist();
     emitListsChanged();
   }

@@ -312,11 +312,14 @@ function diskStoragePlugin(): Plugin {
       // 5. IBKR Multiplexed Real-Time SSE Stream (1s base bars + quote + consolidated VWAP)
       if (req.method === "GET" && url.startsWith("/__api/ibkr-stream")) {
         const parsedUrl = new URL(url, "http://127.0.0.1");
-        const rawSymbols = (parsedUrl.searchParams.get("symbols") ?? "")
-          .split(",")
-          .map((s) => s.trim().toUpperCase())
-          .filter(Boolean)
-          .slice(0, 12);
+        const rawSymbols = Array.from(
+          new Set(
+            (parsedUrl.searchParams.get("symbols") ?? "")
+              .split(",")
+              .map((s) => s.trim().toUpperCase())
+              .filter(Boolean),
+          ),
+        ).slice(0, 12);
 
         const exchMap = new Map<string, string>();
         const rawExchanges = (parsedUrl.searchParams.get("exchanges") ?? "").split(",");
@@ -341,17 +344,6 @@ function diskStoragePlugin(): Plugin {
         };
 
         const symSet = new Set(rawSymbols);
-        const releases = rawSymbols.map((sym) => ibkr.acquireSymbolStream(sym, exchMap.get(sym)));
-
-        const status = ibkr.getStatusPayload();
-        writeEvent({
-          type: "status",
-          connected: status.connectionState === "connected",
-          connectionState: status.connectionState,
-          marketDataType: status.effectiveMarketDataType ?? status.marketDataType,
-          reason: status.lastError ?? undefined,
-        });
-
         const onStreamEvent = (evt: IbkrStreamEvent) => {
           if (evt.type === "status") {
             writeEvent(evt);
@@ -362,6 +354,17 @@ function diskStoragePlugin(): Plugin {
           }
         };
         ibkr.on("stream-event", onStreamEvent);
+
+        const status = ibkr.getStatusPayload();
+        writeEvent({
+          type: "status",
+          connected: status.connectionState === "connected",
+          connectionState: status.connectionState,
+          marketDataType: status.effectiveMarketDataType ?? status.marketDataType,
+          reason: status.lastError ?? undefined,
+        });
+
+        const releases = rawSymbols.map((sym) => ibkr.acquireSymbolStream(sym, exchMap.get(sym)));
 
         const heartbeatTimer = setInterval(() => {
           if (res.writableEnded) return;
@@ -534,8 +537,9 @@ function diskStoragePlugin(): Plugin {
         const minBarsRaw = Number(parsedUrl.searchParams.get("minBars") ?? "1500");
         const minBars =
           Number.isFinite(minBarsRaw) && minBarsRaw > 0
-            ? Math.min(2_000, Math.round(minBarsRaw))
+            ? Math.min(3_500, Math.round(minBarsRaw))
             : 1500;
+        const targetDate = (parsedUrl.searchParams.get("targetDate") ?? "").trim() || undefined;
         if (!symbol) {
           sendJson(res, 400, { error: "Missing symbol parameter" });
           return;
@@ -546,7 +550,7 @@ function diskStoragePlugin(): Plugin {
         };
         res.on("close", onClose);
         void cryptoData
-          .getHistoricalCandles(symbol, timeframe, minBars, ac.signal)
+          .getHistoricalCandles(symbol, timeframe, minBars, ac.signal, targetDate)
           .then((result) => {
             res.off("close", onClose);
             sendJson(res, 200, result);
@@ -564,11 +568,14 @@ function diskStoragePlugin(): Plugin {
       // 10. Crypto Real-Time Multiplexed SSE Stream: GET /__api/crypto-stream?symbols=...
       if (req.method === "GET" && url.startsWith("/__api/crypto-stream")) {
         const parsedUrl = new URL(url, "http://127.0.0.1");
-        const rawSymbols = (parsedUrl.searchParams.get("symbols") ?? "")
-          .split(",")
-          .map((s) => s.trim().toUpperCase())
-          .filter(Boolean)
-          .slice(0, 12);
+        const rawSymbols = Array.from(
+          new Set(
+            (parsedUrl.searchParams.get("symbols") ?? "")
+              .split(",")
+              .map((s) => s.trim().toUpperCase())
+              .filter(Boolean),
+          ),
+        ).slice(0, 12);
 
         res.statusCode = 200;
         res.setHeader("Content-Type", "text/event-stream");

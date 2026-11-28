@@ -705,7 +705,7 @@ function renderRectangle(scope: BitmapCoordinatesRenderingScope, e: ResolvedEntr
   const b = toBitmap(scope, e.x2, e.y2);
   const ctx = scope.context;
   ctx.save();
-  ctx.fillStyle = hexToRgba(e.d.color, RECT_FILL_ALPHA);
+  ctx.fillStyle = hexToRgba(e.d.fillColor ?? e.d.color, e.d.fillOpacity ?? RECT_FILL_ALPHA);
   ctx.fillRect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y));
   ctx.strokeStyle = e.d.color;
   ctx.lineWidth = (e.d.width ?? 1.5) * scope.verticalPixelRatio;
@@ -766,10 +766,12 @@ function renderFibLevel(
   const ctx = scope.context;
   ctx.save();
   ctx.font = `${Math.round(10 * scope.verticalPixelRatio)}px monospace`;
-  ctx.textAlign = "right";
+  const hpr = scope.horizontalPixelRatio;
+  const nearLeftEdge = xA < 85 * hpr;
+  ctx.textAlign = nearLeftEdge ? "left" : "right";
   ctx.textBaseline = "middle";
   ctx.fillStyle = lvl.color;
-  ctx.fillText(lvl.label, xA - 6 * scope.horizontalPixelRatio, y);
+  ctx.fillText(lvl.label, nearLeftEdge ? xA + 6 * hpr : xA - 6 * hpr, y);
   ctx.restore();
 }
 

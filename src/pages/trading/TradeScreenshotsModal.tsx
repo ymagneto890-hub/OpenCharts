@@ -39,28 +39,11 @@ export function TradeScreenshotsModal({ trade, onClose }: TradeScreenshotsModalP
   const closedTrade = isClosed ? (trade as ClosedPosition) : null;
   const digits = trade ? getPipDigits(trade.symbolName) : 2;
 
-  const tradeTimeSec = parseTradeTimestampSec(trade?.openedAt);
-  const isHistorical = typeof tradeTimeSec === "number" && tradeTimeSec < 1_788_220_800;
-
-  // 1H, 4H, and Daily charts should ALWAYS be pure, pristine charts without TP/SL lines.
-  // Historical replay trades with 1H screenshots taken prior to the 1h replay fix are automatically regenerated.
-  const isFaultyLegacy1h = Boolean(
-    isHistorical &&
-    trade?.oneHourScreenshot &&
-    (trade.oneHourScreenshot.includes("_1792244077917_") ||
-     trade.oneHourScreenshot.includes("_1792244407435_") ||
-     (() => {
-       const m = trade.oneHourScreenshot.match(/_1h_(\d{13})_/);
-       return m && Number(m[1]) < 1_792_248_000_000;
-     })())
-  );
-
   const isDirty1h = Boolean(
-    isFaultyLegacy1h ||
-    (trade?.oneHourScreenshot &&
-     trade?.entryScreenshot &&
-     trade.oneHourScreenshot === trade.entryScreenshot &&
-     trade?.entryTimeframe === "1h")
+    trade?.oneHourScreenshot &&
+      trade?.entryScreenshot &&
+      trade.oneHourScreenshot === trade.entryScreenshot &&
+      trade?.entryTimeframe === "1h",
   );
   const isDirty4h = Boolean(
     trade?.fourHourScreenshot &&
@@ -147,11 +130,10 @@ export function TradeScreenshotsModal({ trade, onClose }: TradeScreenshotsModalP
     const targetTradeId = trade.id;
 
     const dirty1h = Boolean(
-      isFaultyLegacy1h ||
-      (trade.entryTimeframe === "1h" &&
-       trade.oneHourScreenshot &&
-       trade.entryScreenshot &&
-       trade.oneHourScreenshot === trade.entryScreenshot)
+      trade.entryTimeframe === "1h" &&
+        trade.oneHourScreenshot &&
+        trade.entryScreenshot &&
+        trade.oneHourScreenshot === trade.entryScreenshot,
     );
     const dirty4h = Boolean(
       trade.entryTimeframe === "4h" &&
@@ -199,7 +181,6 @@ export function TradeScreenshotsModal({ trade, onClose }: TradeScreenshotsModalP
           if (res) {
             api.updateTradeScreenshot?.(targetTradeId, "1h", res);
             if (!cancelled && activeTradeIdRef.current === targetTradeId) {
-              (trade as { oneHourScreenshot?: string }).oneHourScreenshot = res;
               setOneHourScreenshot(res);
             }
           }
@@ -220,7 +201,6 @@ export function TradeScreenshotsModal({ trade, onClose }: TradeScreenshotsModalP
           if (res) {
             api.updateTradeScreenshot?.(targetTradeId, "4h", res);
             if (!cancelled && activeTradeIdRef.current === targetTradeId) {
-              (trade as { fourHourScreenshot?: string }).fourHourScreenshot = res;
               setFourHourScreenshot(res);
             }
           }
@@ -241,7 +221,6 @@ export function TradeScreenshotsModal({ trade, onClose }: TradeScreenshotsModalP
           if (res) {
             api.updateTradeScreenshot?.(targetTradeId, "daily", res);
             if (!cancelled && activeTradeIdRef.current === targetTradeId) {
-              (trade as { dailyScreenshot?: string }).dailyScreenshot = res;
               setDailyScreenshot(res);
             }
           }
@@ -329,12 +308,10 @@ export function TradeScreenshotsModal({ trade, onClose }: TradeScreenshotsModalP
   const handleSaveNotes = async () => {
     if (!trade) return;
     const targetTradeId = trade.id;
-    const trimmedNotes = notes.trim() || undefined;
     setIsSavingNotes(true);
     try {
       await api.updateTradeNotes?.(targetTradeId, notes);
       if (activeTradeIdRef.current !== targetTradeId) return;
-      (trade as { notes?: string }).notes = trimmedNotes;
       setSavedSuccess(true);
       setIsEditingNotes(false);
       if (saveNoticeTimerRef.current) clearTimeout(saveNoticeTimerRef.current);

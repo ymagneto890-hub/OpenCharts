@@ -8,7 +8,9 @@
  * - PnlHeatmap (#59)
  * - NewsFeed (#60)
  */
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
+import { fetchStockNews, type StockNewsItem } from "@/services/stockScreener";
+import { getDemoSymbol } from "@/services/demo/instruments";
 import {
   Bell,
   BellOff,
@@ -591,47 +593,59 @@ export function PnlHeatmap({ data = [] }: { data?: { hour: number; day: number; 
 export function NewsFeed({ symbol }: { symbol: string }) {
   const [activeTab, setActiveTab] = useState<"recent" | "history">("recent");
   const { data: calendarEvents } = useEconomicCalendar(["USD", "EUR", "GBP"]);
+  const [stockNews, setStockNews] = useState<StockNewsItem[]>([]);
+  const isStock = (getDemoSymbol(symbol)?.category ?? "").toUpperCase() === "STOCKS";
 
-  const recentNews = useMemo(
-    () => [
-      {
-        id: "n-1",
-        title: `Decisión inminente sobre tipos de interés del banco central de ${symbol.slice(0, 3)}`,
-        source: "Reuters",
-        time: "Hace 2h",
-        impact: "HIGH" as const,
-      },
-      {
-        id: "n-2",
-        title: `Los datos de empleo de ${symbol.slice(3, 6) || "USD"} superan las expectativas del mercado`,
-        source: "Bloomberg",
-        time: "Hace 4h",
-        impact: "MEDIUM" as const,
-      },
-      {
-        id: "n-3",
-        title: `Análisis Técnico: ${symbol} se aproxima a una resistencia clave`,
-        source: "IBKR Wire",
-        time: "Hace 6h",
-        impact: "LOW" as const,
-      },
-      {
-        id: "n-4",
-        title: "Mejora el apetito por el riesgo global ante avances en acuerdos comerciales",
-        source: "FT",
-        time: "Hace 8h",
-        impact: "MEDIUM" as const,
-      },
-      {
-        id: "n-5",
-        title: `Se espera un repunte de volatilidad en ${symbol} previo a las Nóminas no Agrícolas (NFP)`,
-        source: "ForexLive",
-        time: "Hace 12h",
-        impact: "HIGH" as const,
-      },
-    ],
-    [symbol],
-  );
+  useEffect(() => {
+    if (!isStock) {
+      setStockNews([]);
+      return;
+    }
+    const ac = new AbortController();
+    void fetchStockNews(symbol, ac.signal)
+      .then((res) => {
+        if (!ac.signal.aborted) setStockNews(res.items ?? []);
+      })
+      .catch(() => {
+        if (!ac.signal.aborted) setStockNews([]);
+      });
+    return () => ac.abort();
+  }, [symbol, isStock]);
+
+  const recentNews = useMemo(() => {
+    if (isStock && stockNews.length > 0) {
+      return stockNews.map((item, idx) => ({
+        id: `sn-${idx}-${item.title.slice(0, 16)}`,
+        title: item.catalystTag ? `[${item.catalystTag}] ${item.title}` : item.title,
+        source: item.publisher || "Finviz",
+        time: item.publishedAt
+          ? new Date(item.publishedAt).toLocaleString("es-ES", {
+              day: "2-digit",
+              month: "short",
+              hour: "2-digit",
+              minute: "2-digit",
+            })
+          : "Reciente",
+        impact: (item.catalystTag ? "HIGH" : "MEDIUM") as "HIGH" | "MEDIUM" | "LOW",
+      }));
+    }
+    return (calendarEvents ?? []).slice(0, 10).map((ev) => {
+      const d = new Date(ev.time);
+      const timeLabel = !Number.isNaN(d.getTime())
+        ? d.toLocaleDateString("es-ES", { day: "2-digit", month: "short" })
+        : "—";
+      return {
+        id: `cal-${ev.id}`,
+        title: `[${ev.currency}] ${ev.event}`,
+        source: ev.country ? `${ev.country} Macro` : "Calendario Macro",
+        time: timeLabel,
+        impact: (ev.impact === "high" ? "HIGH" : ev.impact === "medium" ? "MEDIUM" : "LOW") as
+          | "HIGH"
+          | "MEDIUM"
+          | "LOW",
+      };
+    });
+  }, [isStock, stockNews, calendarEvents]);
 
   const historicalNews = useMemo(() => {
     if (!calendarEvents || calendarEvents.length === 0) return [];

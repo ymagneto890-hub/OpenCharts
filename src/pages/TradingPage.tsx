@@ -17,7 +17,7 @@ import {
 import { useTradeSound } from "../hooks/useTradeSound";
 import { INDICATOR_REGISTRY, type IndicatorType } from "../lib/indicators.ts";
 import { computeRequiredWarmupBars, isValidTimeframe } from "../lib/timeframes.ts";
-import { getIndicatorSettings } from "../hooks/useIndicatorSettings.ts";
+import { useIndicatorSettings } from "../hooks/useIndicatorSettings.ts";
 import { computeLivePnl, computeLivePrice } from "../lib/livePnl.ts";
 import { posthog } from "../lib/posthog";
 import type { CreateJournalEntryInput, UpdateJournalEntryInput } from "../services/api/journal.ts";
@@ -914,12 +914,19 @@ export function TradingPage() {
   );
 
   const handleModifyDraftSlTp = useCallback(
-    (mods: { takeProfit?: number | null; stopLoss?: number | null }) => {
+    (
+      mods: { takeProfit?: number | null; stopLoss?: number | null },
+      opts?: { commit?: boolean; startPrice?: number },
+    ) => {
       const cur = draftOrderPreviewRef.current;
-      if (cur) {
+      if (cur && opts?.commit !== false) {
         const before: { takeProfit?: number | null; stopLoss?: number | null } = {};
-        if (mods.takeProfit !== undefined) before.takeProfit = cur.takeProfit;
-        if (mods.stopLoss !== undefined) before.stopLoss = cur.stopLoss;
+        if (mods.takeProfit !== undefined) {
+          before.takeProfit = opts?.startPrice ?? cur.takeProfit;
+        }
+        if (mods.stopLoss !== undefined) {
+          before.stopLoss = opts?.startPrice ?? cur.stopLoss;
+        }
         actionUndoRef.current.push({
           kind: "draft-sltp",
           before,
@@ -1087,15 +1094,7 @@ export function TradingPage() {
     };
   }, [selectedSymbol, updateTick, isReplayActive]);
 
-  // Pacing-safe prefetch of the active symbol + timeframe (avoids bursting multiple concurrent historical queries)
-  useEffect(() => {
-    if (isReplayActive) return;
-    void queryClient.prefetchQuery({
-      queryKey: [...queryKeys.market.candles(selectedSymbol, timeframe), "auto", 0],
-      queryFn: () => api.getCandlesWithMeta(selectedSymbol, timeframe),
-      staleTime: 30_000,
-    });
-  }, [selectedSymbol, timeframe, queryClient, isReplayActive]);
+  // Active symbol/timeframe candles are loaded directly by useCandles with the exact deepCandleLimit key.
 
   // Reload open stock charts immediately when IBKR connection settings are saved or reset
   useEffect(() => {
@@ -1221,17 +1220,22 @@ export function TradingPage() {
   const handleChartClosePosition = useCallback(
     async (positionId: string) => {
       if (!activeAccountId) return;
+      if (!isFeedConnected) {
+        toast.warning("No Data Feed", "Cannot close positions while disconnected from the data feed");
+        return;
+      }
       try {
         await api.closePosition(positionId);
         toast.success("Position Closed", "Position has been closed from chart");
         queryClient.invalidateQueries({ queryKey: ["positions", activeAccountId] });
         queryClient.invalidateQueries({ queryKey: ["closedPositions", activeAccountId] });
         queryClient.invalidateQueries({ queryKey: ["fills", activeAccountId] });
+        queryClient.invalidateQueries({ queryKey: queryKeys.accounts.detail(activeAccountId) });
       } catch (err: unknown) {
         toast.error("Close Failed", getErrorMessage(err));
       }
     },
-    [activeAccountId, queryClient],
+    [activeAccountId, queryClient, isFeedConnected],
   );
 
   // Chart context-menu quick orders (Buy/Sell limit/stop at the clicked price).
@@ -1379,12 +1383,13 @@ export function TradingPage() {
   // Fast initial render batch (1,000 bars max).
   // Older historical bars (from the deep 20,000+ dataset) load on-demand
   // as the user scrolls back in time via the chart's makeHistoryLoader.
+  const indicatorSettings = useIndicatorSettings();
   const deepCandleLimit = useMemo(() => {
     if (timeframe === "1w") return 500;
-    const emaLines = getIndicatorSettings().ema?.lines ?? [];
+    const emaLines = indicatorSettings.ema?.lines ?? [];
     const activePeriods = emaLines.filter((l) => l.enabled && l.period > 0).map((l) => l.period);
     return Math.max(1_500, computeRequiredWarmupBars(activePeriods));
-  }, [timeframe]);
+  }, [timeframe, indicatorSettings.ema?.lines]);
   const { data: candles = [] } = useCandles(
     selectedSymbol,
     timeframe,
@@ -1529,16 +1534,17 @@ export function TradingPage() {
       if (targetTf !== timeframe) {
         setTimeframe(targetTf);
       }
+      const prefetchLimit = targetTf === "1w" ? 500 : deepCandleLimit;
       void queryClient.prefetchQuery({
-        queryKey: [...queryKeys.market.candles(stock.ticker, targetTf), "auto", 0],
-        queryFn: () => api.getCandlesWithMeta(stock.ticker, targetTf),
+        queryKey: [...queryKeys.market.candles(stock.ticker, targetTf), prefetchLimit, replayVersion],
+        queryFn: () => api.getCandlesWithMeta(stock.ticker, targetTf, prefetchLimit),
         staleTime: 30_000,
       });
       setSelectedSymbol(stock.ticker);
       setActiveTab("chart");
       toast.success(stock.ticker, `${stock.description} abierto en el gráfico`);
     },
-    [chartPrefs.showExtendedHours, queryClient, setSelectedSymbol, timeframe],
+    [chartPrefs.showExtendedHours, queryClient, setSelectedSymbol, timeframe, deepCandleLimit, replayVersion],
   );
 
   // Mobile trading state

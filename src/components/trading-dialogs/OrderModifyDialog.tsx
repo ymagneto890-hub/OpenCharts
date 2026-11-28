@@ -4,7 +4,7 @@ import { toast } from "../../services/toast";
 import { cn, formatNumber } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { X, SlidersHorizontal } from "lucide-react";
-import { useInstrumentLabels } from "../../hooks/useInstrumentLabels.ts";
+import { extractBaseAsset, useInstrumentLabels } from "../../hooks/useInstrumentLabels.ts";
 import { getPipDigits } from "../../pages/trading/utils.ts";
 
 interface OrderModifyDialogProps {
@@ -47,11 +47,20 @@ export function OrderModifyDialog({ order, onClose, onSaved, tick }: OrderModify
     }
   }, [order?.id, order?.price, order?.stopPrice, order?.quantity, order?.takeProfit, order?.stopLoss]);
 
+  useEffect(() => {
+    if (!order) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [order, onClose]);
+
   if (!order) return null;
 
   const digits = getPipDigits(order.symbolName);
   const priceStep = (10 ** -digits).toFixed(digits);
-  const baseAsset = order.symbolName.split("/")[0] || unitLabelCap;
+  const baseAsset = extractBaseAsset(order.symbolName) || unitLabelCap;
 
   const handleSave = async () => {
     const currentPrice = order.type === "STOP" ? order.stopPrice : order.price;

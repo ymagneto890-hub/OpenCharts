@@ -213,11 +213,12 @@ export function parseFinvizQuoteNewsHtml(
     const title = decodeHtmlEntities(linkMatch[2] ?? "");
     if (!title) continue;
 
-    const link = rawHref.startsWith("http://") || rawHref.startsWith("https://")
-      ? rawHref
-      : rawHref.startsWith("/")
-        ? `https://finviz.com${rawHref}`
-        : rawHref;
+    const link =
+      rawHref.startsWith("http://") || rawHref.startsWith("https://")
+        ? rawHref
+        : rawHref.startsWith("/")
+          ? `https://finviz.com${rawHref}`
+          : "";
 
     // Publisher appears in `<div class="news-link-right"><span>(Publisher)</span>` or trailing `<span>`
     const pubMatch =
@@ -257,7 +258,8 @@ export function parseGoogleNewsRssXml(xml: string, limit = 15): StockNewsHeadlin
     const sourceMatch = /<source[^>]*>([\s\S]*?)<\/source>/i.exec(block);
 
     let title = decodeHtmlEntities(titleMatch?.[1] ?? "");
-    const link = decodeHtmlEntities(linkMatch?.[1] ?? "");
+    const rawLink = decodeHtmlEntities(linkMatch?.[1] ?? "");
+    const link = rawLink.startsWith("http://") || rawLink.startsWith("https://") ? rawLink : "";
     let publisher = decodeHtmlEntities(sourceMatch?.[1] ?? "");
 
     if (!publisher && title.includes(" - ")) {

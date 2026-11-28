@@ -161,6 +161,7 @@ export function useIndicators(
     );
 
     const nextStructureKey = [
+      symbol ?? "",
       effectiveIndicators.join(","),
       isDark ? "1" : "0",
       separatePanes ? "1" : "0",
@@ -641,6 +642,7 @@ export function useIndicators(
               rawCoverageStartSec: vwapRawCoverageStartSec,
               fineRawCoverageStartSec: vwapFineRawCoverageStartSec,
               requireCompleteSession: vwapRequireCompleteSession || isReplaying,
+              validateInternalGaps: isReplaying,
               symbol,
               simTimeSec: isReplaying ? replaySimTimeSec : undefined,
             },
@@ -806,5 +808,7 @@ export function useIndicators(
     vwapFineRawCoverageStartSec,
     vwapRequireCompleteSession,
     isReplaying,
+    symbol,
+    replaySimTimeSec,
   ]);
 }

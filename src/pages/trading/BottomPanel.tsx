@@ -702,7 +702,8 @@ function EconomicCalendar() {
   >(() => {
     try {
       const raw = localStorage.getItem("oc_news_sentiment_overrides_v1");
-      return raw ? JSON.parse(raw) : {};
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
     } catch {
       return {};
     }

@@ -286,9 +286,9 @@ export const DEMO_SYMBOLS: DemoSymbol[] = [
   cryptoEur("SOLEUR", "Solana / EUR", 0.01, 175, ["sol", "solana"]),
   cryptoPerp("BTCUSDT.P", "Bitcoin Perpetuo", 0.1, 90_000, ["btc", "bitcoin"], 125),
   cryptoPerp("ETHUSDT.P", "Ethereum Perpetuo", 0.01, 3_150, ["eth", "ethereum"], 100),
-  stock("SAN", "Banco Santander", 4.68, "BME", ["santander", "españa", "ibex", "banca"]),
-  stock("BBVA", "BBVA", 9.74, "BME", ["bbva", "españa", "ibex", "banca"]),
-  stock("ITX", "Inditex (Zara)", 52.8, "BME", ["inditex", "zara", "españa", "ibex"]),
+  { ...stock("SAN", "Banco Santander", 4.68, "BME", ["santander", "españa", "ibex", "banca"]), country: "Spain", currency: "EUR" },
+  { ...stock("BBVA", "BBVA", 9.74, "BME", ["bbva", "españa", "ibex", "banca"]), country: "Spain", currency: "EUR" },
+  { ...stock("ITX", "Inditex (Zara)", 52.8, "BME", ["inditex", "zara", "españa", "ibex"]), country: "Spain", currency: "EUR" },
   crypto(
     "BTC.D",
     "Dominancia de Bitcoin (BTC.D %)",

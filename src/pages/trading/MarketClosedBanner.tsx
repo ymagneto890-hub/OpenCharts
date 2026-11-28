@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Clock } from "lucide-react";
 import type { Symbol } from "../../services/schemas";
+import { useChartPreferences } from "../../hooks/useChartPreferences.ts";
+import { useReplayStore } from "../../services/demo/replay.ts";
 import { useTradingStore } from "../../services/store.tsx";
 
 /**
@@ -87,11 +89,18 @@ function isForexDefaultOpen(date: Date): boolean {
   return true;
 }
 
+function isUsStockOpen(date: Date, extended: boolean): boolean {
+  const { day, time } = getTimeInZone(date, "America/New_York");
+  if (day === 0 || day === 6) return false;
+  return extended ? time >= "04:00" && time < "20:00" : time >= "09:30" && time < "16:00";
+}
+
 function findNextOpenMs(
   windows: TradingHours[],
   tz: string,
   category: string,
   nowMs: number,
+  extendedHours = true,
 ): number | null {
   const catUpper = category?.toUpperCase();
   if (catUpper === "CRYPTO" || catUpper === "FUTURES") return null;
@@ -102,7 +111,11 @@ function findNextOpenMs(
     const t = baseMinMs + m * 60_000;
     const candidate = new Date(t);
     const open =
-      windows.length > 0 ? isInWindow(windows, tz, candidate) : isForexDefaultOpen(candidate);
+      windows.length > 0
+        ? isInWindow(windows, tz, candidate)
+        : catUpper === "STOCKS"
+          ? isUsStockOpen(candidate, extendedHours)
+          : isForexDefaultOpen(candidate);
     if (open) return t;
   }
   return null;
@@ -130,10 +143,12 @@ export function MarketClosedBanner({ symbolInfo }: Props) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [mountedAt] = useState(() => Date.now());
   const ticks = useTradingStore((s) => s.ticks);
+  const isReplayMode = useReplayStore((s) => s.phase !== "idle");
+  const { showExtendedHours } = useChartPreferences();
 
   const category: string = symbolInfo?.category ?? "";
   const catUpper = category.toUpperCase();
-  const is247 = !symbolInfo || catUpper === "CRYPTO" || catUpper === "FUTURES";
+  const is247 = !symbolInfo || isReplayMode || catUpper === "CRYPTO" || catUpper === "FUTURES";
 
   const symbolTick = symbolInfo ? ticks[symbolInfo.name ?? ""] : undefined;
   const hasRecentTick = Boolean(symbolTick && nowMs - symbolTick.timestamp < LIVE_TICK_GRACE_MS);
@@ -150,15 +165,19 @@ export function MarketClosedBanner({ symbolInfo }: Props) {
     is247 ||
     hasRecentTick ||
     inStartupHoldoff ||
-    (tradingHours.length > 0 ? isInWindow(tradingHours, tz, nowDate) : isForexDefaultOpen(nowDate));
+    (tradingHours.length > 0
+      ? isInWindow(tradingHours, tz, nowDate)
+      : catUpper === "STOCKS"
+        ? isUsStockOpen(nowDate, showExtendedHours)
+        : isForexDefaultOpen(nowDate));
 
   // Compute next open timestamp only when closed (recomputes once per minute if not yet reached)
   const closedMinuteBucket = Math.floor(nowMs / 60_000);
   const nextOpenAtMs = useMemo(() => {
     if (isOpen) return null;
-    return findNextOpenMs(tradingHours, tz, category, nowMs);
+    return findNextOpenMs(tradingHours, tz, category, nowMs, showExtendedHours);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, symbolInfo?.name, tz, category, closedMinuteBucket]);
+  }, [isOpen, symbolInfo?.name, tz, category, closedMinuteBucket, showExtendedHours]);
 
   useEffect(() => {
     if (is247) return;

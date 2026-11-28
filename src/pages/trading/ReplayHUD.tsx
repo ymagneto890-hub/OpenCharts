@@ -1,4 +1,4 @@
-import { useState, useId, useEffect } from "react";
+import { useState, useId, useEffect, useRef } from "react";
 import {
   Play,
   Pause,
@@ -86,6 +86,17 @@ export function ReplayHUD({
 
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [loadingRemoteDate, setLoadingRemoteDate] = useState(false);
+  const launchSeqRef = useRef(0);
+  const closeDatePicker = () => {
+    launchSeqRef.current += 1;
+    setLoadingRemoteDate(false);
+    setShowDatePicker(false);
+  };
+  useEffect(() => {
+    return () => {
+      launchSeqRef.current += 1;
+    };
+  }, []);
   const [selectedDateTime, setSelectedDateTime] = useState(() => {
     const saved = getLastReplayTimeSec(symbol);
     if (saved) return getIsoDateInput(new Date(saved * 1000));
@@ -148,6 +159,7 @@ export function ReplayHUD({
     const targetDate = `${dateObj.getFullYear()}-${pad(dateObj.getMonth() + 1)}-${pad(dateObj.getDate())}`;
     const anchorAtRegularOpen = !getChartPreferencesFromStorage().showExtendedHours;
 
+    const seq = ++launchSeqRef.current;
     setLoadingRemoteDate(true);
     let loadRes: Awaited<ReturnType<typeof ensureReplayHistoricalDataLoaded>>;
     try {
@@ -161,9 +173,12 @@ export function ReplayHUD({
         anchorAtRegularOpen,
       });
     } finally {
-      setLoadingRemoteDate(false);
+      if (launchSeqRef.current === seq) {
+        setLoadingRemoteDate(false);
+      }
     }
 
+    if (launchSeqRef.current !== seq) return;
     if (!loadRes.ok) {
       toast.warning(
         "Datos históricos insuficientes",
@@ -374,7 +389,7 @@ export function ReplayHUD({
       {showDatePicker && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-150"
-          onClick={() => setShowDatePicker(false)}
+          onClick={closeDatePicker}
         >
           <div
             className="w-full max-w-md bg-card border border-border rounded-xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150"
@@ -395,7 +410,7 @@ export function ReplayHUD({
               </div>
               <button
                 type="button"
-                onClick={() => setShowDatePicker(false)}
+                onClick={closeDatePicker}
                 className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
               >
                 <X className="w-4 h-4" />
@@ -446,7 +461,7 @@ export function ReplayHUD({
                 <button
                   type="button"
                   onClick={() => {
-                    setShowDatePicker(false);
+                    closeDatePicker();
                     beginPick();
                   }}
                   className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1.5 py-1 px-2 rounded hover:bg-muted transition-colors"
@@ -456,7 +471,7 @@ export function ReplayHUD({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setShowDatePicker(false)}
+                  onClick={closeDatePicker}
                   className="px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground rounded border border-border hover:bg-muted transition-colors"
                 >
                   Cancelar

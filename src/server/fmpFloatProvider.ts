@@ -696,7 +696,7 @@ export class FmpFloatProvider {
         quotaExhausted: this.quotaExhausted,
         entries: serialized,
       };
-      const tmpPath = `${this.cacheFile}.tmp.${process.pid}`;
+      const tmpPath = `${this.cacheFile}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
       fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), "utf8");
       fs.renameSync(tmpPath, this.cacheFile);
     } catch {

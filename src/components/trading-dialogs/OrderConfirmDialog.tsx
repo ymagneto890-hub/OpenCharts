@@ -44,7 +44,7 @@ export function OrderConfirmDialog({
   const { formatQty } = useInstrumentLabels();
   if (!isOpen || !order) return null;
 
-  const digits = getPipDigits(order.symbol, symbolInfo ?? undefined);
+  const digits = getPipDigits(symbolInfo ?? undefined, order.symbol);
   const contractSize = symbolInfo?.contractSize ?? 1;
 
   const executionPrice =

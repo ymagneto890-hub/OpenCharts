@@ -212,7 +212,7 @@ export function OrderPanel({
       Number.isFinite(curTp) &&
       curTp > 0 &&
       (side === "BUY" ? curTp > refPrice : curTp < refPrice);
-    if (!userDraggedTpRef.current || !tpValid) {
+    if (!userDraggedTpRef.current || (orderType === "MARKET" && !tpValid)) {
       const defaultTp = refPrice * (side === "BUY" ? 1.015 : 0.985);
       const nextTpStr = defaultTp.toFixed(pipDigits);
       if (nextTpStr !== takeProfit) {
@@ -225,14 +225,14 @@ export function OrderPanel({
       Number.isFinite(curSl) &&
       curSl > 0 &&
       (side === "BUY" ? curSl < refPrice : curSl > refPrice);
-    if (!userDraggedSlRef.current || !slValid) {
+    if (!userDraggedSlRef.current || (orderType === "MARKET" && !slValid)) {
       const defaultSl = refPrice * (side === "BUY" ? 0.99 : 1.01);
       const nextSlStr = defaultSl.toFixed(pipDigits);
       if (nextSlStr !== stopLoss) {
         setStopLoss(nextSlStr);
       }
     }
-  }, [refPrice, side, pipDigits, takeProfit, stopLoss]);
+  }, [refPrice, side, orderType, pipDigits, takeProfit, stopLoss]);
 
   const isExternalUpdateRef = useRef(false);
 
@@ -913,7 +913,7 @@ export function OrderPanel({
 
           const slDistance = Number.isFinite(slVal) ? Math.abs(refPrice - slVal) : 0;
           const riskDollar = slDistance * qtyVal * contractSize;
-          const balance = accountBalance || 0;
+          const balance = effectiveBalance;
           const riskPct = balance > 0 ? (riskDollar / balance) * 100 : 0;
           const tpDollar = Number.isFinite(tpVal)
             ? Math.abs(tpVal - refPrice) * qtyVal * contractSize

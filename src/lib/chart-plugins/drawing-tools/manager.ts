@@ -646,6 +646,7 @@ export class DrawingToolsManager {
     const d = deltas[e.key];
     if (!d || this.selectedIds.length === 0) return false;
     e.preventDefault();
+    e.stopImmediatePropagation();
     const step = e.shiftKey ? 10 : 1;
     this.nudgeSelected(d[0] * step, d[1] * step);
     return true;
@@ -719,9 +720,12 @@ export class DrawingToolsManager {
       return;
     }
     if (this.tool === "long-position" || this.tool === "short-position") {
-      this.commitDrawing(
-        this.makeDefaultPosition(this.tool === "long-position" ? "long" : "short", pt),
+      const basePos = this.makeDefaultPosition(
+        this.tool === "long-position" ? "long" : "short",
+        pt,
       );
+      const def = this.styleDefaults["position"];
+      this.commitDrawing(def ? { ...basePos, ...definedOnly(def) } : basePos);
       return;
     }
     if (this.placing) {

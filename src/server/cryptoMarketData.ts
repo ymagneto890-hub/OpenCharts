@@ -253,13 +253,28 @@ export class CryptoMarketDataService {
     timeframe: string,
     minBars = 1000,
     signal?: AbortSignal,
+    targetDate?: string,
   ): Promise<CryptoCandlesResponse> {
     const parsed = parseCryptoSymbol(symbol);
-    const safeMinBars = Math.max(100, Math.min(2000, Math.round(minBars || 1000)));
-    const cacheKey = `${parsed.canonical}|${timeframe}|${safeMinBars}`;
+    const safeMinBars = Math.max(100, Math.min(3500, Math.round(minBars || 1000)));
+    const cleanTargetDate =
+      typeof targetDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(targetDate.trim())
+        ? targetDate.trim()
+        : undefined;
+    const targetEndSec = cleanTargetDate
+      ? (() => {
+          const [yStr, mStr, dStr] = cleanTargetDate.split("-");
+          const endUtcSec = Math.floor(
+            Date.UTC(Number(yStr), Number(mStr) - 1, Number(dStr) + 1, 4, 59, 59) / 1000,
+          );
+          return Math.min(endUtcSec, Math.floor(Date.now() / 1000));
+        })()
+      : undefined;
+    const targetEndMs = targetEndSec !== undefined ? targetEndSec * 1000 : undefined;
+    const cacheKey = `${parsed.canonical}|${timeframe}|${safeMinBars}|${cleanTargetDate ?? "live"}`;
 
     const cached = this.candleCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < 4_000) {
+    if (cached && Date.now() - cached.at < (cleanTargetDate ? 300_000 : 4_000)) {
       return cached.result;
     }
 
@@ -268,14 +283,14 @@ export class CryptoMarketDataService {
 
     const promise = (async (): Promise<CryptoCandlesResponse> => {
       if (parsed.isDominance) {
-        const res = await this.fetchBtcDominanceCandles(timeframe, safeMinBars, signal);
+        const res = await this.fetchBtcDominanceCandles(timeframe, safeMinBars, signal, targetEndMs);
         this.storeCandleCache(cacheKey, res);
         return res;
       }
 
       const plan = resolveBinanceInterval(timeframe, parsed.isPerpetual);
       const nativeBarsNeeded = Math.min(
-        2000,
+        3500,
         Math.ceil(safeMinBars * (plan.targetSec / plan.nativeSec)),
       );
 
@@ -287,6 +302,7 @@ export class CryptoMarketDataService {
           nativeBarsNeeded,
           parsed.isPerpetual,
           signal,
+          targetEndMs,
         );
         if (raw.length > 0) {
           const candles = plan.requiresResample
@@ -307,28 +323,35 @@ export class CryptoMarketDataService {
         // fall through to secondary exchanges
       }
 
-      // 2. Fallback A: Kraken Public OHLC API
-      try {
-        const krakenBars = await this.fetchKrakenOhlc(parsed.krakenPair, plan.targetSec, signal);
-        if (krakenBars.length > 0) {
-          const candles = aggregateCandles(krakenBars, plan.targetSec);
-          const res: CryptoCandlesResponse = {
-            symbol: parsed.canonical,
-            timeframe,
-            candles,
-            regularMarketPrice: candles[candles.length - 1]?.close ?? null,
-            exchangeTimezoneName: "UTC",
-            dataSource: "kraken",
-          };
-          this.storeCandleCache(cacheKey, res);
-          return res;
+      // 2. Fallback A: Kraken Public OHLC API (only when not requesting a distant targetDate)
+      if (!cleanTargetDate) {
+        try {
+          const krakenBars = await this.fetchKrakenOhlc(parsed.krakenPair, plan.targetSec, signal);
+          if (krakenBars.length > 0) {
+            const candles = aggregateCandles(krakenBars, plan.targetSec);
+            const res: CryptoCandlesResponse = {
+              symbol: parsed.canonical,
+              timeframe,
+              candles,
+              regularMarketPrice: candles[candles.length - 1]?.close ?? null,
+              exchangeTimezoneName: "UTC",
+              dataSource: "kraken",
+            };
+            this.storeCandleCache(cacheKey, res);
+            return res;
+          }
+        } catch {
+          // fall through to Coinbase
         }
-      } catch {
-        // fall through to Coinbase
       }
 
       // 3. Fallback B: Coinbase Exchange Public Candles API
-      const cbBars = await this.fetchCoinbaseCandles(parsed.coinbaseProduct, plan.targetSec, signal);
+      const cbBars = await this.fetchCoinbaseCandles(
+        parsed.coinbaseProduct,
+        plan.targetSec,
+        signal,
+        targetEndSec,
+      );
       if (cbBars.length > 0) {
         const candles = aggregateCandles(cbBars, plan.targetSec);
         const res: CryptoCandlesResponse = {
@@ -368,38 +391,36 @@ export class CryptoMarketDataService {
     totalWanted: number,
     isFutures: boolean,
     signal?: AbortSignal,
+    endTimeMsOverride?: number,
   ): Promise<OhlcvBar[]> {
     const base = isFutures ? BINANCE_FUTURES_BASE : BINANCE_SPOT_BASE;
     const path = isFutures ? "/fapi/v1/klines" : "/api/v3/klines";
     const maxPerReq = isFutures ? 1500 : 1000;
+    const merged = new Map<number, OhlcvBar>();
+    let cursorEndMs = endTimeMsOverride;
 
-    const firstLimit = Math.min(maxPerReq, Math.max(100, totalWanted));
-    const url1 = `${base}${path}?symbol=${encodeURIComponent(binanceSymbol)}&interval=${encodeURIComponent(interval)}&limit=${firstLimit}`;
-    const res1 = await this.fetchImpl(url1, { headers: HTTP_HEADERS, signal });
-    if (!res1.ok) {
-      throw new Error(`Binance ${isFutures ? "Futures" : "Spot"} HTTP ${res1.status}`);
-    }
-    const batch1 = parseBinanceKlines(await res1.json());
-    if (batch1.length >= totalWanted || batch1.length < firstLimit) {
-      return batch1;
+    for (let page = 0; page < 4 && merged.size < totalWanted; page++) {
+      const reqLimit = Math.min(maxPerReq, Math.max(100, totalWanted - merged.size));
+      const endParam =
+        typeof cursorEndMs === "number" && Number.isFinite(cursorEndMs) && cursorEndMs > 0
+          ? `&endTime=${Math.floor(cursorEndMs)}`
+          : "";
+      const url = `${base}${path}?symbol=${encodeURIComponent(binanceSymbol)}&interval=${encodeURIComponent(interval)}&limit=${reqLimit}${endParam}`;
+      const res = await this.fetchImpl(url, { headers: HTTP_HEADERS, signal });
+      if (!res.ok) {
+        if (page === 0) {
+          throw new Error(`Binance ${isFutures ? "Futures" : "Spot"} HTTP ${res.status}`);
+        }
+        break;
+      }
+      const batch = parseBinanceKlines(await res.json());
+      if (batch.length === 0) break;
+      for (const b of batch) merged.set(b.time, b);
+      if (batch.length < reqLimit) break;
+      cursorEndMs = batch[0]!.time * 1000 - 1;
     }
 
-    // Fetch one additional preceding page so 1m/3m/5m get >= 1500 warmup bars
-    const remaining = Math.min(maxPerReq, totalWanted - batch1.length);
-    if (remaining <= 0 || batch1.length === 0) return batch1;
-    const endTimeMs = batch1[0]!.time * 1000 - 1;
-    const url2 = `${base}${path}?symbol=${encodeURIComponent(binanceSymbol)}&interval=${encodeURIComponent(interval)}&limit=${remaining}&endTime=${endTimeMs}`;
-    try {
-      const res2 = await this.fetchImpl(url2, { headers: HTTP_HEADERS, signal });
-      if (!res2.ok) return batch1;
-      const batch2 = parseBinanceKlines(await res2.json());
-      const merged = new Map<number, OhlcvBar>();
-      for (const b of batch2) merged.set(b.time, b);
-      for (const b of batch1) merged.set(b.time, b);
-      return Array.from(merged.values()).sort((a, b) => a.time - b.time);
-    } catch {
-      return batch1;
-    }
+    return Array.from(merged.values()).sort((a, b) => a.time - b.time);
   }
 
   private async fetchKrakenOhlc(
@@ -450,12 +471,17 @@ export class CryptoMarketDataService {
     product: string,
     targetSec: number,
     signal?: AbortSignal,
+    endSecOverride?: number,
   ): Promise<OhlcvBar[]> {
     let gran = 60;
     for (const g of COINBASE_GRANULARITIES) {
       if (g <= targetSec && targetSec % g === 0) gran = g;
     }
-    const url = `${COINBASE_BASE}/products/${encodeURIComponent(product)}/candles?granularity=${gran}`;
+    const rangeParams =
+      typeof endSecOverride === "number" && Number.isFinite(endSecOverride) && endSecOverride > 0
+        ? `&start=${encodeURIComponent(new Date((endSecOverride - gran * 299) * 1000).toISOString())}&end=${encodeURIComponent(new Date(endSecOverride * 1000).toISOString())}`
+        : "";
+    const url = `${COINBASE_BASE}/products/${encodeURIComponent(product)}/candles?granularity=${gran}${rangeParams}`;
     const res = await this.fetchImpl(url, { headers: COINBASE_HEADERS, signal });
     if (!res.ok) throw new Error(`Coinbase HTTP ${res.status}`);
     const rows = (await res.json()) as unknown;
@@ -516,15 +542,16 @@ export class CryptoMarketDataService {
     timeframe: string,
     minBars: number,
     signal?: AbortSignal,
+    targetEndMs?: number,
   ): Promise<CryptoCandlesResponse> {
     const plan = resolveBinanceInterval(timeframe, false);
     const needed = Math.min(1000, Math.ceil(minBars * (plan.targetSec / plan.nativeSec)));
     const [liveDomPct, btcBars, ethBars] = await Promise.all([
       this.fetchLiveBtcDominancePct(signal),
-      this.fetchBinanceKlinesPaginated("BTCUSDT", plan.interval, needed, false, signal).catch(() =>
+      this.fetchBinanceKlinesPaginated("BTCUSDT", plan.interval, needed, false, signal, targetEndMs).catch(() =>
         this.fetchKrakenOhlc("XBTUSD", plan.targetSec, signal),
       ),
-      this.fetchBinanceKlinesPaginated("ETHUSDT", plan.interval, needed, false, signal).catch(() =>
+      this.fetchBinanceKlinesPaginated("ETHUSDT", plan.interval, needed, false, signal, targetEndMs).catch(() =>
         this.fetchKrakenOhlc("ETHUSD", plan.targetSec, signal).catch(() => [] as OhlcvBar[]),
       ),
     ]);

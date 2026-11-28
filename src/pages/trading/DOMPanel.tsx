@@ -13,7 +13,8 @@ export function DOMPanel({
   const levels = useMemo(() => {
     if (!tick) return [];
     const mid = (tick.bid + tick.ask) / 2;
-    const step = tick.ask - tick.bid || 0.0001;
+    const minTick = Math.pow(10, -pipDigits);
+    const step = tick.ask - tick.bid > minTick * 0.5 ? tick.ask - tick.bid : minTick;
     const result = [];
 
     for (let i = 10; i >= 1; i--) {
@@ -47,16 +48,21 @@ export function DOMPanel({
     return result;
     // tick is captured via tick?.bid and tick?.ask; including tick.bid/tick.ask is sufficient
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick?.bid, tick?.ask]);
+  }, [tick?.bid, tick?.ask, pipDigits]);
 
   const maxSize = Math.max(...levels.map((l) => Math.max(l.bidSize, l.askSize)), 1);
 
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-secondary">
-        <h3 className="text-sm font-bold uppercase tracking-wider text-muted-foreground">
-          Depth of Market
-        </h3>
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-bold uppercase tracking-wider text-muted-foreground">
+            Depth of Market
+          </h3>
+          <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 text-[9px] font-semibold uppercase">
+            Simulado
+          </span>
+        </div>
         <span className="text-sm font-bold">{symbol}</span>
       </div>
       <div className="flex-1 overflow-y-auto">

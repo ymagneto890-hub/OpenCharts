@@ -1300,25 +1300,23 @@ describe("OpenCharts Improvements Suite", () => {
       // Jan 18, 2024 20:00:00 UTC (timestamp from user's trade)
       const jan18_2024Sec = 1705608000;
 
-      // 1. getReplayHistory for 1h should synthesize consistent 1-hour bars around Jan 18, 2024
+      // 1. Strict data provenance: 1h does NOT synthesize fake bars when Jan 2024 1h history is absent,
+      // while 4h authentic history covers Jan 18, 2024 at ~$41,300 (NOT modern $80,000+)
       const bars1h = getReplayHistory("BTCUSD", "1h", jan18_2024Sec);
-      expect(bars1h.length).toBeGreaterThan(100);
+      expect(bars1h).toEqual([]);
 
-      // Verify that the bars cover the target timestamp
-      const pastBars = bars1h.filter((b) => b.time <= jan18_2024Sec);
+      const bars4h = getReplayHistory("BTCUSD", "4h", jan18_2024Sec);
+      const pastBars = bars4h.filter((b) => b.time <= jan18_2024Sec);
       expect(pastBars.length).toBeGreaterThan(50);
 
       const targetBar = pastBars[pastBars.length - 1]!;
       expect(targetBar.time).toBeLessThanOrEqual(jan18_2024Sec);
-      // Jan 2024 BTC was ~$41,300 (NOT modern $80,000+)
       expect(targetBar.close).toBeGreaterThan(38_000);
       expect(targetBar.close).toBeLessThan(45_000);
 
-      // 2. Offscreen chart capture handles the 1H historical replay timestamp cleanly
+      // 2. Offscreen chart capture handles the 1H historical replay timestamp without throwing
       const screenshot = await captureOneHourChart("BTCUSD", true, jan18_2024Sec);
-      expect(screenshot).toBeDefined();
-      expect(typeof screenshot).toBe("string");
-      expect(screenshot.length).toBeGreaterThan(0);
+      expect(screenshot === undefined || typeof screenshot === "string").toBe(true);
     });
 
     it("accurately calculates fractional coordinates and bar spacing for future news icons in Replay whitespace", async () => {
@@ -1684,8 +1682,9 @@ describe("OpenCharts Improvements Suite", () => {
       expect(getDemoSymbol("KASPAUSD")?.initialPrice).toBe(0.165);
       expect(custom.category).toBe("CRYPTO");
 
-      // Multi-timeframe candle generation works seamlessly for BTC.D and all asset classes
-      for (const sym of ["BTC.D", "PEPEUSD", "AAPL", "ESP35", "XAUUSD", "EURUSD", "KASPAUSD"]) {
+      // Multi-timeframe test fixture generation works for non-stock asset classes,
+      // while US Stocks (AAPL) strictly forbid synthetic fallback candles
+      for (const sym of ["BTC.D", "PEPEUSD", "ESP35", "XAUUSD", "EURUSD", "KASPAUSD"]) {
         const bars = getHistory(sym, "4h");
         expect(bars.length).toBeGreaterThan(100);
         const last = bars[bars.length - 1]!;
@@ -1693,6 +1692,7 @@ describe("OpenCharts Improvements Suite", () => {
         expect(last.high).toBeGreaterThanOrEqual(Math.max(last.open, last.close));
         expect(last.low).toBeLessThanOrEqual(Math.min(last.open, last.close));
       }
+      expect(getHistory("AAPL", "4h")).toEqual([]);
     });
 
     it("supports EUR-quoted crypto, commodities, and forex search, dynamic registration, and candles", async () => {
@@ -2378,9 +2378,13 @@ describe("OpenCharts Improvements Suite", () => {
         }
       }
 
-      // Replay 3m subdivision from ancestor timeframe (15m -> 3m) earlier than direct 1m history
-      const replayTargetSec = bars3m[0]!.time - 7 * 86_400;
-      const replayBars3m = getReplayHistory("BTCUSD", "3m", replayTargetSec);
+      // Replay 3m refuses synthetic downward subdivision earlier than direct 1m history,
+      // and succeeds cleanly within authentic 1m coverage via upward aggregation
+      const outOfCoverageSec = bars3m[0]!.time - 7 * 86_400;
+      expect(getReplayHistory("BTCUSD", "3m", outOfCoverageSec)).toEqual([]);
+
+      const inCoverageSec = bars3m[Math.min(bars3m.length - 2, 30)]!.time;
+      const replayBars3m = getReplayHistory("BTCUSD", "3m", inCoverageSec);
       expect(replayBars3m.length).toBeGreaterThan(20);
       for (let i = 0; i < replayBars3m.length; i++) {
         const b = replayBars3m[i]!;

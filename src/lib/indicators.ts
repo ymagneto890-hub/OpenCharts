@@ -2409,6 +2409,7 @@ export function computeFineGrainedSessionVwap(
     const dayFineBars = fineCandlesByDay.get(day) ?? [];
     let fi = 0;
     let hasMissingFineBucket = false;
+    if (options.validateInternalGaps !== false)
     for (let ti = 0; ti < dayTargetBars.length; ti++) {
       const tBar = dayTargetBars[ti]!;
       if (!(tBar.volume != null && tBar.volume > 0)) continue;
@@ -2612,8 +2613,17 @@ export function computeVolumeProfile(
   const clampBin = (p: number) =>
     Math.max(0, Math.min(rows - 1, Math.floor(((p - minPrice) / span) * rows)));
 
+  const hasRealVolume = clean.some(
+    (c) => typeof c.volume === "number" && Number.isFinite(c.volume) && c.volume > 0,
+  );
   for (const c of clean) {
-    const vol = typeof c.volume === "number" && Number.isFinite(c.volume) && c.volume > 0 ? c.volume : 1;
+    const vol =
+      typeof c.volume === "number" && Number.isFinite(c.volume) && c.volume > 0
+        ? c.volume
+        : hasRealVolume
+          ? 0
+          : 1;
+    if (vol <= 0) continue;
     const isBull = c.close >= c.open;
     totalVolume += vol;
 

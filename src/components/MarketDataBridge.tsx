@@ -4,6 +4,8 @@ import { useTradingStore } from "../services/store.tsx";
 import { wsClient } from "../services/ws.ts";
 import { queryKeys, type MarketDataCandlesPayload } from "../services/queries.ts";
 import { getHistory } from "../services/demo/candles.ts";
+import { computeRequiredWarmupBars } from "../lib/timeframes.ts";
+import { getIndicatorSettings } from "../hooks/useIndicatorSettings.ts";
 import type { Position, Order } from "../services/schemas.ts";
 
 /**
@@ -188,24 +190,39 @@ export function MarketDataBridge() {
           timestamp: wsEvent.timestamp,
         });
       } else if (wsEvent.eventType === "CandleClosed") {
-        // Immediately sync closed live bars from in-memory store into React Query cache
-        // so EMA 9, VWAP, and Volume MA(20) on 1m / 3m / 5m charts never skip closed bars.
-        const freshBars = getHistory(wsEvent.symbol, wsEvent.timeframe, 1_500);
-        if (freshBars.length > 0) {
+        // Immediately sync closed live bars without truncating EMA warmup depth
+        // or overwriting historical targetDate queries.
+        const emaPeriods = (getIndicatorSettings().ema?.lines ?? [])
+          .filter((l) => l.enabled && l.period > 0)
+          .map((l) => l.period);
+        const minWarmup = computeRequiredWarmupBars(emaPeriods);
+        const probeBars = getHistory(wsEvent.symbol, wsEvent.timeframe, minWarmup);
+        if (probeBars.length > 0) {
           queryClient.setQueriesData<MarketDataCandlesPayload>(
-            { queryKey: queryKeys.market.candles(wsEvent.symbol, wsEvent.timeframe) },
-            (old) => ({
-              candles: freshBars,
-              metadata: old?.metadata ?? {
-                isPartial: false,
-                backfillQueued: false,
-                historicalCoverageStart: null,
-              },
-            }),
+            {
+              queryKey: queryKeys.market.candles(wsEvent.symbol, wsEvent.timeframe),
+              predicate: (query) => query.queryKey.length <= 5,
+            },
+            (old) => {
+              const targetLimit = Math.max(old?.candles.length ?? 0, minWarmup);
+              const freshBars =
+                targetLimit === minWarmup
+                  ? probeBars
+                  : getHistory(wsEvent.symbol, wsEvent.timeframe, targetLimit);
+              return {
+                candles: freshBars,
+                metadata: old?.metadata ?? {
+                  isPartial: false,
+                  backfillQueued: false,
+                  historicalCoverageStart: null,
+                },
+              };
+            },
           );
         } else {
           queryClient.invalidateQueries({
             queryKey: queryKeys.market.candles(wsEvent.symbol, wsEvent.timeframe),
+            predicate: (query) => query.queryKey.length <= 5,
           });
         }
       }

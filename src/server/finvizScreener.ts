@@ -152,32 +152,27 @@ export function buildFinvizFilterCodes(payload: FinvizScreenerQueryPayload): str
     if (preset !== null) codes.push(`sh_float_u${preset}`);
   }
 
-  // 2. Change %
+  // 2. Change % (use free Finviz presets and enforce exact min/max in postFilterFinvizRows)
   const hasChgMin = isFiniteNum(payload.changeMin);
   const hasChgMax = isFiniteNum(payload.changeMax);
-  if (hasChgMin && !hasChgMax && payload.changeMin! > 0) {
+  if (hasChgMin && payload.changeMin! > 0) {
     const preset = pickPresetOver(payload.changeMin!, CHANGE_PRESETS);
     if (preset !== null) codes.push(`ta_change_u${preset}`);
-  } else if (!hasChgMin && hasChgMax && payload.changeMax! < 0) {
+  } else if (hasChgMax && payload.changeMax! < 0) {
     const preset = pickPresetOver(Math.abs(payload.changeMax!), CHANGE_PRESETS);
     if (preset !== null) codes.push(`ta_change_d${preset}`);
   }
 
-  // 3. Price ($)
+  // 3. Price ($) — use free Finviz presets (avoid Elite-only XtoY codes) + exact post-filtering
   const hasPriceMin = isFiniteNum(payload.priceMin) && payload.priceMin > 0;
   const hasPriceMax = isFiniteNum(payload.priceMax) && payload.priceMax > 0;
-  if (!hasPriceMin && hasPriceMax) {
-    const preset = pickPresetUnder(payload.priceMax!, PRICE_PRESETS);
+  if (hasPriceMax) {
+    const hi = hasPriceMin ? Math.max(payload.priceMin!, payload.priceMax!) : payload.priceMax!;
+    const preset = pickPresetUnder(hi, PRICE_PRESETS);
     if (preset !== null) codes.push(`sh_price_u${preset}`);
-    else codes.push(`sh_price_0to${Number(payload.priceMax!.toFixed(2))}`);
-  } else if (hasPriceMin && !hasPriceMax) {
+  } else if (hasPriceMin) {
     const preset = pickPresetOver(payload.priceMin!, PRICE_PRESETS);
     if (preset !== null) codes.push(`sh_price_o${preset}`);
-    else codes.push(`sh_price_${Number(payload.priceMin!.toFixed(2))}to`);
-  } else if (hasPriceMin && hasPriceMax) {
-    const lo = Math.min(payload.priceMin!, payload.priceMax!);
-    const hi = Math.max(payload.priceMin!, payload.priceMax!);
-    codes.push(`sh_price_${Number(lo.toFixed(2))}to${Number(hi.toFixed(2))}`);
   }
 
   // 4. Relative Volume (Finviz 90-day / 3M relative volume)
@@ -429,6 +424,16 @@ export class FinvizScreener {
   private readonly fetchImpl: typeof fetch;
   private readonly cache = new Map<string, { at: number; result: FinvizScreenerResponse }>();
   private readonly inFlight = new Map<string, Promise<FinvizScreenerResponse>>();
+  private readonly streamPools = new Map<
+    string,
+    {
+      listeners: Set<(evt: FinvizScreenerStreamEvent) => void>;
+      timer: ReturnType<typeof setInterval>;
+      ac: AbortController;
+      lastSig: string;
+      lastSnapshot: FinvizScreenerStreamEvent | null;
+    }
+  >();
   private readonly cacheTtlMs: number;
   private readonly pollIntervalMs: number;
 
@@ -560,49 +565,91 @@ export class FinvizScreener {
     payload: FinvizScreenerQueryPayload,
     onEvent: (evt: FinvizScreenerStreamEvent) => void,
   ): () => void {
-    let closed = false;
-    const ac = new AbortController();
-    let lastSig = "";
+    const poolKey = JSON.stringify(payload);
+    let pool = this.streamPools.get(poolKey);
 
-    const pushScan = async (type: "snapshot" | "update", forceFresh: boolean) => {
-      if (closed) return;
-      try {
-        const res = await this.scan(payload, ac.signal, forceFresh);
-        if (closed) return;
-        const sig = JSON.stringify(
-          res.items.map((r) => [r.ticker, r.close, r.change, r.relativeVolume, r.volume, r.floatShares]),
-        );
-        if (type === "update" && sig === lastSig) return;
-        lastSig = sig;
-        onEvent({
-          type,
-          connected: true,
-          totalCount: res.totalCount,
-          items: res.items,
-          fetchedAt: res.fetchedAt,
-          source: "finviz",
-          finvizUrl: res.finvizUrl,
-        });
-      } catch (err) {
-        if (closed || ac.signal.aborted) return;
-        onEvent({
-          type: "status",
-          connected: false,
-          reason: err instanceof Error ? err.message : String(err),
-        });
+    if (!pool) {
+      const ac = new AbortController();
+      const listeners = new Set<(evt: FinvizScreenerStreamEvent) => void>();
+      const created = {
+        listeners,
+        ac,
+        lastSig: "",
+        lastSnapshot: null as FinvizScreenerStreamEvent | null,
+        timer: null as unknown as ReturnType<typeof setInterval>,
+      };
+
+      const broadcast = (evt: FinvizScreenerStreamEvent) => {
+        for (const fn of created.listeners) {
+          try {
+            fn(evt);
+          } catch {
+            // ignore broken SSE writer
+          }
+        }
+      };
+
+      const pushScan = async (type: "snapshot" | "update", forceFresh: boolean) => {
+        if (ac.signal.aborted || created.listeners.size === 0) return;
+        try {
+          const res = await this.scan(payload, ac.signal, forceFresh);
+          if (ac.signal.aborted || created.listeners.size === 0) return;
+          const sig = JSON.stringify(
+            res.items.map((r) => [r.ticker, r.close, r.change, r.relativeVolume, r.volume, r.floatShares]),
+          );
+          const evt: FinvizScreenerStreamEvent = {
+            type,
+            connected: true,
+            totalCount: res.totalCount,
+            items: res.items,
+            fetchedAt: res.fetchedAt,
+            source: "finviz",
+            finvizUrl: res.finvizUrl,
+          };
+          created.lastSnapshot = evt;
+          if (type === "update" && sig === created.lastSig) return;
+          created.lastSig = sig;
+          broadcast(evt);
+        } catch (err) {
+          if (ac.signal.aborted || created.listeners.size === 0) return;
+          broadcast({
+            type: "status",
+            connected: false,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      };
+
+      created.timer = setInterval(() => {
+        void pushScan("update", true);
+      }, this.pollIntervalMs);
+      pool = created;
+      this.streamPools.set(poolKey, pool);
+      pool.listeners.add(onEvent);
+      void pushScan("snapshot", false);
+    } else {
+      pool.listeners.add(onEvent);
+      if (pool.lastSnapshot) {
+        try {
+          onEvent({ ...pool.lastSnapshot, type: "snapshot" });
+        } catch {
+          // ignore
+        }
       }
-    };
+    }
 
-    void pushScan("snapshot", false);
-    const timer = setInterval(() => {
-      void pushScan("update", true);
-    }, this.pollIntervalMs);
-
+    let released = false;
     return () => {
-      if (closed) return;
-      closed = true;
-      clearInterval(timer);
-      ac.abort();
+      if (released) return;
+      released = true;
+      const cur = this.streamPools.get(poolKey);
+      if (!cur) return;
+      cur.listeners.delete(onEvent);
+      if (cur.listeners.size === 0) {
+        clearInterval(cur.timer);
+        cur.ac.abort();
+        this.streamPools.delete(poolKey);
+      }
     };
   }
 }

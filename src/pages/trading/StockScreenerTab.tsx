@@ -205,6 +205,13 @@ export function StockScreenerTab({
   const [newsItems, setNewsItems] = useState<StockNewsItem[]>([]);
   const newsAbortRef = useRef<AbortController | null>(null);
 
+  useEffect(() => {
+    return () => {
+      newsAbortRef.current?.abort();
+      newsAbortRef.current = null;
+    };
+  }, []);
+
   const closeCatalystModal = useCallback(() => {
     newsAbortRef.current?.abort();
     newsAbortRef.current = null;
@@ -339,7 +346,16 @@ export function StockScreenerTab({
         setTotalCount(res.totalCount);
         setFetchedAt(res.fetchedAt || Date.now());
         if (res.finvizUrl) setFinvizUrl(res.finvizUrl);
-        setItems(res.items);
+        setItems((prev) => {
+          if (prev.length <= res.items.length) return res.items;
+          const freshIds = new Set(res.items.map((r) => r.id || r.ticker));
+          const merged = [...res.items];
+          for (const oldRow of prev) {
+            const key = oldRow.id || oldRow.ticker;
+            if (!freshIds.has(key)) merged.push(oldRow);
+          }
+          return merged;
+        });
         setLoading(false);
         setError(null);
       },
